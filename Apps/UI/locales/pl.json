@@ -1,4 +1,61 @@
 {
+  "downloadsBridge": {
+    "filters": {
+      "popular": "Popularne",
+      "newest": "Najnowsze"
+    },
+    "downloads": {
+      "one": "{count} pobranie",
+      "few": "{count} pobrania",
+      "many": "{count} pobrań"
+    },
+    "updated": {
+      "justNow": "przed chwilą",
+      "fewSecondsAgo": "kilka sekund temu",
+      "lessThanMinuteAgo": "mniej niż minutę temu",
+      "today": "dzisiaj",
+      "yesterday": "wczoraj",
+      "year": {
+        "one": "{count} rok temu",
+        "few": "{count} lata temu",
+        "many": "{count} lat temu"
+      },
+      "month": {
+        "one": "{count} miesiąc temu",
+        "few": "{count} miesiące temu",
+        "many": "{count} miesięcy temu"
+      },
+      "week": {
+        "one": "{count} tydzień temu",
+        "few": "{count} tygodnie temu",
+        "many": "{count} tygodni temu"
+      },
+      "day": {
+        "one": "{count} dzień temu",
+        "few": "{count} dni temu",
+        "many": "{count} dni temu"
+      },
+      "hour": {
+        "one": "{count} godzinę temu",
+        "few": "{count} godziny temu",
+        "many": "{count} godzin temu"
+      },
+      "minute": {
+        "one": "{count} minutę temu",
+        "few": "{count} minuty temu",
+        "many": "{count} minut temu"
+      },
+      "second": {
+        "one": "{count} sekundę temu",
+        "few": "{count} sekundy temu",
+        "many": "{count} sekund temu"
+      }
+    },
+    "summary": {
+      "text": "Tekst",
+      "image": "Obraz"
+    }
+  },
   "tools": {
     "requiresDocker": "To narzędzie wymaga Dockera.",
     "refreshDocker": "Sprawdź Docker ponownie",

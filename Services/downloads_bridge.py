@@ -7,11 +7,16 @@ import json
 import platform
 import re
 import sys
+from copy import deepcopy
 from dataclasses import dataclass
+from decimal import Decimal
 from html import unescape
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin
+
+from Apps.UI.locale_catalog import resolve_effective_locale_from_snapshot, translate, translate_plural
+from Settings.host_theme import load_host_theme
 
 # Bridge configuration
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -20,6 +25,8 @@ DETAIL_CACHE_DIR = CACHE_DIR / "ollama_details"
 DETAIL_HTML_CACHE_DIR = CACHE_DIR / "ollama_detail_html"
 SEARCH_CACHE_DIR = CACHE_DIR / "ollama_search"
 REQUEST_TIMEOUT_SECONDS = 20
+CACHE_SCHEMA_VERSION = 1
+MAX_VARIANT_SIZE_BYTES = (1 << 63) - 1
 
 OLLAMA_SEARCH_URL = "https://ollama.com/search"
 OLLAMA_CATEGORY_ID = "ollama-library"
@@ -32,6 +39,12 @@ PROTOCOL_VERSION = 1
 DEFAULT_SORT_KEY = "popular"
 SORT_FILTER_PREFIX = "sort:"
 CAPABILITY_FILTER_PREFIX = "capability:"
+CAPABILITY_COLORS = {
+    "vision": "SystemOrange",
+    "tools": "SystemBlue",
+    "thinking": "SystemGreen",
+    "cloud": "SystemTeal",
+}
 
 
 # Search query model
@@ -78,7 +91,51 @@ def _response(
         payload["uninstallManifest"] = uninstall_manifest
     if error:
         payload["error"] = error
-    return payload
+    owners = [*(items or []), *([item_detail] if item_detail else [])]
+    resources = _build_resources(owners) if owners else None
+    if resources:
+        payload["resources"] = resources
+    return _localize_response(payload) if owners or filters is not None else payload
+
+
+# Resolve named assets and the current host palette when sending a response, not when caching items.
+def _build_resources(owners: list[dict[str, Any]]) -> dict[str, Any]:
+    theme = load_host_theme() or {}
+    palette = theme.get("colors") or {}
+    if not isinstance(palette, dict):
+        palette = {}
+    surface = _color_channels(palette.get("BackgroundSecondary"))
+    colors: dict[str, str] = {}
+    icons: dict[str, dict[str, str]] = {}
+    for owner in owners:
+        for field in [*owner.get("details", []), *owner.get("tags", [])]:
+            icon = field.get("icon")
+            if icon in CAPABILITY_COLORS:
+                icons[icon] = {"path": f"Apps/UI/static/img/capabilities/{icon}.png"}
+                color_key = CAPABILITY_COLORS[icon]
+                foreground = _color_channels(palette.get(color_key))
+                if foreground is not None:
+                    colors[color_key] = "#" + "".join(f"{channel:02X}" for channel in foreground)
+                    field["textColor"] = color_key
+                    if surface is not None:
+                        background_key = f"{color_key}Background"
+                        colors[background_key] = "#" + "".join(
+                            f"{(front + 4 * back + 2) // 5:02X}" for front, back in zip(foreground, surface)
+                        )
+                        field["backgroundColor"] = background_key
+            elif icon in {"downloads", "update"}:
+                icons[icon] = {"path": f"Apps/UI/static/img/info/{icon}.png"}
+    return {key: value for key, value in {"colors": colors, "icons": icons}.items() if value}
+
+
+# Host palette values use RGB or MAUI ARGB hex, with alpha first.
+def _color_channels(value: Any) -> tuple[int, ...] | None:
+    if not isinstance(value, str) or not re.fullmatch(r"#(?:[0-9a-fA-F]{6}|[0-9a-fA-F]{8})", value):
+        return None
+    body = value[1:]
+    if len(body) == 6:
+        body = "FF" + body
+    return tuple(int(body[index:index + 2], 16) for index in range(0, 8, 2))
 
 
 # Request helpers
@@ -157,7 +214,27 @@ def _read_cache(path: Path) -> Any | None:
         return None
 
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict) or payload.get("_cacheSchema") != CACHE_SCHEMA_VERSION:
+            return None
+        payload.pop("_cacheSchema")
+        # Rebuild incompatible cached payloads in place; never translate the old wire format.
+        for item in payload.get("items", [payload]):
+            if "detail" in item:
+                return None
+            for key in ("details", "tags"):
+                fields = item.get(key)
+                if fields is not None and (not isinstance(fields, list) or
+                                           any(not isinstance(field, dict) for field in fields)):
+                    return None
+            for variant in item.get("variants", []):
+                if any(key in variant for key in ("detail", "details", "tags", "version", "installedVersion")):
+                    return None
+                if type(variant.get("hasSize")) is not bool or type(variant.get("size")) is not int:
+                    return None
+                if not 0 <= variant["size"] <= MAX_VARIANT_SIZE_BYTES or (not variant["hasSize"] and variant["size"] != 0):
+                    return None
+        return payload
     except Exception:
         return None
 
@@ -165,7 +242,7 @@ def _read_cache(path: Path) -> Any | None:
 # Write a JSON cache payload.
 def _write_cache(path: Path, payload: Any) -> None:
     _ensure_cache_dirs()
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    path.write_text(json.dumps({**payload, "_cacheSchema": CACHE_SCHEMA_VERSION}, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 # Write a plain text cache file.
@@ -245,9 +322,6 @@ def _variant_is_mlx(variant: dict[str, Any] | None) -> bool:
         return True
     if _is_mlx_model_ref(str(variant.get("title") or "")):
         return True
-    for tag in variant.get("tags") or []:
-        if str(tag).strip().lower() == "mlx":
-            return True
     return False
 
 
@@ -361,17 +435,21 @@ _DEFAULT_PREVIEW_THEME: dict[str, str] = {
 
 # Load host-theme tokens for standalone preview HTML documents.
 def _resolve_preview_theme() -> dict[str, str]:
+    tokens = dict(_DEFAULT_PREVIEW_THEME)
     try:
         # Reuse the same host palette mapping as the chat UI.
         from Apps.UI.host_theme_bridge import resolve_preview_document_theme
 
-        tokens = resolve_preview_document_theme()
-        if isinstance(tokens, dict) and tokens.get("bg") and tokens.get("text"):
-            return tokens
+        resolved = resolve_preview_document_theme()
+        if isinstance(resolved, dict) and resolved.get("bg") and resolved.get("text"):
+            tokens = dict(resolved)
     except Exception:
         # Bridge must stay available even if the theme module is missing.
         pass
-    return dict(_DEFAULT_PREVIEW_THEME)
+    # Include the rendered shell so CSS changes also refresh already-cached Readmes.
+    shell = _build_html_document("", "", "", tokens)
+    tokens["fingerprint"] = hashlib.sha256(shell.encode("utf-8")).hexdigest()[:16]
+    return tokens
 
 
 # Escape a CSS color/token value for safe interpolation into a style block.
@@ -444,14 +522,83 @@ def _absolutize_url(candidate: str | None, base_url: str) -> str:
 
 # Payload formatting helpers
 
-# Build a standard item detail line.
-def _build_detail_line(pull_count: str, tag_count: str, updated_text: str) -> str:
-    return " | ".join(part for part in (pull_count, tag_count, updated_text) if part)
+# Localize only at the response boundary: disk caches retain Ollama's original labels.
+def _localize_response(payload: dict[str, Any]) -> dict[str, Any]:
+    localized = deepcopy(payload)
+    locale = resolve_effective_locale_from_snapshot()
+    for entry in localized.get("filters", []):
+        key = entry.get("key")
+        if key in {"sort:popular", "sort:newest"}:
+            entry["title"] = translate(f"downloadsBridge.filters.{key.split(':', 1)[1]}", locale=locale)
+
+    owners = [*localized.get("items", [])]
+    if localized.get("itemDetail") is not None:
+        owners.append(localized["itemDetail"])
+    for owner in owners:
+        for field in owner.get("details", []):
+            text = _normalize_text(field.get("text"))
+            if field.get("icon") == "downloads":
+                match = re.fullmatch(r"(\d[\d,]*(?:\.\d+)?\s*[KMBT]?)\s+(?:downloads?|pulls?)", text, re.IGNORECASE)
+                if match:
+                    display_count = match.group(1)
+                    number = display_count.replace(",", "").replace(" ", "").upper()
+                    multiplier = 1000 ** ("KMBT".index(number[-1]) + 1) if number[-1] in "KMBT" else 1
+                    count = Decimal(number[:-1] if multiplier != 1 else number) * multiplier
+                    if count == count.to_integral_value():
+                        field["text"] = translate_plural(
+                            "downloadsBridge.downloads", int(count), locale=locale, display_count=display_count,
+                        )
+            elif field.get("icon") == "update":
+                field["text"] = _localize_updated_text(text, locale)
+        for variant in owner.get("variants", []):
+            variant["summary"] = re.sub(
+                r"\b(text|image)\b",
+                lambda match: translate(f"downloadsBridge.summary.{match.group().lower()}", locale=locale),
+                str(variant.get("summary") or ""),
+                flags=re.IGNORECASE,
+            )
+    return localized
 
 
-# Build a standard variant detail line.
-def _build_variant_line(parts: list[str]) -> str:
-    return " | ".join(part for part in parts if part)
+# Preserve unknown provider labels; never invent a timestamp for an unrecognized value.
+def _localize_updated_text(value: str, locale: str) -> str:
+    normalized = _strip_leading_label(value, ("updated",)).lower()
+    aliases = {
+        "now": "justNow",
+        "just now": "justNow",
+        "a few seconds ago": "fewSecondsAgo",
+        "less than a minute ago": "lessThanMinuteAgo",
+        "today": "today",
+        "yesterday": "yesterday",
+    }
+    if normalized in aliases:
+        return translate(f"downloadsBridge.updated.{aliases[normalized]}", locale=locale)
+    match = re.fullmatch(r"(\d+|an?)\s+(year|month|week|day|hour|minute|second)s?\s+ago", normalized)
+    if match:
+        count, unit = match.groups()
+        return translate_plural(
+            f"downloadsBridge.updated.{unit}", 1 if count in {"a", "an"} else int(count), locale=locale,
+        )
+    return value
+
+
+# Keep individual counters separate; the host decides how to lay them out.
+def _build_details(pull_count: str, updated_text: str) -> list[dict[str, Any]]:
+    return [
+        {"text": text, "showInCatalog": True, "icon": icon}
+        for text, icon in (
+            (f"{pull_count} downloads" if pull_count else "", "downloads"),
+            (updated_text, "update"),
+        )
+        if text
+    ]
+
+
+def _build_tags(values: list[str]) -> list[dict[str, Any]]:
+    return [
+        {"text": value, **({"icon": value.lower(), "showInCatalog": True} if value.lower() in CAPABILITY_COLORS else {})}
+        for value in _deduplicate_preserving_order(values)
+    ]
 
 
 # Build the static Ollama category payload.
@@ -520,7 +667,6 @@ def _build_html_document(
     surface_strong = _css_token(tokens.get("surface_strong", ""), defaults["surface_strong"])
     border = _css_token(tokens.get("border", ""), defaults["border"])
     text = _css_token(tokens.get("text", ""), defaults["text"])
-    muted = _css_token(tokens.get("muted", ""), defaults["muted"])
     link = _css_token(tokens.get("link", ""), defaults["link"])
     safe_title = (
         str(title or "")
@@ -545,7 +691,6 @@ def _build_html_document(
       --surface-strong: {surface_strong};
       --border: {border};
       --text: {text};
-      --muted: {muted};
       --link: {link};
     }}
 
@@ -584,7 +729,7 @@ def _build_html_document(
 
     p, ul, ol, blockquote, pre {{
       margin: 0 0 14px;
-      color: var(--muted);
+      color: var(--text);
     }}
 
     strong, b {{
@@ -630,7 +775,7 @@ def _build_html_document(
 
     li {{
       margin: 6px 0;
-      color: var(--muted);
+      color: var(--text);
     }}
 
     img {{
@@ -673,7 +818,7 @@ def _build_html_document(
       text-align: left;
       vertical-align: top;
       white-space: nowrap;
-      color: var(--muted);
+      color: var(--text);
       font-size: 13px;
     }}
 
@@ -690,7 +835,7 @@ def _build_html_document(
     blockquote {{
       border-left: 3px solid var(--border);
       padding-left: 12px;
-      color: var(--muted);
+      color: var(--text);
     }}
 
     hr {{
@@ -933,7 +1078,7 @@ def _extract_search_card_meta(list_item: Any) -> tuple[str, str, str]:
         if re.search(r"\btags?\b", lower):
             tag_count_text = _strip_trailing_label(group_text, ("tags", "tag"))
             continue
-        if "updated" in lower or re.search(r"\bago\b", lower):
+        if "updated" in lower or re.search(r"\bago\b", lower) or lower in {"today", "yesterday", "just now", "now"}:
             updated_text = _strip_leading_label(group_text, ("updated",))
             if not updated_text:
                 updated_text = group_text
@@ -1095,12 +1240,11 @@ def _parse_search_items(soup: Any) -> list[dict[str, Any]]:
                 "provider": "Ollama",
                 "version": "",
                 "homepageUrl": f"https://ollama.com{href.split('?', 1)[0]}",
-                "detail": _build_detail_line(
-                    f"{pull_count_text} Pulls" if pull_count_text else "",
-                    f"{tag_count_text} Tags" if tag_count_text else "",
+                "details": _build_details(
+                    pull_count_text,
                     updated_text,
                 ),
-                "tags": tag_values,
+                "tags": _build_tags(tag_values),
                 "variantCount": variant_count,
                 "defaultVariantResourceKey": _variant_resource_key(slug, "latest"),
                 "sortOrder": index,
@@ -1167,6 +1311,21 @@ def _load_search_payload(
 
 # Detail parsing helpers
 
+# Convert the provider's decimal (GB) or binary (GiB) size label to whole bytes.
+# A missing/cloud size remains unknown; an explicit zero is a known empty download.
+# Sizes outside the bridge's int64 byte range cannot be represented and remain unknown.
+def _parse_size_bytes(value: str) -> int | None:
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)\s*(B|[KMGTPE]i?B)", _normalize_text(value), re.IGNORECASE)
+    if match is None:
+        return None
+    number, unit = match.groups()
+    unit = unit.upper()
+    exponent = "BKMGTPE".index(unit[0])
+    multiplier = (1024 if "I" in unit else 1000) ** exponent
+    size = Decimal(number) * multiplier
+    return int(size) if size <= MAX_VARIANT_SIZE_BYTES else None
+
+
 # Parse available model variants from the model page.
 def _parse_variant_payloads(soup: BeautifulSoup, slug: str) -> list[dict[str, Any]]:
     variants: list[dict[str, Any]] = []
@@ -1193,9 +1352,7 @@ def _parse_variant_payloads(soup: BeautifulSoup, slug: str) -> list[dict[str, An
         segments = [segment.strip() for segment in detail_text.split("|") if segment.strip()]
         mobile_rows[href] = {
             "size": segments[0] if len(segments) > 0 else "",
-            "context": segments[1] if len(segments) > 1 else "",
             "input": segments[2] if len(segments) > 2 else "",
-            "updated": segments[3] if len(segments) > 3 else "",
         }
 
     # Parse the main grid and backfill missing fields from the mobile rows
@@ -1213,25 +1370,14 @@ def _parse_variant_payloads(soup: BeautifulSoup, slug: str) -> list[dict[str, An
         tag = model_name.partition(":")[2].strip()
         columns = row.select("p.col-span-2")
         size_text = _normalize_text(columns[0].get_text(" ", strip=True) if len(columns) > 0 else "")
-        context_text = _normalize_text(columns[1].get_text(" ", strip=True) if len(columns) > 1 else "")
         input_text = _normalize_text(columns[2].get_text(" ", strip=True) if len(columns) > 2 else "")
 
         mobile_row = mobile_rows.get(href, {})
         if not size_text:
             size_text = mobile_row.get("size", "")
-        if not context_text:
-            context_text = mobile_row.get("context", "")
         if not input_text:
             input_text = mobile_row.get("input", "")
-
-        # Normalize variant metadata so every row follows the same detail format
-        updated_text = mobile_row.get("updated", "")
-        context_label = context_text
-        if context_label and "context" not in context_label.lower():
-            context_label = f"{context_label} context window"
-
-        detail_segments = [size_text, context_label, input_text, updated_text]
-        tags = [segment for segment in (size_text, context_text, input_text) if segment]
+        size_bytes = _parse_size_bytes(size_text)
         summary = input_text if input_text else ""
 
         variants.append(
@@ -1239,10 +1385,9 @@ def _parse_variant_payloads(soup: BeautifulSoup, slug: str) -> list[dict[str, An
                 "resourceKey": _variant_resource_key(slug, tag),
                 "title": tag or "latest",
                 "summary": summary,
-                "version": "",
-                "detail": _build_variant_line(detail_segments),
+                "size": size_bytes if size_bytes is not None else 0,
+                "hasSize": size_bytes is not None,
                 "homepageUrl": f"https://ollama.com{prefix}{tag}" if tag else f"https://ollama.com{page_path}",
-                "tags": tags,
                 "sortOrder": len(variants),
             }
         )
@@ -1305,7 +1450,8 @@ def _extract_detail_page_meta(soup: Any) -> tuple[str, str]:
                     ("downloads", "download", "pulls", "pull"),
                 )
                 continue
-            if not updated_text and ("updated" in lower or re.search(r"\bago\b", lower)):
+            if not updated_text and ("updated" in lower or re.search(r"\bago\b", lower) or
+                                     lower in {"today", "yesterday", "just now", "now"}):
                 updated_text = _strip_leading_label(group_text, ("updated",))
                 if not updated_text:
                     updated_text = group_text
@@ -1324,15 +1470,13 @@ def _parse_item_detail(slug: str, html: str) -> dict[str, Any]:
     summary = _normalize_text(summary_node.get_text(" ", strip=True) if summary_node else "")
 
     pull_count_text, updated_text = _extract_detail_page_meta(soup)
-    detail = _build_detail_line(
-        f"{pull_count_text} Pulls" if pull_count_text else "",
-        "",
-        updated_text,
-    )
-
     # Resolve variants; host platform filtering is applied later so cached details
     # stay reusable and are filtered at serve time.
     variants = _parse_variant_payloads(soup, slug)
+    details = _build_details(
+        pull_count_text,
+        updated_text,
+    )
     default_variant = _select_default_variant_key(variants)
 
     # Prefer the rendered readme block because it matches the source page styling
@@ -1375,8 +1519,8 @@ def _parse_item_detail(slug: str, html: str) -> dict[str, Any]:
         "provider": "Ollama",
         "version": "",
         "homepageUrl": page_url,
-        "detail": detail,
-        "tags": [],
+        "details": details,
+        # Capability tags remain inherited from list_items; this page does not always expose them.
         "defaultVariantResourceKey": default_variant,
         "variants": variants,
         "blocks": blocks,

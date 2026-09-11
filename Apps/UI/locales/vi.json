@@ -1,4 +1,45 @@
 {
+  "downloadsBridge": {
+    "filters": {
+      "popular": "Phổ biến",
+      "newest": "Mới nhất"
+    },
+    "downloads": {
+      "other": "{count} lượt tải xuống"
+    },
+    "updated": {
+      "justNow": "vừa xong",
+      "fewSecondsAgo": "vài giây trước",
+      "lessThanMinuteAgo": "chưa đầy một phút trước",
+      "today": "hôm nay",
+      "yesterday": "hôm qua",
+      "year": {
+        "other": "{count} năm trước"
+      },
+      "month": {
+        "other": "{count} tháng trước"
+      },
+      "week": {
+        "other": "{count} tuần trước"
+      },
+      "day": {
+        "other": "{count} ngày trước"
+      },
+      "hour": {
+        "other": "{count} giờ trước"
+      },
+      "minute": {
+        "other": "{count} phút trước"
+      },
+      "second": {
+        "other": "{count} giây trước"
+      }
+    },
+    "summary": {
+      "text": "Văn bản",
+      "image": "Hình ảnh"
+    }
+  },
   "tools": {
     "requiresDocker": "Công cụ này yêu cầu Docker.",
     "refreshDocker": "Kiểm tra lại Docker",

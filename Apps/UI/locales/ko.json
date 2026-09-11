@@ -1,4 +1,45 @@
 {
+  "downloadsBridge": {
+    "filters": {
+      "popular": "인기순",
+      "newest": "최신순"
+    },
+    "downloads": {
+      "other": "{count}회 다운로드"
+    },
+    "updated": {
+      "justNow": "방금",
+      "fewSecondsAgo": "몇 초 전",
+      "lessThanMinuteAgo": "1분 미만 전",
+      "today": "오늘",
+      "yesterday": "어제",
+      "year": {
+        "other": "{count}년 전"
+      },
+      "month": {
+        "other": "{count}개월 전"
+      },
+      "week": {
+        "other": "{count}주 전"
+      },
+      "day": {
+        "other": "{count}일 전"
+      },
+      "hour": {
+        "other": "{count}시간 전"
+      },
+      "minute": {
+        "other": "{count}분 전"
+      },
+      "second": {
+        "other": "{count}초 전"
+      }
+    },
+    "summary": {
+      "text": "텍스트",
+      "image": "이미지"
+    }
+  },
   "tools": {
     "requiresDocker": "이 도구에는 Docker가 필요합니다.",
     "refreshDocker": "Docker 다시 확인",

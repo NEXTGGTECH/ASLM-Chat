@@ -127,6 +127,58 @@ def translate(key: str, *, locale: str | None = None, fallback: str | None = Non
     return value
 
 
+# CLDR cardinal categories for whole-number counts in the host's supported languages.
+# https://www.unicode.org/cldr/charts/latest/supplemental/language_plural_rules.html
+def _plural_category(count: int, locale: str) -> str:
+    n = abs(count)
+    if locale in {"id", "ja", "ko", "vi", "zh-Hans", "zh-Hant"}:
+        return "other"
+    if locale == "ar":
+        if n == 0:
+            return "zero"
+        if n == 1:
+            return "one"
+        if n == 2:
+            return "two"
+        if 3 <= n % 100 <= 10:
+            return "few"
+        if 11 <= n % 100 <= 99:
+            return "many"
+        return "other"
+    if locale in {"ru", "uk", "pl"}:
+        if (n == 1 if locale == "pl" else n % 10 == 1 and n % 100 != 11):
+            return "one"
+        if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+            return "few"
+        return "many"
+    if locale in {"es", "fr", "it", "pt", "pt-BR"} and n != 0 and n % 1_000_000 == 0:
+        return "many"
+    # The pt catalog uses European Portuguese; only pt-BR treats zero as singular.
+    if locale in {"fr", "hi", "pt-BR"}:
+        return "one" if n in {0, 1} else "other"
+    return "one" if n == 1 else "other"
+
+
+# Translate a count without forcing languages into English singular/plural grammar.
+# display_count preserves provider abbreviations such as 42.9K independently of agreement.
+def translate_plural(
+    key: str,
+    count: int,
+    *,
+    locale: str | None = None,
+    display_count: str | None = None,
+) -> str:
+    effective = resolve_effective_locale(locale) if locale else resolve_effective_locale_from_snapshot()
+    catalog = load_catalog(effective)
+    category = _plural_category(count, effective)
+    value = _lookup_nested(catalog, f"{key}.{category}")
+    if not isinstance(value, str):
+        value = _lookup_nested(catalog, f"{key}.other")
+    if not isinstance(value, str):
+        return key
+    return _interpolate(value, {"count": count if display_count is None else display_count})
+
+
 # Return the merged catalog tree embedded in pages for client-side ``t()``.
 def catalog_for_js(locale: str | None = None) -> dict[str, Any]:
     effective = resolve_effective_locale(locale) if locale else resolve_effective_locale_from_snapshot()
