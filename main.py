@@ -76,6 +76,23 @@ def _maybe_reexec_in_server_venv(command: str) -> None:
             "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0),
             "startupinfo": startupinfo,
         }
+
+    if command == "downloads_bridge":
+        request_payload = sys.stdin.buffer.read()
+        completed = subprocess.run(
+            args,
+            env=env,
+            input=request_payload,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            **process_kwargs,
+        )
+        sys.stdout.buffer.write(completed.stdout)
+        sys.stdout.buffer.flush()
+        sys.stderr.buffer.write(completed.stderr)
+        sys.stderr.buffer.flush()
+        sys.exit(completed.returncode)
+
     process = subprocess.Popen(args, env=env, **process_kwargs)
     try:
         sys.exit(process.wait())

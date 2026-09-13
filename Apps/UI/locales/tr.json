@@ -1,4 +1,53 @@
 {
+  "downloadsBridge": {
+    "filters": {
+      "popular": "Popüler",
+      "newest": "En yeni"
+    },
+    "downloads": {
+      "one": "{count} indirme",
+      "other": "{count} indirme"
+    },
+    "updated": {
+      "justNow": "az önce",
+      "fewSecondsAgo": "birkaç saniye önce",
+      "lessThanMinuteAgo": "bir dakikadan kısa süre önce",
+      "today": "bugün",
+      "yesterday": "dün",
+      "year": {
+        "one": "{count} yıl önce",
+        "other": "{count} yıl önce"
+      },
+      "month": {
+        "one": "{count} ay önce",
+        "other": "{count} ay önce"
+      },
+      "week": {
+        "one": "{count} hafta önce",
+        "other": "{count} hafta önce"
+      },
+      "day": {
+        "one": "{count} gün önce",
+        "other": "{count} gün önce"
+      },
+      "hour": {
+        "one": "{count} saat önce",
+        "other": "{count} saat önce"
+      },
+      "minute": {
+        "one": "{count} dakika önce",
+        "other": "{count} dakika önce"
+      },
+      "second": {
+        "one": "{count} saniye önce",
+        "other": "{count} saniye önce"
+      }
+    },
+    "summary": {
+      "text": "Metin",
+      "image": "Görsel"
+    }
+  },
   "tools": {
     "requiresDocker": "Bu araç Docker gerektirir.",
     "refreshDocker": "Docker'ı yeniden denetle",

@@ -1,4 +1,61 @@
 {
+  "downloadsBridge": {
+    "filters": {
+      "popular": "Populaires",
+      "newest": "Plus récents"
+    },
+    "downloads": {
+      "one": "{count} téléchargement",
+      "other": "{count} téléchargements",
+      "many": "{count} téléchargements"
+    },
+    "updated": {
+      "justNow": "à l’instant",
+      "fewSecondsAgo": "il y a quelques secondes",
+      "lessThanMinuteAgo": "il y a moins d’une minute",
+      "today": "aujourd’hui",
+      "yesterday": "hier",
+      "year": {
+        "one": "il y a {count} an",
+        "other": "il y a {count} ans",
+        "many": "il y a {count} ans"
+      },
+      "month": {
+        "one": "il y a {count} mois",
+        "other": "il y a {count} mois",
+        "many": "il y a {count} mois"
+      },
+      "week": {
+        "one": "il y a {count} semaine",
+        "other": "il y a {count} semaines",
+        "many": "il y a {count} semaines"
+      },
+      "day": {
+        "one": "il y a {count} jour",
+        "other": "il y a {count} jours",
+        "many": "il y a {count} jours"
+      },
+      "hour": {
+        "one": "il y a {count} heure",
+        "other": "il y a {count} heures",
+        "many": "il y a {count} heures"
+      },
+      "minute": {
+        "one": "il y a {count} minute",
+        "other": "il y a {count} minutes",
+        "many": "il y a {count} minutes"
+      },
+      "second": {
+        "one": "il y a {count} seconde",
+        "other": "il y a {count} secondes",
+        "many": "il y a {count} secondes"
+      }
+    },
+    "summary": {
+      "text": "Texte",
+      "image": "Image"
+    }
+  },
   "tools": {
     "requiresDocker": "Cet outil nécessite Docker.",
     "refreshDocker": "Revérifier Docker",

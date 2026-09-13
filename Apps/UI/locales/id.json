@@ -1,4 +1,45 @@
 {
+  "downloadsBridge": {
+    "filters": {
+      "popular": "Populer",
+      "newest": "Terbaru"
+    },
+    "downloads": {
+      "other": "{count} unduhan"
+    },
+    "updated": {
+      "justNow": "baru saja",
+      "fewSecondsAgo": "beberapa detik lalu",
+      "lessThanMinuteAgo": "kurang dari satu menit lalu",
+      "today": "hari ini",
+      "yesterday": "kemarin",
+      "year": {
+        "other": "{count} tahun lalu"
+      },
+      "month": {
+        "other": "{count} bulan lalu"
+      },
+      "week": {
+        "other": "{count} minggu lalu"
+      },
+      "day": {
+        "other": "{count} hari lalu"
+      },
+      "hour": {
+        "other": "{count} jam lalu"
+      },
+      "minute": {
+        "other": "{count} menit lalu"
+      },
+      "second": {
+        "other": "{count} detik lalu"
+      }
+    },
+    "summary": {
+      "text": "Teks",
+      "image": "Gambar"
+    }
+  },
   "tools": {
     "requiresDocker": "Alat ini memerlukan Docker.",
     "refreshDocker": "Periksa ulang Docker",

@@ -1,4 +1,85 @@
 {
+  "downloadsBridge": {
+    "filters": {
+      "popular": "الأكثر رواجًا",
+      "newest": "الأحدث"
+    },
+    "downloads": {
+      "zero": "لا تنزيلات",
+      "one": "تنزيل واحد",
+      "two": "تنزيلان",
+      "few": "{count} تنزيلات",
+      "many": "{count} تنزيلًا",
+      "other": "{count} تنزيل"
+    },
+    "updated": {
+      "justNow": "الآن",
+      "fewSecondsAgo": "قبل بضع ثوانٍ",
+      "lessThanMinuteAgo": "قبل أقل من دقيقة",
+      "today": "اليوم",
+      "yesterday": "أمس",
+      "year": {
+        "zero": "قبل {count} سنة",
+        "one": "قبل سنة واحدة",
+        "two": "قبل سنتين",
+        "few": "قبل {count} سنوات",
+        "many": "قبل {count} سنة",
+        "other": "قبل {count} سنة"
+      },
+      "month": {
+        "zero": "قبل {count} شهر",
+        "one": "قبل شهر واحد",
+        "two": "قبل شهرين",
+        "few": "قبل {count} أشهر",
+        "many": "قبل {count} شهرًا",
+        "other": "قبل {count} شهر"
+      },
+      "week": {
+        "zero": "قبل {count} أسبوع",
+        "one": "قبل أسبوع واحد",
+        "two": "قبل أسبوعين",
+        "few": "قبل {count} أسابيع",
+        "many": "قبل {count} أسبوعًا",
+        "other": "قبل {count} أسبوع"
+      },
+      "day": {
+        "zero": "قبل {count} يوم",
+        "one": "قبل يوم واحد",
+        "two": "قبل يومين",
+        "few": "قبل {count} أيام",
+        "many": "قبل {count} يومًا",
+        "other": "قبل {count} يوم"
+      },
+      "hour": {
+        "zero": "قبل {count} ساعة",
+        "one": "قبل ساعة واحدة",
+        "two": "قبل ساعتين",
+        "few": "قبل {count} ساعات",
+        "many": "قبل {count} ساعة",
+        "other": "قبل {count} ساعة"
+      },
+      "minute": {
+        "zero": "قبل {count} دقيقة",
+        "one": "قبل دقيقة واحدة",
+        "two": "قبل دقيقتين",
+        "few": "قبل {count} دقائق",
+        "many": "قبل {count} دقيقة",
+        "other": "قبل {count} دقيقة"
+      },
+      "second": {
+        "zero": "قبل {count} ثانية",
+        "one": "قبل ثانية واحدة",
+        "two": "قبل ثانيتين",
+        "few": "قبل {count} ثوانٍ",
+        "many": "قبل {count} ثانية",
+        "other": "قبل {count} ثانية"
+      }
+    },
+    "summary": {
+      "text": "نص",
+      "image": "صورة"
+    }
+  },
   "tools": {
     "requiresDocker": "تتطلب هذه الأداة Docker.",
     "refreshDocker": "إعادة فحص Docker",

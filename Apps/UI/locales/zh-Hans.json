@@ -1,4 +1,45 @@
 {
+  "downloadsBridge": {
+    "filters": {
+      "popular": "热门",
+      "newest": "最新"
+    },
+    "downloads": {
+      "other": "{count} 次下载"
+    },
+    "updated": {
+      "justNow": "刚刚",
+      "fewSecondsAgo": "几秒前",
+      "lessThanMinuteAgo": "不到一分钟前",
+      "today": "今天",
+      "yesterday": "昨天",
+      "year": {
+        "other": "{count}年前"
+      },
+      "month": {
+        "other": "{count}个月前"
+      },
+      "week": {
+        "other": "{count}周前"
+      },
+      "day": {
+        "other": "{count}天前"
+      },
+      "hour": {
+        "other": "{count}小时前"
+      },
+      "minute": {
+        "other": "{count}分钟前"
+      },
+      "second": {
+        "other": "{count}秒前"
+      }
+    },
+    "summary": {
+      "text": "文本",
+      "image": "图像"
+    }
+  },
   "tools": {
     "requiresDocker": "此工具需要 Docker。",
     "refreshDocker": "重新检查 Docker",

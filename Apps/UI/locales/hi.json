@@ -1,4 +1,53 @@
 {
+  "downloadsBridge": {
+    "filters": {
+      "popular": "लोकप्रिय",
+      "newest": "सबसे नए"
+    },
+    "downloads": {
+      "one": "{count} डाउनलोड",
+      "other": "{count} डाउनलोड"
+    },
+    "updated": {
+      "justNow": "अभी-अभी",
+      "fewSecondsAgo": "कुछ सेकंड पहले",
+      "lessThanMinuteAgo": "एक मिनट से भी कम समय पहले",
+      "today": "आज",
+      "yesterday": "कल",
+      "year": {
+        "one": "{count} वर्ष पहले",
+        "other": "{count} वर्ष पहले"
+      },
+      "month": {
+        "one": "{count} महीने पहले",
+        "other": "{count} महीने पहले"
+      },
+      "week": {
+        "one": "{count} सप्ताह पहले",
+        "other": "{count} सप्ताह पहले"
+      },
+      "day": {
+        "one": "{count} दिन पहले",
+        "other": "{count} दिन पहले"
+      },
+      "hour": {
+        "one": "{count} घंटे पहले",
+        "other": "{count} घंटे पहले"
+      },
+      "minute": {
+        "one": "{count} मिनट पहले",
+        "other": "{count} मिनट पहले"
+      },
+      "second": {
+        "one": "{count} सेकंड पहले",
+        "other": "{count} सेकंड पहले"
+      }
+    },
+    "summary": {
+      "text": "टेक्स्ट",
+      "image": "छवि"
+    }
+  },
   "tools": {
     "requiresDocker": "इस टूल के लिए Docker आवश्यक है।",
     "refreshDocker": "Docker फिर से जाँचें",

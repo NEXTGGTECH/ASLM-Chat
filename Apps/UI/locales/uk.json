@@ -1,4 +1,61 @@
 {
+  "downloadsBridge": {
+    "filters": {
+      "popular": "Популярні",
+      "newest": "Нові"
+    },
+    "downloads": {
+      "one": "{count} завантаження",
+      "few": "{count} завантаження",
+      "many": "{count} завантажень"
+    },
+    "updated": {
+      "justNow": "щойно",
+      "fewSecondsAgo": "кілька секунд тому",
+      "lessThanMinuteAgo": "менше хвилини тому",
+      "today": "сьогодні",
+      "yesterday": "вчора",
+      "year": {
+        "one": "{count} рік тому",
+        "few": "{count} роки тому",
+        "many": "{count} років тому"
+      },
+      "month": {
+        "one": "{count} місяць тому",
+        "few": "{count} місяці тому",
+        "many": "{count} місяців тому"
+      },
+      "week": {
+        "one": "{count} тиждень тому",
+        "few": "{count} тижні тому",
+        "many": "{count} тижнів тому"
+      },
+      "day": {
+        "one": "{count} день тому",
+        "few": "{count} дні тому",
+        "many": "{count} днів тому"
+      },
+      "hour": {
+        "one": "{count} годину тому",
+        "few": "{count} години тому",
+        "many": "{count} годин тому"
+      },
+      "minute": {
+        "one": "{count} хвилину тому",
+        "few": "{count} хвилини тому",
+        "many": "{count} хвилин тому"
+      },
+      "second": {
+        "one": "{count} секунду тому",
+        "few": "{count} секунди тому",
+        "many": "{count} секунд тому"
+      }
+    },
+    "summary": {
+      "text": "Текст",
+      "image": "Зображення"
+    }
+  },
   "tools": {
     "requiresDocker": "Цей інструмент потребує Docker.",
     "refreshDocker": "Перевірити Docker знову",

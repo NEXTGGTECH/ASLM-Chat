@@ -1,4 +1,53 @@
 {
+  "downloadsBridge": {
+    "filters": {
+      "popular": "Beliebt",
+      "newest": "Neueste"
+    },
+    "downloads": {
+      "one": "{count} Download",
+      "other": "{count} Downloads"
+    },
+    "updated": {
+      "justNow": "gerade eben",
+      "fewSecondsAgo": "vor wenigen Sekunden",
+      "lessThanMinuteAgo": "vor weniger als einer Minute",
+      "today": "heute",
+      "yesterday": "gestern",
+      "year": {
+        "one": "vor {count} Jahr",
+        "other": "vor {count} Jahren"
+      },
+      "month": {
+        "one": "vor {count} Monat",
+        "other": "vor {count} Monaten"
+      },
+      "week": {
+        "one": "vor {count} Woche",
+        "other": "vor {count} Wochen"
+      },
+      "day": {
+        "one": "vor {count} Tag",
+        "other": "vor {count} Tagen"
+      },
+      "hour": {
+        "one": "vor {count} Stunde",
+        "other": "vor {count} Stunden"
+      },
+      "minute": {
+        "one": "vor {count} Minute",
+        "other": "vor {count} Minuten"
+      },
+      "second": {
+        "one": "vor {count} Sekunde",
+        "other": "vor {count} Sekunden"
+      }
+    },
+    "summary": {
+      "text": "Text",
+      "image": "Bild"
+    }
+  },
   "tools": {
     "requiresDocker": "Dieses Tool benötigt Docker.",
     "refreshDocker": "Docker erneut prüfen",

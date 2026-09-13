@@ -1,4 +1,45 @@
 {
+  "downloadsBridge": {
+    "filters": {
+      "popular": "人気順",
+      "newest": "新着順"
+    },
+    "downloads": {
+      "other": "{count} 回のダウンロード"
+    },
+    "updated": {
+      "justNow": "たった今",
+      "fewSecondsAgo": "数秒前",
+      "lessThanMinuteAgo": "1分未満前",
+      "today": "今日",
+      "yesterday": "昨日",
+      "year": {
+        "other": "{count}年前"
+      },
+      "month": {
+        "other": "{count}か月前"
+      },
+      "week": {
+        "other": "{count}週間前"
+      },
+      "day": {
+        "other": "{count}日前"
+      },
+      "hour": {
+        "other": "{count}時間前"
+      },
+      "minute": {
+        "other": "{count}分前"
+      },
+      "second": {
+        "other": "{count}秒前"
+      }
+    },
+    "summary": {
+      "text": "テキスト",
+      "image": "画像"
+    }
+  },
   "tools": {
     "requiresDocker": "このツールには Docker が必要です。",
     "refreshDocker": "Docker を再確認",

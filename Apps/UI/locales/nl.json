@@ -1,4 +1,53 @@
 {
+  "downloadsBridge": {
+    "filters": {
+      "popular": "Populair",
+      "newest": "Nieuwste"
+    },
+    "downloads": {
+      "one": "{count} download",
+      "other": "{count} downloads"
+    },
+    "updated": {
+      "justNow": "zojuist",
+      "fewSecondsAgo": "enkele seconden geleden",
+      "lessThanMinuteAgo": "minder dan een minuut geleden",
+      "today": "vandaag",
+      "yesterday": "gisteren",
+      "year": {
+        "one": "{count} jaar geleden",
+        "other": "{count} jaar geleden"
+      },
+      "month": {
+        "one": "{count} maand geleden",
+        "other": "{count} maanden geleden"
+      },
+      "week": {
+        "one": "{count} week geleden",
+        "other": "{count} weken geleden"
+      },
+      "day": {
+        "one": "{count} dag geleden",
+        "other": "{count} dagen geleden"
+      },
+      "hour": {
+        "one": "{count} uur geleden",
+        "other": "{count} uur geleden"
+      },
+      "minute": {
+        "one": "{count} minuut geleden",
+        "other": "{count} minuten geleden"
+      },
+      "second": {
+        "one": "{count} seconde geleden",
+        "other": "{count} seconden geleden"
+      }
+    },
+    "summary": {
+      "text": "Tekst",
+      "image": "Afbeelding"
+    }
+  },
   "tools": {
     "requiresDocker": "Voor deze tool is Docker vereist.",
     "refreshDocker": "Docker opnieuw controleren",
