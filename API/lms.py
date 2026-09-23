@@ -14,9 +14,11 @@ import threading
 import unicodedata
 from typing import Any
 from urllib.parse import urlparse
+from urllib.request import Request
 
 from API import mcp as tool_registry
 from Settings import settings
+from Settings.proxy_policy import urlopen_with_loopback_bypass
 
 logger = logging.getLogger(__name__)
 
@@ -351,6 +353,36 @@ def _serialize_model_info(info: Any) -> dict[str, Any]:
             break
 
     return payload
+
+
+# Read capabilities independently of the loaded-model lifecycle.
+def _get_catalog_model_info(model_name: str) -> dict[str, Any]:
+    """Read public capabilities for loaded and unloaded models without loading them."""
+    base_url = settings.get_engine_url("lms").strip().rstrip("/")
+    if not base_url.startswith(("http://", "https://")):
+        base_url = f"http://{base_url}"
+    base_url = re.sub(r"/(?:api/)?v[01]$", "", base_url)
+    request = Request(f"{base_url}/api/v1/models", headers={"Accept": "application/json"})
+    try:
+        with urlopen_with_loopback_bypass(request, timeout=5) as response:
+            catalog = json.loads(response.read().decode("utf-8"))
+    except (OSError, ValueError):
+        logger.debug("[LM Studio API] Native model catalog is unavailable", exc_info=True)
+        return {}
+
+    models = catalog.get("models", []) if isinstance(catalog, dict) else []
+    candidates = []
+    for model in models if isinstance(models, list) else []:
+        if not isinstance(model, dict) or model.get("type") != "llm":
+            continue
+        names = [model.get("key")]
+        names.extend(model.get("variants") or [])
+        names.extend(instance.get("id") for instance in model.get("loaded_instances", []) if isinstance(instance, dict))
+        if any(_normalize_model_identifier(model_name) == _normalize_model_identifier(name) for name in names if name):
+            return model
+        if _model_identifiers_match(model_name, model.get("key")):
+            candidates.append(model)
+    return candidates[0] if len(candidates) == 1 else {}
 
 
 # Fetch one raw model info payload.
@@ -1869,17 +1901,25 @@ def generate(model_name: str, messages: list[dict[str, Any]], **kwargs: Any):
 
 # Read one model's settings.
 def get_model_settings(model_name: str) -> dict[str, Any]:
-    """Return capability metadata for one already-loaded LM Studio model."""
+    """Combine the downloaded-model catalog with optional loaded-instance settings."""
 
-    _lms, client = _get_client()
+    catalog_info = _get_catalog_model_info(model_name)
+    info = None
+    raw_info: dict[str, Any] = {}
+    fallback_info: dict[str, Any] = {}
+    client = None
     try:
-        # Do not require the model to be loaded: capability metadata is read
-        # best-effort from the API and the local LM Studio model index, so a
-        # downloaded model can be inspected before it is JIT-loaded for chat.
-        raw_info = _get_raw_model_info(client, model_name)
-        info, fallback_info = _get_model_info(client, model_name)
+        if not catalog_info or catalog_info.get("loaded_instances"):
+            _lms, client = _get_client()
+            raw_info = _get_raw_model_info(client, model_name)
+            info, fallback_info = _get_model_info(client, model_name)
+    except Exception:
+        if not catalog_info:
+            raise
+        logger.debug("[LM Studio API] Using catalog without loaded-instance settings", exc_info=True)
     finally:
-        _close_client(client)
+        if client is not None:
+            _close_client(client)
 
     model_index_record = _get_model_index_record(model_name)
     model_virtual = model_index_record.get("virtual", {}) if isinstance(model_index_record, dict) else {}
@@ -1895,6 +1935,10 @@ def get_model_settings(model_name: str) -> dict[str, Any]:
         raw_info["reasoning"] = True
 
     metadata_overrides = _normalize_model_config(raw_info.get("metadataOverrides") or {})
+    catalog_capabilities = catalog_info.get("capabilities", {})
+    if not isinstance(catalog_capabilities, dict):
+        catalog_capabilities = {}
+    catalog_reasoning = catalog_capabilities.get("reasoning")
     config_payload = _normalize_model_config(raw_info.get("config") or {})
     operation_defaults = _merge_nested_dicts(_normalize_model_config(config_payload.get("operation") or {}), disk_operation_defaults)
 
@@ -1929,16 +1973,23 @@ def get_model_settings(model_name: str) -> dict[str, Any]:
         or metadata_overrides.get("maxContextLength")
         or getattr(info, "context_length", None)
         or getattr(info, "max_context_length", None)
+        or catalog_info.get("max_context_length")
         or 8192
     )
     supports_vision = _bool_from_value(
-        raw_info.get("vision", metadata_overrides.get("vision", getattr(info, "vision", False))),
+        catalog_capabilities.get(
+            "vision",
+            raw_info.get("vision", metadata_overrides.get("vision", getattr(info, "vision", False))),
+        ),
         default=False,
     )
     supports_tool_calling = _bool_from_value(
-        raw_info.get(
-            "trainedForToolUse",
-            metadata_overrides.get("trainedForToolUse", getattr(info, "trained_for_tool_use", False)),
+        catalog_capabilities.get(
+            "trained_for_tool_use",
+            raw_info.get(
+                "trainedForToolUse",
+                metadata_overrides.get("trainedForToolUse", getattr(info, "trained_for_tool_use", False)),
+            ),
         ),
         default=False,
     )
@@ -1946,7 +1997,14 @@ def get_model_settings(model_name: str) -> dict[str, Any]:
         raw_info.get("reasoning", metadata_overrides.get("reasoning")),
         default=False,
     )
-    supports_thinking = supports_thinking or bool(model_virtual.get("metadataOverridesReasoning")) or custom_toggle_name is not None or think_value is not None or think_level_value is not None
+    supports_thinking = (
+        supports_thinking
+        or bool(catalog_reasoning)
+        or bool(model_virtual.get("metadataOverridesReasoning"))
+        or custom_toggle_name is not None
+        or think_value is not None
+        or think_level_value is not None
+    )
     supports_think_level = think_level_value is not None or custom_level_name is not None
     supports_think_toggle = custom_toggle_name is not None or isinstance(think_value, bool)
 
@@ -1973,6 +2031,10 @@ def get_model_settings(model_name: str) -> dict[str, Any]:
     return {
         "model": model_name,
         "context_length": int(context_length),
+        "capabilities_source": "lms-catalog" if catalog_capabilities else "lms-sdk",
+        "metadata_fallback": not catalog_capabilities and not any(
+            key in raw_info or key in metadata_overrides for key in ("vision", "trainedForToolUse")
+        ),
         "defaults": operation_defaults,
         "supports_thinking": supports_thinking,
         "supports_think_toggle": supports_think_toggle,

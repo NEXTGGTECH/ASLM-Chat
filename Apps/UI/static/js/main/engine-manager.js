@@ -4,7 +4,7 @@ import { getJson, postJson } from './api.js';
 import { t } from './i18n.js';
 import { confirmDialog, textDialog } from '../ui/dialogs.js';
 import { LLM_PARAMETER_OPTION_SETS } from './constants.js';
-import { getEngineAdapter, normalizeEngineValue } from '../engines/engine-registry.js';
+import { getEngineAdapter, getModelEndpoint, normalizeEngineValue } from '../engines/engine-registry.js';
 import { isLocalHostname, normalizeAddressForParsing } from './utils.js';
 
 // Engine manager.
@@ -633,6 +633,8 @@ export function createEngineManager(context, dependencies) {
   // Load capabilities and defaults for the selected model.
   async function loadModelInfo(model) {
     const requestedEngine = getActiveEngine();
+    const requestedEndpoint = getModelEndpoint(requestedEngine, state.runtimeSettings);
+    const selectionVersion = state.engineSelectionVersion;
     const requestVersion = ++state.modelInfoRequestVersion;
 
     if (!model) {
@@ -655,12 +657,14 @@ export function createEngineManager(context, dependencies) {
     try {
       const data = await getJson(`/api/model_info/?engine=${encodeURIComponent(requestedEngine)}&model=${encodeURIComponent(model)}`);
 
-      if (requestVersion !== state.modelInfoRequestVersion || requestedEngine !== getActiveEngine() || model !== getSelectedModelName()) {
+      if (requestVersion !== state.modelInfoRequestVersion || selectionVersion !== state.engineSelectionVersion
+        || requestedEngine !== getActiveEngine() || model !== getSelectedModelName()) {
         return;
       }
 
       // Rebuild all capability-dependent panels from the latest payload.
       state.currentModelInfo = data;
+      state.currentModelInfoEndpoint = requestedEndpoint;
       rememberLastModel(requestedEngine, model);
       parametersUi.resetDynamicPanels();
       applyPresetState(
@@ -735,7 +739,7 @@ export function createEngineManager(context, dependencies) {
 
       parametersUi.renderModelParameters(data, defaults);
     } catch (error) {
-      if (requestVersion !== state.modelInfoRequestVersion) {
+      if (requestVersion !== state.modelInfoRequestVersion || selectionVersion !== state.engineSelectionVersion) {
         return;
       }
 

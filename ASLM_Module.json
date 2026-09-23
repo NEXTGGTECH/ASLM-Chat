@@ -44,6 +44,7 @@
         "branch": "main",
         "preserve": [
             "Data/downloads_bridge_cache",
+            "Data/model_capabilities",
             "Data/venvs",
             "Settings/settings.json",
             "Skills",
