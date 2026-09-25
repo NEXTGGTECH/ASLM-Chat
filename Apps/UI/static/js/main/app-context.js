@@ -75,7 +75,6 @@ export function createAppContext() {
     $composerSkillsHosts: $('.composer-skills-host'),
     $attachBtn: $('#attachBtn'),
     $attachBtnConv: $('#attachBtnConv'),
-    $modelVisionIndicator: $('#modelVisionIndicator'),
     $thinkToggleBtn: $('#thinkToggleBtn'),
     $thinkToggleBtnConv: $('#thinkToggleBtnConv'),
     $thinkLevelSelector: $('#thinkLevelSelector'),
@@ -195,6 +194,7 @@ export function createAppContext() {
       chatRequestQueue: [],
       contextUsage: {},
       currentModelInfo: null,
+      currentModelInfoEndpoint: null,
       activeMenuTarget: null,
       visionState: {
         supported: false

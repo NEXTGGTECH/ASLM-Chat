@@ -3,7 +3,7 @@
     "id": "aslm-chat",
     "name": "ASLM Chat",
     "description": "ASLM Chat Module",
-    "version": "0.9.0.3",
+    "version": "0.9.1.4",
     "author": "NEXTGGTECH",
     "type": "ui",
     "category": [
@@ -44,6 +44,7 @@
         "branch": "main",
         "preserve": [
             "Data/downloads_bridge_cache",
+            "Data/model_capabilities",
             "Data/venvs",
             "Settings/settings.json",
             "Skills",

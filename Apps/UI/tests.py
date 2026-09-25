@@ -29,6 +29,7 @@ from API import lms as lms_api
 from API import mcp as tool_registry
 from API import ollama as ollama_api
 from API import openai as openai_api
+from Apps.Data import model_capabilities
 from Tools.system_prompts import get_system_prompt, is_instant_generation
 from API.google_genai import (
     generate as generate_google_genai,
@@ -3970,6 +3971,7 @@ class LmsAdapterTests(SimpleTestCase):
         self.assertEqual(payload["maxContextLength"], 65536)
 
     # Test get model settings uses loaded model info when direct lookup fails.
+    @patch("API.lms._get_catalog_model_info", return_value={})
     @patch("API.lms._close_client")
     @patch("API.lms._get_client")
     # Verify get model settings uses loaded model info when direct lookup fails.
@@ -3977,6 +3979,7 @@ class LmsAdapterTests(SimpleTestCase):
         self,
         mock_get_client,
         _mock_close_client,
+        _mock_catalog,
     ):
         # Define loaded info.
         class LoadedInfo:
@@ -3999,6 +4002,42 @@ class LmsAdapterTests(SimpleTestCase):
         self.assertTrue(payload["supports_vision"])
         self.assertTrue(payload["supports_tool_calling"])
         self.assertEqual(payload["context_length"], 65536)
+
+    @patch("API.lms._get_client")
+    @patch("API.lms._get_local_gpu_devices", return_value=[])
+    @patch("API.lms._get_disk_model_operation_defaults", return_value={})
+    @patch("API.lms._get_model_index_record", return_value={})
+    @patch("API.lms._get_catalog_model_info")
+    def test_unloaded_model_uses_catalog_capabilities_without_sdk_load(
+        self, catalog, _index, _defaults, _gpu, client,
+    ):
+        catalog.return_value = {
+            "key": "qwen/model", "loaded_instances": [], "max_context_length": 262144,
+            "capabilities": {"vision": True, "trained_for_tool_use": True, "reasoning": {"allowed_options": ["off", "on"]}},
+        }
+        payload = get_lms_model_settings("qwen/model")
+        self.assertTrue(payload["supports_vision"])
+        self.assertTrue(payload["supports_tool_calling"])
+        self.assertTrue(payload["supports_thinking"])
+        self.assertFalse(payload["metadata_fallback"])
+        self.assertEqual(payload["capabilities_source"], "lms-catalog")
+        self.assertEqual(payload["context_length"], 262144)
+        client.assert_not_called()
+
+    @patch("API.lms.urlopen_with_loopback_bypass")
+    @patch("API.lms.settings.get_engine_url", return_value="http://localhost:1234/v1")
+    def test_catalog_resolves_model_keys_and_loaded_instance_aliases(self, _url, request):
+        models = [
+            {"type": "embedding", "key": "embedding"},
+            {"type": "llm", "key": "owner/model", "loaded_instances": [{"id": "instance"}]},
+            {"type": "llm", "key": "other/model", "variants": ["other/model@q4"]},
+        ]
+        request.return_value.__enter__.return_value.read.return_value = json.dumps({"models": models}).encode()
+        self.assertEqual(lms_api._get_catalog_model_info("instance"), models[1])
+        self.assertEqual(lms_api._get_catalog_model_info("owner/model"), models[1])
+        self.assertEqual(lms_api._get_catalog_model_info("other/model@q4"), models[2])
+        self.assertEqual(lms_api._get_catalog_model_info("model"), {})
+        self.assertEqual(request.call_args.args[0].full_url, "http://localhost:1234/api/v1/models")
 
     # Test prepare OpenAI prediction options keeps LM Studio custom values in extra body.
     def test_prepare_openai_prediction_options_keeps_lms_custom_values_in_extra_body(self):
@@ -4204,6 +4243,162 @@ class BrowserPortalApiTests(SimpleTestCase):
 
 # Model metadata cache tests.
 # Ensure cached payloads are safe to reuse between requests.
+class ModelCapabilitiesCacheTests(SimpleTestCase):
+    def setUp(self):
+        super().setUp()
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.cache_dir = Path(temporary.name)
+        cache_patch = patch.object(model_capabilities, "CACHE_DIR", self.cache_dir)
+        cache_patch.start()
+        self.addCleanup(cache_patch.stop)
+        enabled_patch = patch("Apps.UI.views.settings.is_engine_enabled", return_value=True)
+        enabled_patch.start()
+        self.addCleanup(enabled_patch.stop)
+        self.endpoint = "https://first.example/v1"
+        url_patch = patch("Apps.UI.views.settings.get_engine_url", side_effect=lambda engine: self.endpoint)
+        url_patch.start()
+        self.addCleanup(url_patch.stop)
+        _clear_model_metadata_caches()
+        self.addCleanup(_clear_model_metadata_caches)
+
+    def request_capabilities(self, engine="openai", model="same-model", **query):
+        return self.client.get(reverse("model_capabilities_api"), {"engine": engine, "model": model, **query})
+
+    @patch("Apps.UI.views.llm_api.get_model_settings")
+    def test_success_is_read_back_from_disk_without_provider_or_presets(self, provider):
+        provider.return_value = {"supports_vision": True, "supports_thinking": True, "defaults": {"temperature": 0.2}}
+        with patch("Apps.UI.views.get_openai_preset_payload") as presets:
+            first = self.request_capabilities()
+            _clear_model_metadata_caches()
+            provider.side_effect = RuntimeError("offline after restart")
+            second = self.request_capabilities()
+            presets.assert_not_called()
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.json(), first.json())
+        provider.assert_called_once_with("openai", "same-model")
+        records = json.loads((self.cache_dir / "openai.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["endpoint"], self.endpoint)
+        self.assertNotIn("defaults", records[0]["capabilities"])
+        self.assertTrue(records[0]["capabilities"]["supports_thinking"])
+
+    @patch("Apps.UI.views.llm_api.get_model_settings")
+    def test_engine_and_endpoint_isolation_and_ollama_without_url(self, provider):
+        for engine in ("lms", "openai", "google-genai"):
+            self.endpoint = "https://first.example/v1"
+            provider.return_value = {"supports_vision": True, "capabilities_source": "catalog"}
+            self.assertEqual(self.request_capabilities(engine).status_code, 200)
+            self.endpoint = "https://second.example/v1"
+            provider.return_value = {"supports_tool_calling": True, "capabilities_source": "catalog"}
+            self.assertEqual(self.request_capabilities(engine).status_code, 200)
+            records = json.loads((self.cache_dir / f"{engine}.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(records), 2)
+            self.assertTrue(records[0]["capabilities"]["supports_vision"])
+            self.assertFalse(records[1]["capabilities"]["supports_vision"])
+            self.assertTrue(records[1]["capabilities"]["supports_tool_calling"])
+            listed = self.request_capabilities(engine, model="").json()["records"]
+            self.assertEqual(listed, records[1:])
+        provider.return_value = {"capabilities": ["vision", "tools", "thinking"]}
+        response = self.request_capabilities("ollama-service", "gemma4:cloud")
+        self.assertNotIn("endpoint", response.json())
+        self.assertTrue(response.json()["capabilities"]["is_cloud"])
+        self.assertEqual(len(list(self.cache_dir.glob("*.json"))), 4)
+
+    @patch("Apps.UI.views.llm_api.get_model_settings")
+    def test_only_expired_entries_are_refreshed_and_replaced(self, provider):
+        with patch.object(model_capabilities.time, "time", return_value=1):
+            model_capabilities.store("openai", "same-model", self.endpoint, {"supports_vision": False})
+        provider.return_value = {"supports_vision": True}
+        response = self.request_capabilities()
+        self.assertTrue(response.json()["capabilities"]["supports_vision"])
+        records = model_capabilities.list_cached("openai", self.endpoint)
+        self.assertEqual(len(records), 1)
+        self.assertTrue(model_capabilities.is_fresh(records[0]))
+        provider.assert_called_once()
+
+    @patch("Apps.UI.views.llm_api.get_model_settings", side_effect=RuntimeError("offline"))
+    def test_failure_keeps_stale_facts_and_does_not_cache_unknown_as_false(self, provider):
+        with patch.object(model_capabilities.time, "time", return_value=1):
+            record = model_capabilities.store("openai", "same-model", self.endpoint, {"supports_vision": True})
+        response = self.request_capabilities()
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["stale"])
+        self.assertTrue(response.json()["capabilities"]["supports_vision"])
+        missing = self.request_capabilities(model="unknown")
+        self.assertEqual(missing.status_code, 503)
+        self.assertEqual(model_capabilities.list_cached("openai", self.endpoint), [record])
+
+    @patch("Apps.UI.views.llm_api.get_model_settings")
+    def test_invalid_cache_is_rebuilt_from_provider(self, provider):
+        (self.cache_dir / "openai.json").write_text("[broken", encoding="utf-8")
+        provider.return_value = {"supports_tool_calling": True}
+        with self.assertLogs("Apps.Data.model_capabilities", level="WARNING"):
+            response = self.request_capabilities()
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(model_capabilities.list_cached("openai", self.endpoint)[0]["capabilities"]["supports_tool_calling"])
+
+    @patch("Apps.UI.views.llm_api.get_model_settings")
+    def test_endpoint_change_during_fetch_cannot_contaminate_cache(self, provider):
+        def change_endpoint(*_args):
+            self.endpoint = "https://second.example/v1"
+            return {"supports_vision": True}
+        provider.side_effect = change_endpoint
+        self.assertEqual(self.request_capabilities().status_code, 409)
+        self.assertEqual(list(self.cache_dir.iterdir()), [])
+
+    @patch("Apps.UI.views.llm_api.get_model_settings")
+    def test_obsolete_queued_endpoint_request_is_rejected_without_fetch(self, provider):
+        self.assertEqual(self.request_capabilities(endpoint="https://second.example/v1").status_code, 409)
+        provider.assert_not_called()
+
+    @patch("Apps.UI.views.llm_api.get_model_settings")
+    def test_genai_fixed_endpoint_can_resolve_unselected_models(self, provider):
+        self.endpoint = "https://generativelanguage.googleapis.com"
+        provider.return_value = {"supports_vision": True, "supports_tool_calling": True}
+        response = self.request_capabilities("google-genai", "unselected", endpoint=self.endpoint)
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["capabilities"]["supports_tool_calling"])
+        provider.assert_called_once_with("google-genai", "unselected")
+
+    @patch("Apps.UI.views.llm_api.get_model_settings")
+    def test_old_lms_snapshots_are_rechecked_without_waiting_a_day(self, provider):
+        model_capabilities.store("lms", "same-model", self.endpoint, {"supports_vision": False})
+        records = self.request_capabilities("lms", model="").json()["records"]
+        self.assertTrue(records[0]["stale"])
+        self.assertFalse(model_capabilities.is_fresh(records[0]))
+        provider.return_value = {"supports_vision": True, "capabilities_source": "lms-catalog"}
+        response = self.request_capabilities("lms")
+        self.assertTrue(response.json()["capabilities"]["supports_vision"])
+        self.assertTrue(model_capabilities.is_fresh(response.json()))
+        self.assertEqual(response.json()["source"], "lms-catalog")
+        self.request_capabilities("lms")
+        provider.assert_called_once()
+
+    @patch("Apps.UI.views.llm_api.get_model_settings", return_value={"metadata_fallback": True})
+    def test_missing_lms_metadata_is_not_persisted_as_unsupported(self, provider):
+        response = self.request_capabilities("lms")
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(list(self.cache_dir.iterdir()), [])
+
+    @patch("Apps.UI.views.llm_api.get_model_settings")
+    def test_missing_layer_metadata_is_not_a_cloud_marker(self, provider):
+        provider.return_value = {"capabilities": ["completion"]}
+        response = self.request_capabilities("ollama-service", "local-model")
+        self.assertFalse(response.json()["capabilities"]["is_cloud"])
+        provider.return_value = {"supports_vision": True, "is_cloud": True}
+        response = self.request_capabilities("openai", "remote-model")
+        self.assertFalse(response.json()["capabilities"]["is_cloud"])
+
+    def test_failed_atomic_write_preserves_previous_file(self):
+        record = model_capabilities.store("openai", "same-model", self.endpoint, {"supports_vision": True})
+        with patch.object(model_capabilities.os, "replace", side_effect=OSError("locked")):
+            with self.assertLogs("Apps.Data.model_capabilities", level="WARNING"):
+                model_capabilities.store("openai", "same-model", self.endpoint, {"supports_vision": False})
+        self.assertEqual(model_capabilities.list_cached("openai", self.endpoint), [record])
+        self.assertEqual(list(self.cache_dir.glob("*.tmp")), [])
+
+
 class ModelInfoCacheTests(TestCase):
     # Clear metadata caches around each test.
     def setUp(self):

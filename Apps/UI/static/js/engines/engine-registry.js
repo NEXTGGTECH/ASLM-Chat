@@ -40,6 +40,14 @@ export function getEngineAdapter(engine) {
   return adaptersById.get(normalizeEngineValue(engine)) || ollamaServiceAdapter;
 }
 
+// Metadata is scoped to the server URL even when its address control is hidden.
+export function getModelEndpoint(engine, runtimeSettings) {
+  const canonical = normalizeEngineValue(engine);
+  return canonical === 'ollama-service'
+    ? ''
+    : String(runtimeSettings.engine_urls?.[canonical] || '').trim().replace(/\/+$/, '');
+}
+
 // Report whether the engine supports presets.
 export function isPresetCapableEngine(engine) {
   return !!getEngineAdapter(engine).supportsPresets;

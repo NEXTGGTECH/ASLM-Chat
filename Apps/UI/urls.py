@@ -35,6 +35,7 @@ urlpatterns = [
     # Model discovery APIs.
     path("api/models/", views.get_models_api, name="models_api"),
     path("api/model_info/", views.get_model_info_api, name="model_info_api"),
+    path("api/model_capabilities/", views.get_model_capabilities_api, name="model_capabilities_api"),
     path("api/inference_info/", views.get_inference_info_api, name="inference_info_api"),
     path("api/context_usage/", views.get_context_usage_api, name="context_usage_api"),
     path("api/context_compress/", views.context_compress_api, name="context_compress_api"),

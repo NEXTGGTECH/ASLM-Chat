@@ -1,17 +1,20 @@
 // Copyright NEXTGGTECH. Elastic License 2.0.
 
-import { escHtml, parseJsonScript } from '../main/utils.js';
+import { escHtml } from '../main/utils.js';
+import { t } from '../main/i18n.js';
+import { getModelEndpoint, normalizeEngineValue } from '../engines/engine-registry.js';
 
 // Custom model selector.
 // Mirrors the native select so existing model-loading code keeps working.
 export function createModelSelectorUi(context) {
   const { dom, state } = context;
-  const uiIconPaths = parseJsonScript('uiIconPathsData') || {};
   const rowHeight = 34;
   const overscan = 6;
-  const eagerCapabilityLimit = 15;
   const maxCapabilityCacheEntries = 300;
   const capabilityCache = new Map();
+  const cacheLoads = new Map();
+  const retryAfter = new Map();
+  let capabilityTtl = 24 * 60 * 60 * 1000;
   const pendingCapabilityRequests = new Set();
   const queuedCapabilityRequests = new Map();
   const maxConcurrentCapabilityRequests = 2;
@@ -26,7 +29,7 @@ export function createModelSelectorUi(context) {
   const $button = $(`
     <button type="button" class="custom-model-select" id="customModelSelect" aria-haspopup="listbox" aria-expanded="false">
       <span class="custom-model-select-value"></span>
-      <span class="custom-model-select-vision-slot"></span>
+      <span class="custom-model-option-meta"></span>
       <span class="custom-model-select-chevron" aria-hidden="true"></span>
     </button>
   `);
@@ -49,8 +52,25 @@ export function createModelSelectorUi(context) {
   }
 
   // Build one cache key for capability lookups.
-  function cacheKey(modelName) {
-    return `${String(state.activeEngine || '').trim()}::${String(modelName || '').trim()}`;
+  function currentScope() {
+    const engine = normalizeEngineValue(state.activeEngine);
+    return { engine, endpoint: getModelEndpoint(engine, state.runtimeSettings) };
+  }
+
+  function scopeKey(scope) {
+    return JSON.stringify([scope.engine, scope.endpoint]);
+  }
+
+  function cacheKey(modelName, scope = currentScope()) {
+    return JSON.stringify([scope.engine, scope.endpoint, modelName]);
+  }
+
+  function capabilityUrl(scope, modelName) {
+    const params = new URLSearchParams({ engine: scope.engine, endpoint: scope.endpoint });
+    if (modelName) {
+      params.set('model', modelName);
+    }
+    return `/api/model_capabilities/?${params}`;
   }
 
   // Mirror option rows from the native model select element.
@@ -67,20 +87,9 @@ export function createModelSelectorUi(context) {
     return !model || !model.value || model.value === 'No models available' || model.value === 'Models load on demand';
   }
 
-  // Read cached vision and tool capability flags for one model.
+  // The selected model and list rows share the same capability snapshots.
   function currentCapabilities(modelName) {
-    const key = cacheKey(modelName);
-    const cached = capabilityCache.get(key);
-    if (cached) {
-      return cached;
-    }
-    if (modelName && modelName === selectedModel() && state.currentModelInfo) {
-      return {
-        vision: !!state.currentModelInfo.supports_vision,
-        tools: !!state.currentModelInfo.supports_tool_calling
-      };
-    }
-    return null;
+    return capabilityCache.get(cacheKey(modelName))?.capabilities || null;
   }
 
   // Store capability flags with a bounded LRU-style eviction policy.
@@ -101,13 +110,33 @@ export function createModelSelectorUi(context) {
   // Cache capabilities for the model currently loaded in app state.
   function rememberCurrentModelCapabilities() {
     const modelName = selectedModel();
-    if (!modelName || !state.currentModelInfo) {
+    const info = state.currentModelInfo;
+    const scope = currentScope();
+    if (!modelName || !info || info.model !== modelName
+      || normalizeEngineValue(info.engine) !== scope.engine
+      || state.currentModelInfoEndpoint !== scope.endpoint) {
       return;
     }
-    cacheCapabilities(cacheKey(modelName), {
-      vision: !!state.currentModelInfo.supports_vision,
-      tools: !!state.currentModelInfo.supports_tool_calling
+    cacheCapabilities(cacheKey(modelName, scope), {
+      updated_at: Date.now() / 1000,
+      capabilities: info
     });
+  }
+
+  // Use the same assets, palette and order as the downloads bridge.
+  function capabilityHtml(modelName) {
+    const capabilities = currentCapabilities(modelName);
+    if (!capabilities) {
+      return '';
+    }
+    return [
+      ['vision', t('settings.visionModel', null, 'Vision'), capabilities.supports_vision],
+      ['tools', t('settings.tools', null, 'Tools'), capabilities.supports_tool_calling],
+      ['thinking', t('think.thinking', null, 'Thinking'), capabilities.supports_thinking],
+      ['cloud', 'Cloud (Ollama)', currentScope().engine === 'ollama-service' && capabilities.is_cloud]
+    ].filter(([, , supported]) => supported).map(([name, label]) => (
+      `<span class="model-capability is-${name}" role="img" title="${escHtml(label)}" aria-label="${escHtml(label)}"></span>`
+    )).join('');
   }
 
   // Sync the custom selector button label with the active model.
@@ -117,6 +146,7 @@ export function createModelSelectorUi(context) {
       return model.value === selected;
     });
     $value.text((match && match.label) || selected || 'Models load on demand');
+    $button.find('.custom-model-option-meta').html(capabilityHtml(selected));
   }
 
   // Filter the virtual list from the search box and reset highlight.
@@ -136,14 +166,52 @@ export function createModelSelectorUi(context) {
 
 
   // Capability prefetch.
+  // Hydrate an endpoint in one disk-only request before probing visible models.
+  function loadCachedCapabilities(scope) {
+    const key = scopeKey(scope);
+    const existing = cacheLoads.get(key);
+    if (existing && existing.until > Date.now()) {
+      return existing.promise;
+    }
+    const entry = { until: Date.now() + 300000, promise: null };
+    entry.promise = fetch(capabilityUrl(scope))
+      .then(function parseCache(response) {
+        if (!response.ok) {
+          throw new Error(`model_capabilities ${response.status}`);
+        }
+        return response.json();
+      })
+      .then(function hydrateCache(data) {
+        capabilityTtl = data.ttl * 1000 || capabilityTtl;
+        (data.records || []).forEach(function rememberRecord(record) {
+          const recordKey = cacheKey(record.model, scope);
+          const current = capabilityCache.get(recordKey);
+          if (!current || current.updated_at < record.updated_at) {
+            cacheCapabilities(recordKey, record);
+          }
+        });
+        if (key === scopeKey(currentScope())) {
+          updateButtonLabel();
+          renderList();
+        }
+      })
+      .catch(function cacheUnavailable() {
+        entry.until = Date.now() + 30000;
+      });
+    cacheLoads.set(key, entry);
+    return entry.promise;
+  }
+
   // Queue capability lookups for rows visible in the virtual list.
   function requestVisibleCapabilities() {
     window.clearTimeout(requestTimer);
-    requestTimer = window.setTimeout(function requestLater() {
+    requestTimer = window.setTimeout(async function requestLater() {
       if (!isOpen) {
         return;
       }
-      if (allModels.length > eagerCapabilityLimit) {
+      const scope = currentScope();
+      await loadCachedCapabilities(scope);
+      if (!isOpen || scopeKey(scope) !== scopeKey(currentScope())) {
         return;
       }
 
@@ -151,22 +219,26 @@ export function createModelSelectorUi(context) {
       const viewportHeight = $list.innerHeight() || 0;
       const start = Math.max(0, Math.floor(scrollTop / rowHeight) - overscan);
       const count = Math.ceil(viewportHeight / rowHeight) + overscan * 2;
+      queuedCapabilityRequests.clear();
       filteredModels.slice(start, start + count).forEach(function requestModel(model) {
         if (!model || isPlaceholderModel(model)) {
           return;
         }
-        const key = cacheKey(model.value);
-        if (capabilityCache.has(key) || pendingCapabilityRequests.has(key)) {
+        const key = cacheKey(model.value, scope);
+        const cached = capabilityCache.get(key);
+        const age = cached ? Date.now() - cached.updated_at * 1000 : Infinity;
+        if ((!cached?.stale && age >= 0 && age < capabilityTtl) || pendingCapabilityRequests.has(key)
+          || (retryAfter.get(key) || 0) > Date.now()) {
           return;
         }
 
-        queuedCapabilityRequests.set(key, model.value);
+        queuedCapabilityRequests.set(key, { modelName: model.value, scope });
       });
       processCapabilityQueue();
     }, 80);
   }
 
-  // Drain the queued model_info requests with a concurrency limit.
+  // Drain capability requests with a concurrency limit.
   function processCapabilityQueue() {
     if (activeCapabilityRequests >= maxConcurrentCapabilityRequests || queuedCapabilityRequests.size === 0) {
       return;
@@ -177,32 +249,41 @@ export function createModelSelectorUi(context) {
       return;
     }
 
-    const [key, modelName] = next;
+    const [key, { modelName, scope }] = next;
     queuedCapabilityRequests.delete(key);
 
-    if (capabilityCache.has(key) || pendingCapabilityRequests.has(key)) {
+    const cached = capabilityCache.get(key);
+    const age = cached ? Date.now() - cached.updated_at * 1000 : Infinity;
+    if (!isOpen || scopeKey(scope) !== scopeKey(currentScope()) || pendingCapabilityRequests.has(key)
+      || (!cached?.stale && age >= 0 && age < capabilityTtl) || (retryAfter.get(key) || 0) > Date.now()) {
       processCapabilityQueue();
       return;
     }
 
     activeCapabilityRequests += 1;
     pendingCapabilityRequests.add(key);
-    fetch(`/api/model_info/?engine=${encodeURIComponent(state.activeEngine)}&model=${encodeURIComponent(modelName)}`)
+    fetch(capabilityUrl(scope, modelName))
       .then(function parseResponse(response) {
         if (!response.ok) {
-          throw new Error(`model_info ${response.status}`);
+          throw new Error(`model_capabilities ${response.status}`);
         }
         return response.json();
       })
       .then(function cacheData(data) {
-        cacheCapabilities(key, {
-          vision: !!data.supports_vision,
-          tools: !!data.supports_tool_calling
-        });
-        renderList();
+        cacheCapabilities(key, data);
+        if (data.stale) {
+          retryAfter.set(key, Date.now() + 30000);
+        } else {
+          retryAfter.delete(key);
+        }
+        if (scopeKey(scope) === scopeKey(currentScope())) {
+          updateButtonLabel();
+          renderList();
+        }
       })
       .catch(function ignoreCapabilityError() {
-        cacheCapabilities(key, { vision: false, tools: false, error: true });
+        // Unknown is not unsupported: keep previous facts and allow a later retry.
+        retryAfter.set(key, Date.now() + 30000);
       })
       .finally(function clearPending() {
         pendingCapabilityRequests.delete(key);
@@ -219,8 +300,6 @@ export function createModelSelectorUi(context) {
   function optionHtml(model, index) {
     const selected = model.value === selectedModel();
     const highlighted = index === highlightedIndex;
-    const capabilities = currentCapabilities(model.value);
-    const vision = capabilities && capabilities.vision;
     const classes = [
       'custom-model-option',
       selected ? 'is-selected' : '',
@@ -230,8 +309,8 @@ export function createModelSelectorUi(context) {
     return `
       <button type="button" class="${classes}" role="option" aria-selected="${selected ? 'true' : 'false'}" data-model-index="${index}" style="top:${index * rowHeight}px">
         <span class="custom-model-option-name">${escHtml(model.label)}</span>
-        <span class="custom-model-option-meta" aria-hidden="true">
-          ${vision ? `<span class="custom-model-meta-svg is-vision" title="Vision model"><svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true"><use href="${uiIconPaths.eye}#icon"></use></svg></span>` : ''}
+        <span class="custom-model-option-meta">
+          ${capabilityHtml(model.value)}
         </span>
       </button>
     `;
@@ -273,6 +352,7 @@ export function createModelSelectorUi(context) {
     applyFilter();
     updateButtonLabel();
     renderList();
+    loadCachedCapabilities(currentScope());
   }
 
   // Select one model by its index in the filtered list.
@@ -436,6 +516,7 @@ export function createModelSelectorUi(context) {
 
     $(document).on('aslm:modelCapabilitiesChanged', function onCapabilitiesChanged() {
       rememberCurrentModelCapabilities();
+      updateButtonLabel();
       renderList();
     });
 
@@ -458,7 +539,6 @@ export function createModelSelectorUi(context) {
     $wrap.data('customModelSelectorReady', true);
     dom.$modelSelector.addClass('native-model-selector');
     dom.$modelSelector.after($button);
-    $button.find('.custom-model-select-vision-slot').append(dom.$modelVisionIndicator);
     $('body').append($popover);
     bindEvents();
     syncFromNative();

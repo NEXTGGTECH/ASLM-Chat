@@ -465,7 +465,7 @@
 
 .custom-model-select {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 18px 16px;
+  grid-template-columns: minmax(0, 1fr) auto 16px;
   align-items: center;
   gap: 8px;
   width: 100%;
@@ -500,17 +500,10 @@
   white-space: nowrap;
 }
 
-.custom-model-select-vision-slot {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 18px;
-  height: 18px;
-}
-
 .custom-model-select-chevron {
   width: 14px;
   height: 14px;
+  grid-column: 3;
   justify-self: end;
   background: currentColor;
   color: var(--c-text-muted);
@@ -608,58 +601,47 @@
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  min-width: 16px;
   justify-content: flex-end;
 }
 
-.custom-model-meta-svg {
-  display: inline-flex;
+.custom-model-option-meta:empty {
+  display: none;
+}
+
+.model-capability {
+  display: block;
   width: 16px;
   height: 16px;
   flex: 0 0 auto;
-  align-items: center;
-  justify-content: center;
-  color: var(--c-text-muted);
+  background: currentColor;
+  -webkit-mask: var(--capability-icon) center / contain no-repeat;
+  mask: var(--capability-icon) center / contain no-repeat;
 }
 
-.custom-model-meta-svg.is-vision {
-  color: var(--text-success);
+.model-capability.is-vision {
+  --capability-icon: url("../../img/capabilities/vision.svg");
+  color: var(--c-system-orange);
 }
 
-.custom-model-meta-svg svg {
-  display: block;
+.model-capability.is-tools {
+  --capability-icon: url("../../img/capabilities/tools.svg");
+  color: var(--c-system-blue);
+}
+
+.model-capability.is-thinking {
+  --capability-icon: url("../../img/capabilities/thinking.svg");
+  color: var(--c-system-green);
+}
+
+.model-capability.is-cloud {
+  --capability-icon: url("../../img/capabilities/cloud.svg");
+  color: var(--c-system-teal);
 }
 
 .custom-model-empty {
   padding: 10px 8px;
   color: var(--c-text-muted);
   font-size: var(--font-size-caption-1);
-}
-
-.model-vision-indicator {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 18px;
-  height: 18px;
-  color: var(--text-success);
-  opacity: 0;
-  pointer-events: none;
-  transition: opacity var(--t-fast), color var(--t-fast);
-}
-
-.model-vision-indicator svg {
-  display: block;
-  flex: 0 0 auto;
-}
-
-.model-vision-indicator.is-visible {
-  opacity: 0.9;
-}
-
-.model-selector-wrap:hover .model-vision-indicator.is-visible,
-.model-selector-wrap:focus-within .model-vision-indicator.is-visible {
-  color: var(--text-success);
 }
 
 /* Generic settings-sidebar selects: same chrome as the model selector, but

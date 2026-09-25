@@ -41,6 +41,7 @@ except Exception:  # pragma: no cover - optional dependency guard.
 
 from API import llm_api, mcp as tool_registry
 from API import ollama as ollama_api
+from Apps.Data import model_capabilities
 from Apps.Data.ollama_presets import (
     activate_ollama_preset,
     create_ollama_preset,
@@ -2798,16 +2799,14 @@ def _extract_ollama_model_info(settings_data: Any) -> dict[str, Any]:
     }
 
 
-# Decide whether an Ollama model runs in the cloud (no local layers to manage).
-def _ollama_model_is_cloud(model_name: str, model_layers: int) -> bool:
+# Missing layer metadata alone is not evidence that a model runs in the cloud.
+def _ollama_model_is_cloud(model_name: str, settings_data: Any) -> bool:
     name = str(model_name or "").strip().lower()
     if name.endswith("-cloud") or name.endswith(":cloud") or "-cloud:" in name:
         return True
-    # Local models report a positive block_count; cloud models expose none.
-    try:
-        return int(model_layers) <= 0
-    except (TypeError, ValueError):
-        return False
+    if isinstance(settings_data, dict):
+        return bool(settings_data.get("remote_model") or settings_data.get("remote_host"))
+    return bool(getattr(settings_data, "remote_model", None) or getattr(settings_data, "remote_host", None))
 
 
 # Extract generic model info
@@ -2880,6 +2879,8 @@ def _extract_generic_model_info(settings_data: Any) -> dict[str, Any]:
         ),
         "supports_tool_calling": bool(settings_data.get("supports_tool_calling", False)),
         "supports_files": bool(settings_data.get("supports_files", False)),
+        "capabilities_source": settings_data.get("capabilities_source", ""),
+        "metadata_fallback": bool(settings_data.get("metadata_fallback", False)),
         "runtime_limits": settings_data.get("runtime_limits", {}) if isinstance(settings_data.get("runtime_limits", {}), dict) else {},
         "custom_fields": settings_data.get("custom_fields", []) if isinstance(settings_data.get("custom_fields", []), list) else [],
     }
@@ -2896,6 +2897,14 @@ def _build_fallback_model_info_payload(engine: str, model_name: str) -> dict[str
 
 
 # Load adapter metadata and normalize it for the frontend.
+def _extract_model_info(engine: str, model_name: str, settings_data: Any) -> dict[str, Any]:
+    if settings.is_ollama_engine(engine):
+        payload = _extract_ollama_model_info(settings_data)
+        payload["is_cloud"] = _ollama_model_is_cloud(model_name, settings_data)
+        return payload
+    return _extract_generic_model_info(settings_data)
+
+
 def _build_model_info_payload(
     engine: str,
     model_name: str,
@@ -2913,23 +2922,23 @@ def _build_model_info_payload(
         )
         return cached_payload
 
+    endpoint = model_capabilities.get_endpoint(engine)
     try:
         settings_data = llm_api.get_model_settings(engine, model_name)
     except Exception:
         if not allow_fallback:
             raise
         return _build_fallback_model_info_payload(engine, model_name)
+    payload = _extract_model_info(engine, model_name, settings_data)
+    # Keep only capability facts on disk, not presets, API keys or runtime settings.
+    if endpoint != model_capabilities.get_endpoint(engine):
+        raise RuntimeError("Engine endpoint changed while loading model metadata")
+    model_capabilities.store(engine, model_name, endpoint, payload)
     if settings.is_ollama_engine(engine):
-        payload = _extract_ollama_model_info(settings_data)
         preset_payload = get_ollama_preset_payload(model_name)
         payload["defaults"] = {**payload.get("defaults", {}), **preset_payload["active_config"]}
         payload["ollama_presets"] = preset_payload
-        # Report whether the model runs in the cloud. The frontend derives which
-        # parameters to hide (local execution knobs) from this flag, so no list
-        # of option names is hardcoded here.
-        payload["is_cloud"] = _ollama_model_is_cloud(model_name, payload.get("model_layers", 0))
     elif engine == "lms":
-        payload = _extract_generic_model_info(settings_data)
         preset_payload = get_lms_preset_payload(model_name)
         active_config = preset_payload.get("active_config", {}) if isinstance(preset_payload, dict) else {}
         if isinstance(active_config, dict):
@@ -2939,7 +2948,6 @@ def _build_model_info_payload(
             }
         payload["lms_presets"] = preset_payload
     elif engine == "openai":
-        payload = _extract_generic_model_info(settings_data)
         # Scope presets by endpoint URL so the same model name from different
         # providers keeps independent presets.
         preset_payload = get_openai_preset_payload(settings.get_engine_url("openai"), model_name)
@@ -2948,20 +2956,18 @@ def _build_model_info_payload(
             payload["defaults"] = {**payload.get("defaults", {}), **active_config}
         payload["openai_presets"] = preset_payload
     elif engine == "google-genai":
-        payload = _extract_generic_model_info(settings_data)
         preset_payload = get_google_genai_preset_payload(model_name)
         active_config = preset_payload.get("active_config", {}) if isinstance(preset_payload, dict) else {}
         if isinstance(active_config, dict):
             payload["defaults"] = {**payload.get("defaults", {}), **active_config}
         payload["google_genai_presets"] = preset_payload
-    else:
-        payload = _extract_generic_model_info(settings_data)
-
     payload["available_tool_servers"] = (
         _list_tool_servers_cached(engine, model_name) if payload.get("supports_tool_calling") else []
     )
     payload["model"] = model_name
     payload["engine"] = engine
+    if endpoint != model_capabilities.get_endpoint(engine):
+        raise RuntimeError("Engine endpoint changed while loading model metadata")
     cached_payload = _set_cached_model_info(engine, model_name, payload)
     _sync_runtime_model_metadata(
         engine,
@@ -6849,6 +6855,43 @@ def load_chat_api(request, chat_id):
 
 
 # Model and tool discovery APIs.
+
+# Return persistent capability markers independently of model presets.
+def get_model_capabilities_api(request):
+    """Serve cached markers, resolving only visible uncached/stale models on demand."""
+    if request.method != "GET":
+        return JsonResponse({"error": "Invalid request method"}, status=405)
+    engine, engine_error = _resolve_request_engine_or_response(request)
+    if engine_error is not None:
+        return engine_error
+    endpoint = model_capabilities.get_endpoint(engine)
+    if "endpoint" in request.GET and str(request.GET["endpoint"]).strip().rstrip("/") != endpoint:
+        return JsonResponse({"error": "Engine endpoint changed"}, status=409)
+
+    records = model_capabilities.list_cached(engine, endpoint)
+    model_name = str(request.GET.get("model", "")).strip()
+    if not model_name:
+        return JsonResponse({"engine": engine, "records": records, "ttl": model_capabilities.CACHE_TTL_SECONDS})
+    cached = next((row for row in records if row["model"] == model_name), None)
+    if cached and model_capabilities.is_fresh(cached):
+        return JsonResponse(cached)
+    try:
+        payload = _get_cached_model_info(engine, model_name)
+        if payload is None:
+            raw = llm_api.get_model_settings(engine, model_name)
+            payload = _extract_model_info(engine, model_name, raw)
+        if endpoint != model_capabilities.get_endpoint(engine):
+            return JsonResponse({"error": "Engine endpoint changed"}, status=409)
+        record = model_capabilities.store(engine, model_name, endpoint, payload)
+        if record is None:
+            raise RuntimeError("Model capability metadata is unavailable")
+        return JsonResponse(record)
+    except Exception as exc:
+        logger.warning("Could not refresh model capabilities for %s on %s: %s", model_name, engine, exc)
+        if cached:
+            return JsonResponse({**cached, "stale": True})
+        return JsonResponse({"error": _format_runtime_error(engine, exc)}, status=503)
+
 
 # Return model metadata for the selected engine.
 def get_model_info_api(request):

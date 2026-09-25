@@ -257,23 +257,6 @@ Tools/mcp-web-search/tmp/
 Tools/mcp-web-search/todo.md
 Tools/mcp-web-search/logs
 Tools/mcp-web-search/_cache
-# Hugo documentation (Docs/ASLM)
-Docs/ASLM/assets/jsconfig.json
-Docs/ASLM/public/
-Docs/ASLM/resources/
-Docs/ASLM/hugo_stats.json
-Docs/ASLM/.hugo_build.lock
-Docs/ASLM/tmp/
-Docs/ASLM/cache/
-Docs/ASLM/_modules/
-Docs/ASLM/_vendor/
-Docs/ASLM/themes/github.com/
-Docs/ASLM/themes/gohugoio/
-Docs/ASLM/themes/hugo-mod-*/
-Docs/ASLM/go.work
-Docs/ASLM/go.work.sum
-!Docs/ASLM/go.mod
-!Docs/ASLM/go.sum
 
 # Context compression dev-script reports
 Tools/context_compression/tests/out/
