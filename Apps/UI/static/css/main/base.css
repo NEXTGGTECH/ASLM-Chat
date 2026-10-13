@@ -64,9 +64,6 @@
 
   --c-text: #ffffff;
   --c-text-muted: rgba(235, 235, 245, 0.6);
-  --c-text-dim: rgba(235, 235, 245, 0.3);
-  --c-text-quaternary: rgba(235, 235, 245, 0.18);
-  --c-text-placeholder: rgba(235, 235, 245, 0.3);
 
   --c-border: #38383a;
   --c-border-strong: var(--c-gray-4);
@@ -76,7 +73,6 @@
 
   --c-white: #ffffff;
   --c-black: #000000;
-  --c-bg-error-overlay: #4c1f24;
   --c-overlay-scrim: rgba(0, 0, 0, 0.25);
 
   --c-primary: var(--c-system-blue);

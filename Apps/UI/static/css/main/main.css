@@ -233,7 +233,7 @@
   min-height: 72px;
   padding: 16px 10px;
   cursor: default;
-  color: var(--c-text-quaternary);
+  color: var(--c-gray-3);
 }
 
 .chat-item.empty-state:hover {
@@ -299,7 +299,7 @@
   width: 14px;
   height: 14px;
   flex-shrink: 0;
-  color: var(--c-text-dim);
+  color: var(--c-gray-2);
   transition: transform var(--t-fast);
 }
 
@@ -387,7 +387,7 @@
   width: 14px;
   height: 14px;
   flex-shrink: 0;
-  color: var(--c-text-dim);
+  color: var(--c-gray-2);
   transition: transform var(--t-fast);
 }
 
@@ -543,7 +543,7 @@
 }
 
 .custom-model-search::placeholder {
-  color: var(--c-text-placeholder);
+  color: var(--c-text-muted);
 }
 
 .custom-model-search:focus {
@@ -996,7 +996,7 @@
   font-size: var(--font-size-caption-2);
   font-weight: 500;
   font-variant-numeric: tabular-nums;
-  color: var(--c-text-dim);
+  color: var(--c-gray-2);
 }
 
 .setting-number {
@@ -1092,7 +1092,7 @@
 }
 
 .setting-textarea::placeholder {
-  color: var(--c-text-placeholder);
+  color: var(--c-text-muted);
 }
 
 .setting-note {
@@ -1145,7 +1145,7 @@
   display: inline-flex;
   align-items: center;
   flex: 0 0 auto;
-  color: var(--c-text-dim);
+  color: var(--c-gray-2);
   cursor: help;
 }
 
@@ -1365,7 +1365,7 @@
 
 .slash-command-section-title {
   padding: 3px 8px 5px;
-  color: var(--c-text-dim);
+  color: var(--c-gray-2);
   font-size: var(--font-size-caption-2);
   font-weight: 650;
   line-height: 1;
@@ -1394,7 +1394,7 @@
 }
 
 .slash-command-row.is-disabled {
-  color: var(--c-text-dim);
+  color: var(--c-gray-2);
   cursor: not-allowed;
   opacity: 0.72;
 }
@@ -1402,7 +1402,7 @@
 .slash-command-row.is-disabled:hover,
 .slash-command-row.is-disabled.is-active {
   background: transparent;
-  color: var(--c-text-dim);
+  color: var(--c-gray-2);
 }
 
 .slash-command-row:hover .slash-command-icon,
@@ -1411,7 +1411,7 @@
 }
 
 .slash-command-row.is-disabled .slash-command-icon {
-  color: var(--c-text-dim);
+  color: var(--c-gray-2);
 }
 
 .slash-command-icon {
@@ -1475,7 +1475,7 @@
 
 .slash-command-status.is-warning {
   background: var(--surface-tertiary);
-  color: var(--c-text-dim);
+  color: var(--c-gray-2);
 }
 
 .slash-command-refresh {
@@ -1672,7 +1672,7 @@
 }
 
 .chat-input::placeholder {
-  color: var(--c-text-placeholder);
+  color: var(--c-text-muted);
 }
 
 .input-bottom-bar,
@@ -4012,7 +4012,7 @@
   gap: 8px;
   min-height: 34px;
   padding: 8px 12px;
-  color: var(--c-text-dim);
+  color: var(--c-gray-2);
   font-size: var(--font-size-caption-1);
   font-weight: 600;
   cursor: pointer;
@@ -4165,7 +4165,7 @@
   justify-content: center;
   align-self: start;
   margin-top: var(--search-batch-icon-offset, 0);
-  color: var(--c-text-dim);
+  color: var(--c-gray-2);
   opacity: 0.9;
 }
 
@@ -4270,7 +4270,7 @@
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  color: var(--c-text-dim);
+  color: var(--c-gray-2);
   opacity: 0.9;
 }
 
@@ -4311,7 +4311,7 @@
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  color: var(--c-text-dim);
+  color: var(--c-gray-2);
 }
 
 .msg-search-main-icon {
@@ -4437,7 +4437,7 @@
 
 .msg-search-chip--more {
   flex: 0 0 auto;
-  color: var(--c-text-dim);
+  color: var(--c-gray-2);
 }
 
 .msg-search-chip--more-expanded {
@@ -4596,7 +4596,7 @@
 
 .msg-citation-preview-date {
   margin-top: 9px;
-  color: var(--c-text-dim);
+  color: var(--c-gray-2);
   font-size: 12px;
   line-height: var(--leading-ui);
 }
@@ -5389,7 +5389,7 @@ body.is-resizing-reasoning-drawer * {
   line-height: var(--leading-ui);
   white-space: pre;
   text-align: right;
-  color: var(--c-text-dim);
+  color: var(--c-gray-2);
   tab-size: 2;
   transform: translateY(0);
   will-change: transform;
@@ -5506,7 +5506,7 @@ body.is-resizing-reasoning-drawer * {
 
 .mcp-json-modal .hljs-punctuation,
 .mcp-json-modal .hljs-meta {
-  color: var(--c-text-dim);
+  color: var(--c-gray-2);
 }
 
 .mcp-json-modal .hljs-keyword {
@@ -5514,12 +5514,12 @@ body.is-resizing-reasoning-drawer * {
 }
 
 .mcp-json-modal .hljs-comment {
-  color: var(--c-text-quaternary);
+  color: var(--c-gray-3);
   font-style: italic;
 }
 
 .skills-settings-summary {
-  color: var(--c-text-dim);
+  color: var(--c-gray-2);
   font-size: var(--font-size-caption-2);
 }
 
@@ -5695,7 +5695,7 @@ body.is-resizing-reasoning-drawer * {
 }
 
 .skills-search-input::placeholder {
-  color: var(--c-text-placeholder);
+  color: var(--c-text-muted);
 }
 
 .skills-personal-group {
@@ -6114,7 +6114,7 @@ body.is-resizing-reasoning-drawer * {
 }
 
 .skills-edit-input::placeholder {
-  color: var(--c-text-placeholder);
+  color: var(--c-text-muted);
 }
 
 .skills-edit-error {
@@ -6673,7 +6673,7 @@ body.is-resizing-reasoning-drawer * {
 
 .skills-import-dropzone-hint {
   font-size: var(--font-size-caption-2);
-  color: var(--c-text-dim);
+  color: var(--c-gray-2);
 }
 
 @media (max-width: 900px) {

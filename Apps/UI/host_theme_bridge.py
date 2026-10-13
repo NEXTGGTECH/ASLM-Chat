@@ -31,9 +31,6 @@ _ASLM_COLOR_KEY_TO_CSS_VAR: Final[dict[str, str]] = {
     "BackgroundTertiary": "--c-bg-elevated",
     "LabelPrimary": "--c-text",
     "LabelSecondary": "--c-text-muted",
-    "LabelTertiary": "--c-text-dim",
-    "LabelQuaternary": "--c-text-quaternary",
-    "PlaceholderText": "--c-text-placeholder",
     "Separator": "--c-border",
     "LinkColor": "--c-link",
     "SystemBlueOverlay": "--c-overlay-blue",
@@ -43,7 +40,6 @@ _ASLM_COLOR_KEY_TO_CSS_VAR: Final[dict[str, str]] = {
     "ActionBlue": "--c-primary",
     "ActionGreen": "--c-success",
     "OverlayBackground": "--c-overlay-scrim",
-    "BackgroundErrorOverlay": "--c-bg-error-overlay",
 }
 
 _HEX_RE = re.compile(r"^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$")
@@ -335,7 +331,7 @@ def resolve_preview_document_theme() -> dict[str, str]:
         tokens["text"] = resolved.get("--c-text") or tokens["text"]
         tokens["muted"] = (
             resolved.get("--c-text-muted")
-            or resolved.get("--c-text-dim")
+            or resolved.get("--c-gray-2")
             or tokens["muted"]
         )
         tokens["link"] = (

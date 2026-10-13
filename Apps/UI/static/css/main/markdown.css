@@ -1063,7 +1063,7 @@
   border: 0;
   border-radius: 0;
   background: transparent;
-  color: var(--c-text-dim);
+  color: var(--c-gray-2);
   font: inherit;
   font-size: var(--font-size-body-2);
   font-weight: 400;
@@ -1137,7 +1137,7 @@
 .msg-sandbox-detail {
   min-width: 0;
   overflow: hidden;
-  color: var(--c-text-dim);
+  color: var(--c-gray-2);
   font-size: var(--font-size-caption-2);
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1159,7 +1159,7 @@
 
 .msg-sandbox-section-label {
   padding: 7px 10px 0;
-  color: var(--c-text-dim);
+  color: var(--c-gray-2);
   font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
   font-size: 10px;
   font-weight: 700;
@@ -1187,7 +1187,7 @@
 }
 
 .msg-sandbox-section.is-empty .msg-sandbox-pre {
-  color: var(--c-text-dim);
+  color: var(--c-gray-2);
 }
 
 .msg-sandbox-image-card {
@@ -1263,7 +1263,7 @@
   width: 100%;
   min-height: 72px;
   padding: 24px 12px;
-  color: var(--c-text-dim);
+  color: var(--c-gray-2);
   font-size: var(--font-size-caption-1);
   text-align: center;
 }
@@ -1280,7 +1280,7 @@
 }
 
 .msg-sandbox-image-meta {
-  color: var(--c-text-dim);
+  color: var(--c-gray-2);
   font-size: var(--font-size-caption-2);
   line-height: 1.35;
   word-break: break-word;
@@ -1346,7 +1346,7 @@
 
 .msg-write-summary {
   flex: 0 0 auto;
-  color: var(--c-text-dim);
+  color: var(--c-gray-2);
   font-size: var(--font-size-caption-2);
   font-weight: 550;
 }
@@ -1394,12 +1394,12 @@
 }
 
 .msg-write-line--fade {
-  color: color-mix(in srgb, var(--c-text-dim) 52%, transparent);
+  color: color-mix(in srgb, var(--c-gray-2) 52%, transparent);
   mask-image: linear-gradient(90deg, var(--c-black) 0%, var(--c-black) 68%, transparent 100%);
 }
 
 .msg-write-line--empty {
-  color: var(--c-text-dim);
+  color: var(--c-gray-2);
 }
 
 .msg-edit-card {
@@ -1457,7 +1457,7 @@
 
 .msg-edit-summary {
   flex: 0 0 auto;
-  color: var(--c-text-dim);
+  color: var(--c-gray-2);
   font-size: var(--font-size-caption-2);
   font-weight: 550;
 }
@@ -1519,7 +1519,7 @@
 }
 
 .msg-edit-row.is-hunk {
-  color: var(--c-text-dim);
+  color: var(--c-gray-2);
   background: color-mix(in srgb, var(--surface-tertiary) 58%, transparent);
 }
 
@@ -1531,7 +1531,7 @@
 .msg-edit-gutter {
   padding: 0 8px;
   border-right: 1px solid color-mix(in srgb, var(--c-border) 55%, transparent);
-  color: var(--c-text-dim);
+  color: var(--c-gray-2);
   text-align: right;
   line-height: 1.45;
   -webkit-user-select: none;
@@ -1832,7 +1832,7 @@ img.msg-search-main-icon {
 .msg-tool-pending-detail {
   min-width: 0;
   overflow: hidden;
-  color: var(--c-text-dim);
+  color: var(--c-gray-2);
   font-size: var(--font-size-caption-2);
   text-overflow: ellipsis;
   white-space: nowrap;
