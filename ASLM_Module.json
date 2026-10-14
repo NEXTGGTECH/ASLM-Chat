@@ -3,7 +3,9 @@
     "id": "aslm-chat",
     "name": "ASLM Chat",
     "description": "ASLM Chat Module",
-    "version": "0.9.1.4",
+    "version": "0.9.2.3",
+    "is_beta": false,
+    "is_experemental": false,
     "author": "NEXTGGTECH",
     "type": "ui",
     "category": [

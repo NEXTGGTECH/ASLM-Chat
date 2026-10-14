@@ -241,7 +241,7 @@
   align-items: center;
   justify-content: center;
   margin-top: 2px;
-  border: 1px solid var(--c-text-dim);
+  border: 1px solid var(--c-gray-2);
   border-radius: 50%;
   background: transparent;
 }
@@ -265,7 +265,7 @@
 
 .deep-research-check-note,
 .deep-research-check-more {
-  color: var(--c-text-dim);
+  color: var(--c-gray-2);
   font-size: var(--font-size-caption-2);
 }
 
@@ -330,7 +330,7 @@
 
 .deep-research-card-source-count {
   flex: 0 0 auto;
-  color: var(--c-text-dim);
+  color: var(--c-gray-2);
   white-space: nowrap;
 }
 
@@ -703,7 +703,7 @@
 
 .deep-research-timeline-empty {
   padding: 10px 0 18px 28px;
-  color: var(--c-text-dim);
+  color: var(--c-gray-2);
   font-size: var(--font-size-caption-2);
 }
 
