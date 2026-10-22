@@ -89,7 +89,35 @@ def _markdown_to_html(report: str) -> str:
     )
 
 
+# Resolve the browser already provisioned for Web Search without importing its venv into Django.
+def _managed_chromium_path() -> Path | None:
+    """Reuse the installed tool browser without downloading another renderer."""
+
+    from Services import venv_manager
+
+    # Query the library's platform/version resolver rather than duplicating its cache layout.
+    python_path = venv_manager.get_tool_python("mcp-web-search")
+    if python_path is None:
+        return None
+    try:
+        result = subprocess.run(
+            [str(python_path), "-c", "from cloakbrowser.config import get_binary_path, get_effective_version; print(get_binary_path(get_effective_version()))"],
+            env=venv_manager.get_subprocess_environment(python_path),
+            capture_output=True, text=True, encoding="utf-8", timeout=10, check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+    # A missing or broken tool leaves the established system-browser fallback intact.
+    path = result.stdout.strip()
+    return Path(path) if result.returncode == 0 and path else None
+
+
+# Prefer configured/system renderers and fall back to the existing tool installation.
 def _chromium_candidates() -> Iterable[Path]:
+    """Enumerate browser executables in priority order on every supported platform."""
+
     configured = str(os.environ.get("ASLM_CHROMIUM_PATH") or "").strip()
     if configured:
         yield Path(configured)
@@ -107,6 +135,10 @@ def _chromium_candidates() -> Iterable[Path]:
         if root:
             yield Path(root) / relative
 
+    managed = _managed_chromium_path()
+    if managed is not None:
+        yield managed
+
 
 @lru_cache(maxsize=1)
 def _chromium_path() -> Path:
@@ -117,6 +149,11 @@ def _chromium_path() -> Path:
 
 
 def _run_chromium(arguments: list[str], *, timeout: float = 45.0) -> None:
+    """Render with the selected browser using module-scoped scratch storage."""
+
+    from Services import venv_manager
+
+    # Keep native renderer profiles in the same scratch area as tool workers.
     command = [str(_chromium_path()), *arguments]
     completed = subprocess.run(
         command,
@@ -124,6 +161,7 @@ def _run_chromium(arguments: list[str], *, timeout: float = 45.0) -> None:
         stderr=subprocess.PIPE,
         timeout=timeout,
         check=False,
+        env=venv_manager.get_subprocess_environment(venv_manager.get_venv_python("server")),
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
     if completed.returncode != 0:
@@ -289,14 +327,22 @@ def _math_transform():
     return etree.XSLT(etree.parse(str(path)))
 
 
+# Convert editable equations using Office when present, with a portable fallback otherwise.
 def _latex_omml(source: str):
+    """Build an OMML equation without requiring an Office installation."""
+
     transform = _math_transform()
-    if transform is None:
-        return None
     try:
         from latex2mathml.converter import convert
         from lxml import etree
         mathml = convert(str(source or "").strip())
+        if transform is None:
+            from mathml2omml import convert as mathml_to_omml
+            from docx.oxml.ns import nsdecls
+
+            # The converter emits document-scoped prefixes; supply them before parsing its fragment.
+            fragment = f"<root {nsdecls('m', 'w')}>{mathml_to_omml(mathml)}</root>"
+            return etree.fromstring(fragment.encode("utf-8"))[0]
         transformed = transform(etree.fromstring(mathml.encode("utf-8")))
         return deepcopy(transformed.getroot())
     except Exception:

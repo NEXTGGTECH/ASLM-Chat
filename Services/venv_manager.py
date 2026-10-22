@@ -138,6 +138,34 @@ def get_tool_python(tool_dir_name: str) -> Path | None:
     return python_path if python_path.exists() else None
 
 
+# Subprocess environments
+
+# Prepare child-process storage without changing the host process or adding module data roots.
+def get_subprocess_environment(python_path: Path) -> dict[str, str]:
+    """Keep Linux browser downloads in their venv and scratch files in the ASLM profile."""
+
+    environment = os.environ.copy()
+    if not sys.platform.startswith("linux"):
+        return environment
+
+    # Browser binaries belong to the existing preserved environment, not a separate update payload.
+    browsers = python_path.parent.parent / "browsers"
+    environment.update({
+        "XDG_CACHE_HOME": str(browsers),
+        "CLOAKBROWSER_CACHE_DIR": str(browsers / "cloakbrowser"),
+        "CLOAKBROWSER_AUTO_UPDATE": "false",
+        "PLAYWRIGHT_BROWSERS_PATH": str(browsers / "playwright"),
+        "PIP_NO_CACHE_DIR": "1",
+    })
+
+    # Use the host's short scratch path: Chromium's Unix socket names cannot fit a deep venv path.
+    root = BASE_DIR.parent.parent / "Data" / "App" if BASE_DIR.parent.name == "Modules" else BASE_DIR / "Data"
+    root.mkdir(parents=True, exist_ok=True)
+    for key in ("TMPDIR", "TEMP", "TMP"):
+        environment[key] = str(root)
+    return environment
+
+
 # Internal helpers
 
 # Run one subprocess command and optionally stream output to the console.
@@ -149,11 +177,13 @@ def _run(
     log_prefix: str | None = None,
 ) -> bool:
     working_dir = str(cwd or BASE_DIR)
+    environment = get_subprocess_environment(Path(command[0]))
     if log:
         try:
             process = subprocess.Popen(
                 command,
                 cwd=working_dir,
+                env=environment,
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -181,6 +211,7 @@ def _run(
         result = subprocess.run(
             command,
             cwd=working_dir,
+            env=environment,
             text=True,
             capture_output=True,
             check=False,

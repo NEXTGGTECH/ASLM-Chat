@@ -95,7 +95,8 @@ async def _get_sc_code(transport: _Transport) -> str:
             return _sc_code
         # A recent scrape failure is still cooling down — reuse the stale/empty
         # token instead of hammering the homepage on every search.
-        if (now - _sc_failed_at) < _SC_RETRY_COOLDOWN:
+        # Apply backoff only after an actual failure, not to the first request after an OS startup.
+        if _sc_failed_at and (now - _sc_failed_at) < _SC_RETRY_COOLDOWN:
             return _sc_code
         code = await _fetch_sc_code(transport)
         if code:

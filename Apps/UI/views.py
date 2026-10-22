@@ -5719,6 +5719,7 @@ def chat_api(request):
                             text=True,
                             encoding="utf-8",
                             cwd=str(server_file.parent),
+                            env=tool_registry._venv_subprocess_env(Path(python_path)),
                             timeout=60,
                             check=False,
                         )

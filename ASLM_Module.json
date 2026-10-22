@@ -38,6 +38,11 @@
             "os": "macos",
             "arch": "arm64",
             "key": "macos-arm64"
+        },
+        {
+            "os": "linux",
+            "arch": "amd64",
+            "key": "linux-amd64"
         }
     ],
     "update": {

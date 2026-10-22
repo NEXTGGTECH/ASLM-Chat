@@ -321,7 +321,9 @@ def _get_async_callable_runner() -> AsyncCallableRunner:
 def _venv_subprocess_env(python_path: Path) -> dict[str, str]:
     """Return subprocess environment aligned with the selected venv."""
 
-    env = os.environ.copy()
+    from Services import venv_manager
+
+    env = venv_manager.get_subprocess_environment(python_path)
     apply_loopback_proxy_bypass(env)
     venv_path = python_path.parent.parent
     env["VIRTUAL_ENV"] = str(venv_path)
