@@ -37,7 +37,7 @@ def test_legacy_query_schema_advertises_largest_vertical_batch(monkeypatch):
     assert SEARCH_BATCH_LIMIT == 2
     assert batch_schema["maxItems"] == LEGACY_BATCH_LIMIT == 2
     assert batch_schema["items"]["type"] == "string"
-    assert "calendar years are forbidden" in query_schema["description"]
+    assert "focused search query" in query_schema["description"]
 
 
 def test_query_batch_coercion_caps_and_sanitizes_items():
@@ -100,30 +100,15 @@ def test_legacy_preflight_caps_every_vertical_at_two_queries(monkeypatch):
     ]
 
 
-def test_tool_description_documents_rare_batch_and_operator_examples():
-    normalized = " ".join(LEGACY_WEB_SEARCH_TOOL_DESCRIPTION.split())
-    assert "make an internal plan before calling this tool" in normalized
-    assert "answer deliverables, evidence gaps, source classes" in normalized
-    assert "Each call executes the next plan step" in normalized
-    assert "Link count alone is not coverage" in normalized
-    assert "Arrays are reserved" in LEGACY_WEB_SEARCH_TOOL_DESCRIPTION
-    assert "Every vertical permits\nat most 2 queries" in LEGACY_WEB_SEARCH_TOOL_DESCRIPTION
-    assert "site:docs.example.com" in LEGACY_WEB_SEARCH_TOOL_DESCRIPTION
-    assert "postgresql OR postgres" in LEGACY_WEB_SEARCH_TOOL_DESCRIPTION
-    assert "filetype:pdf" in LEGACY_WEB_SEARCH_TOOL_DESCRIPTION
-    assert 'intitle:"release notes"' in LEGACY_WEB_SEARCH_TOOL_DESCRIPTION
-    assert "Date bounds fit requests" in LEGACY_WEB_SEARCH_TOOL_DESCRIPTION
-    assert "four-digit calendar years" in LEGACY_WEB_SEARCH_TOOL_DESCRIPTION
-    assert "exclusively inside after: or before:" in LEGACY_WEB_SEARCH_TOOL_DESCRIPTION
-    assert "medium up to 10" in LEGACY_WEB_SEARCH_TOOL_DESCRIPTION
-    legacy_normalized = " ".join(LEGACY_WEB_SEARCH_TOOL_DESCRIPTION.split())
-    assert "shopping=true for product discovery" in legacy_normalized
-    assert "academic=true for papers" in legacy_normalized
-    advanced_normalized = " ".join(ADVANCED_WEB_SEARCH_TOOL_DESCRIPTION.split())
-    assert "Choose the query field by evidence type" in advanced_normalized
-    assert "at most two queries" in advanced_normalized
-    assert "array of two plain strings" in advanced_normalized
-    assert "10 whitespace-separated words for `web`" in advanced_normalized
+def test_tool_descriptions_explain_inputs_without_research_planning_rules():
+    for description in (LEGACY_WEB_SEARCH_TOOL_DESCRIPTION, ADVANCED_WEB_SEARCH_TOOL_DESCRIPTION):
+        normalized = " ".join(description.split())
+        assert "query" in normalized
+        assert "two independent" in normalized
+        assert "site:" in normalized
+        assert "read_page" in normalized
+        assert "internal plan" not in normalized
+        assert "whitespace-separated words" not in normalized
 
 
 def test_advanced_operators_are_recognized_without_polluting_scoring_terms():

@@ -170,6 +170,8 @@ def _server_metadata(module: ModuleType, folder_name: str) -> dict[str, Any]:
         metadata["requires_docker"] = True
     if raw_server.get("fresh_process_per_call"):
         metadata["fresh_process_per_call"] = True
+    if callable(getattr(module, "get_model_context", None)):
+        metadata["has_model_context"] = True
     return metadata
 
 
@@ -312,6 +314,14 @@ def describe(server_file: Path) -> dict[str, Any]:
     return metadata
 
 
+def model_context(server_file: Path) -> str:
+    """Read explicitly exported, model-safe environment details without executing a tool."""
+    module = _load_module(server_file)
+    provider = getattr(module, "get_model_context", None)
+    result = _execute_callable(provider) if callable(provider) else ""
+    return result if isinstance(result, str) else ""
+
+
 # Return whether the server supports the requested engine and model pair.
 def supports(server_file: Path, payload: dict[str, Any]) -> bool:
     module = _load_module(server_file)
@@ -390,6 +400,8 @@ def _execute_request(operation: str, server_file: Path, payload: dict[str, Any])
     try:
         if operation == "describe":
             return True, describe(server_file)
+        if operation == "model_context":
+            return True, model_context(server_file)
         if operation == "supports":
             return True, supports(server_file, payload)
         if operation == "call":
@@ -457,7 +469,7 @@ def main() -> int:
     apply_loopback_proxy_bypass()
 
     if len(sys.argv) < 3:
-        return _print_response(False, "Usage: tool_worker.py <describe|supports|prepare|call> <server_file>")
+        return _print_response(False, "Usage: tool_worker.py <describe|supports|model_context|prepare|call> <server_file>")
 
     operation = sys.argv[1].strip().lower()
     server_file = Path(sys.argv[2]).resolve()

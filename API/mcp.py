@@ -1062,6 +1062,59 @@ def tool_server_id_for_alias(tool_lookup: dict[str, dict[str, Any]] | None, alia
     return str(server.get("id") or "")
 
 
+def available_tools_prompt(tool_lookup: dict[str, dict[str, Any]]) -> str:
+    """Describe only tools actually exposed for this generation, including alias filters."""
+    if not tool_lookup:
+        return ""
+    lines = [
+        "Available tools for this request (use their supplied parameter schemas):",
+        "For tasks beyond basic conversation, you MUST call the relevant tools before answering. "
+        "Inspect this list before claiming a capability is unavailable. "
+        "Do not call unrelated tools just to satisfy the requirement.",
+    ]
+    for alias, entry in tool_lookup.items():
+        tool = entry.get("tool") or {}
+        description = str(tool.get("description") or tool.get("name") or "").strip()
+        summary = description.splitlines()[0][:200] if description else ""
+        lines.append(f"- {alias}: {summary}")
+    seen_servers: set[str] = set()
+    for entry in tool_lookup.values():
+        server = entry.get("server") or {}
+        server_id = str(server.get("server_file") or server.get("id") or "")
+        if server_id in seen_servers or not server.get("has_model_context"):
+            continue
+        seen_servers.add(server_id)
+        try:
+            if server.get("external"):
+                # A fresh process reads current sandbox.env values, independent of discovery caches.
+                context = _run_worker(server["server_file"], "model_context", {})
+            else:
+                provider = getattr(server.get("module"), "get_model_context", None)
+                context = provider() if callable(provider) else ""
+            if isinstance(context, str) and context.strip():
+                lines.append(context.strip()[:8000])
+        except Exception:
+            logger.warning("Could not read model context for tool server %s", server.get("id"))
+            lines.append("Tool environment details unavailable; inspect the environment before heavy work.")
+    return "\n".join(lines)
+
+
+def with_available_tools_prompt(
+    conversation: list[dict[str, Any]], tool_lookup: dict[str, dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Add live capability context without mutating the caller's history."""
+    prompt = available_tools_prompt(tool_lookup)
+    if not prompt:
+        return conversation
+    messages = [dict(message) for message in conversation]
+    # Merge into the existing system message for backends with one system slot.
+    if messages and messages[0].get("role") == "system" and isinstance(messages[0].get("content"), str):
+        messages[0]["content"] = messages[0]["content"] + "\n\n" + prompt
+    else:
+        messages.insert(0, {"role": "system", "content": prompt})
+    return messages
+
+
 # Read user-required tool servers from the generation context.
 def required_tool_server_ids_from_context(
     tool_context: dict[str, Any] | None,
@@ -1645,6 +1698,7 @@ def _load_external_server(server_file: Path) -> dict[str, Any]:
         "description": str(description.get("description") or "").strip(),
         "requires_docker": bool(description.get("requires_docker")),
         "fresh_process_per_call": bool(description.get("fresh_process_per_call")),
+        "has_model_context": bool(description.get("has_model_context")),
         "tools": tools,
         "module": None,
         "supports": None,
@@ -1846,6 +1900,7 @@ def _extract_server_definition(module: ModuleType, folder_name: str, server_file
         "name": server_name,
         "description": description,
         "requires_docker": bool(raw_server.get("requires_docker")),
+        "has_model_context": callable(getattr(module, "get_model_context", None)),
         "tools": tools,
         "module": module,
         "supports": supports_fn if callable(supports_fn) else None,
@@ -2676,6 +2731,16 @@ def _merge_parallel_web_search_calls(tool_calls: list[dict[str, Any]]) -> dict[s
             else:
                 merged_arguments[vertical] = merged_values
     else:
+        verticals = {arguments.get("vertical", "web") for arguments in raw_arguments
+                     if isinstance(arguments.get("vertical", "web"), str)}
+        if len(verticals) != 1 or any(
+            not isinstance(arguments.get("vertical", "web"), str) for arguments in raw_arguments
+        ):
+            return _rejected_parallel_search_call(
+                first,
+                message="parallel searches must use the same vertical; call different verticals separately",
+                call_count=len(tool_calls),
+            )
         routing_keys = ("shopping", "academic", "onion")
         for key in routing_keys:
             values = {_normalized_batch_bool(arguments, key) for arguments in raw_arguments}

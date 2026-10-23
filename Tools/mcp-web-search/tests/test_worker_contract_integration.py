@@ -35,15 +35,12 @@ def test_worker_publishes_string_and_two_query_batch_inputs():
 
     web_tool = next(tool for tool in described["tools"] if tool["id"] == "web_search")
     read_tool = next(tool for tool in described["tools"] if tool["id"] == "read_page")
-    assert web_tool["parameters"]["minProperties"] == 2
-    web_string, web_batch = web_tool["parameters"]["properties"]["web"]["oneOf"]
+    assert web_tool["parameters"]["required"] == ["query"]
+    web_string, web_batch = web_tool["parameters"]["properties"]["query"]["oneOf"]
     assert web_string["type"] == "string"
-    assert web_string["pattern"] == (
-        r"^\s*\S+(?:\s+\S+){0,9}\s*$"
-    )
+    assert "pattern" not in web_string
     assert web_batch["type"] == "array"
     assert web_batch["maxItems"] == 2
-    assert web_batch["items"]["pattern"] == web_string["pattern"]
     assert read_tool["parameters"]["properties"]["url"]["oneOf"][1]["type"] == "array"
 
 
@@ -51,20 +48,20 @@ def test_worker_preflight_matches_the_published_batch_contract():
     good = _worker("prepare", {
         "tool_id": "web_search",
         "arguments": {
-            "call_description": "Check search",
-            "web": "github rate limit fallback",
+            "description": "Check search",
+            "query": "github rate limit fallback",
         },
     })
     assert good["ok"] is True
-    assert good["arguments"]["web"] == "github rate limit fallback"
+    assert good["arguments"]["query"] == "github rate limit fallback"
 
     bad_cases = [
         (
             {
-                "web": "one two three four five six seven eight nine ten eleven",
-                "call_description": "Check search",
+                "query": ["one", "two", "three"],
+                "description": "Check search",
             },
-            "web allows at most 10",
+            "batch permits at most 2",
         ),
     ]
     for arguments, expected_message in bad_cases:

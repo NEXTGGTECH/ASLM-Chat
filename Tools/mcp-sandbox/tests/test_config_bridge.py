@@ -13,6 +13,7 @@ def test_sync_sandbox_env_generates_active_assignments(tmp_path) -> None:
     env_path = tmp_path / "sandbox.env"
     payload = {
         "SANDBOX_CPU_LIMIT": 6,
+        "SANDBOX_NETWORK_ENABLED": False,
         "SANDBOX_WORKSPACE_CLEANUP_ENABLED": False,
         "IGNORED_VALUE": "ignored",
     }
@@ -22,6 +23,7 @@ def test_sync_sandbox_env_generates_active_assignments(tmp_path) -> None:
     content = env_path.read_text(encoding="utf-8")
 
     assert "SANDBOX_CPU_LIMIT=6" in content
+    assert "SANDBOX_NETWORK_ENABLED=0" in content
     assert "SANDBOX_WORKSPACE_CLEANUP_ENABLED=0" in content
     assert "IGNORED_VALUE" not in content
 

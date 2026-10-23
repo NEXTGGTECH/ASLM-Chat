@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import importlib
 import json
 import io
@@ -134,30 +133,73 @@ class ToolActivityStreamTests(SimpleTestCase):
 
 
 class DefaultSystemPromptTests(SimpleTestCase):
-    def test_thinking_prompt_exactly_preserves_the_legacy_system_prompt(self):
-        # SHA-256 of the complete former Tools/SYSTEM_PROMPT.md content.
-        digest = hashlib.sha256(get_system_prompt(instant_mode=False).encode("utf-8")).hexdigest()
+    def test_tool_use_is_mandatory_in_both_modes(self):
+        for instant in (False, True):
+            prompt = get_system_prompt(instant_mode=instant)
+            self.assertIn("using relevant available tools is REQUIRED, not optional", prompt)
+            self.assertIn("inspect the supplied tool names", prompt)
+            self.assertIn("computation/materials tools", prompt)
+            self.assertIn("never invent a calculation", prompt)
 
-        self.assertEqual(
-            digest,
-            "258f06452eef4abcf17b397614f3fe623d6c6e96002585300a208da7af77a49c",
-        )
-
-    def test_search_query_word_limits_are_explicit(self):
+    def test_search_instructions_rely_on_the_actual_schema(self):
         prompt = _compose_system_prompt("")
+        self.assertIn("Read the supplied web_search schema", prompt)
+        self.assertNotIn("Count every whitespace-separated token", prompt)
+        self.assertNotIn("detailed internal research plan", prompt)
 
-        self.assertIn("`web` 10 words per string", prompt)
-        self.assertIn("`shopping` 4", prompt)
-        self.assertIn("`academic` 8", prompt)
-        self.assertIn("`onion` 7", prompt)
-        self.assertIn("Count every whitespace-separated token", prompt)
-        self.assertIn("Search operators count toward the corresponding string's limit", prompt)
+    def test_capability_prompt_uses_only_live_tools_and_preserves_history(self):
+        history = [{"role": "system", "content": "Original"}, {"role": "user", "content": "Calculate"}]
+        lookup = {"materials__compute": {"tool": {"description": "Compute material properties.\nDetails"}}}
+        result = tool_registry.with_available_tools_prompt(history, lookup)
+        self.assertIn("materials__compute: Compute material properties.", result[0]["content"])
+        self.assertIn("MUST call the relevant tools", result[0]["content"])
+        self.assertNotIn("Details", result[0]["content"])
+        self.assertEqual(history[0]["content"], "Original")
+        self.assertEqual(tool_registry.available_tools_prompt({}), "")
+
+    def test_parallel_searches_do_not_silently_lose_vertical_routing(self):
+        result = tool_registry._merge_parallel_web_search_calls([
+            {"name": "web_search", "arguments": {"query": "steel", "vertical": "academic"}},
+            {"name": "web_search", "arguments": {"query": "steel", "vertical": "shopping"}},
+        ])
+        self.assertIn("preflight_error_result", result)
+        merged = tool_registry._merge_parallel_web_search_calls([
+            {"name": "web_search", "arguments": {"query": "steel density", "vertical": "academic"}},
+            {"name": "web_search", "arguments": {"query": "steel modulus", "vertical": "academic"}},
+        ])
+        self.assertEqual(merged["arguments"]["vertical"], "academic")
+        self.assertEqual(merged["arguments"]["query"], ["steel density", "steel modulus"])
+
+    def test_all_adapters_send_live_capabilities_to_the_model(self):
+        tool = {"type": "function", "function": {
+            "name": "materials__compute", "description": "Compute material properties.",
+            "parameters": {"type": "object", "properties": {}},
+        }}
+        lookup = {"materials__compute": {"server": {"id": "materials"}, "tool": {
+            "id": "compute", "description": "Compute material properties.",
+        }}}
+        history = [{"role": "user", "content": "Calculate steel properties"}]
+        cases = ((ollama_api, "_stream_round"), (openai_api, "_stream_openai_round"),
+                 (lms_api, "_stream_openai_round"), (google_genai_api, "_stream_google_round"))
+        for adapter, stream_name in cases:
+            with self.subTest(adapter=adapter.__name__), patch.object(
+                tool_registry, "build_ollama_tools", return_value=([tool], lookup)
+            ), patch.object(adapter, stream_name, return_value=iter(())) as stream:
+                list(adapter._run_tool_loop(None, "model", history, {}, ["materials"], {}))
+                args = stream.call_args.args
+                if adapter is google_genai_api:
+                    context = args[3]["system_instruction"]
+                else:
+                    context = args[2][0]["content"]
+                self.assertIn("materials__compute: Compute material properties.", context)
+                self.assertIn("MUST call the relevant tools", context)
+        self.assertEqual(history, [{"role": "user", "content": "Calculate steel properties"}])
 
     def test_instant_prompt_replaces_thinking_search_contract(self):
         prompt = _compose_system_prompt("", instant_mode=True)
 
         self.assertIn("Instant/no-thinking web lookup rules", prompt)
-        self.assertIn("at most twice", prompt)
+        self.assertIn("at most two searches and two page reads", prompt)
         self.assertNotIn("`shopping` 4", prompt)
 
     def test_instant_mode_detection_tracks_reasoning_controls(self):
@@ -185,6 +227,39 @@ class DefaultSystemPromptTests(SimpleTestCase):
         self.assertNotIn("max_tool_rounds", instant["tool_context"])
         self.assertNotIn("instant_mode", thinking["tool_context"])
         self.assertNotIn("max_tool_rounds", thinking["tool_context"])
+
+
+class SandboxModelContextTests(SimpleTestCase):
+    def test_enabled_server_context_is_fetched_once_per_generation(self):
+        server = {"id": "sandbox", "has_model_context": True, "external": True,
+                  "server_file": Path("Tools/mcp-sandbox/mcp-server.py")}
+        lookup = {
+            "sandbox__bash": {"server": server, "tool": {"description": "Run Bash"}},
+            "sandbox__read": {"server": server, "tool": {"description": "Read a file"}},
+        }
+        with patch.object(tool_registry, "_run_worker", side_effect=["Sandbox CPU=5", "Sandbox CPU=6"]) as worker:
+            self.assertIn("Sandbox CPU=5", tool_registry.available_tools_prompt(lookup))
+            self.assertEqual(worker.call_count, 1)
+            self.assertIn("Sandbox CPU=6", tool_registry.available_tools_prompt(lookup))
+            self.assertEqual(worker.call_count, 2)
+        self.assertEqual(worker.call_args.args[1], "model_context")
+
+    def test_disabled_sandbox_is_not_inspected_or_included(self):
+        lookup = {"web__search": {"server": {"id": "web"}, "tool": {"description": "Search"}}}
+        with patch.object(tool_registry, "_run_worker") as worker:
+            self.assertNotIn("Sandbox environment", tool_registry.available_tools_prompt(lookup))
+            self.assertEqual(tool_registry.available_tools_prompt({}), "")
+        worker.assert_not_called()
+
+    def test_context_failure_does_not_break_generation(self):
+        lookup = {"sandbox__bash": {"server": {
+            "id": "sandbox", "has_model_context": True, "external": True,
+            "server_file": Path("sandbox/mcp-server.py"),
+        }, "tool": {"description": "Run Bash"}}}
+        with patch.object(tool_registry, "_run_worker", side_effect=RuntimeError("private host details")):
+            prompt = tool_registry.available_tools_prompt(lookup)
+        self.assertIn("environment details unavailable", prompt)
+        self.assertNotIn("private host details", prompt)
 
 
 # Small structured error helper for Google GenAI adapter tests.
@@ -4619,7 +4694,7 @@ class ChatApiTests(ToolRegistryTestMixin, TestCase):
         self.assertEqual(instant_kwargs["tool_context"]["forced_tool_name"], "web_search")
         self.assertNotIn("max_tool_rounds", instant_kwargs["tool_context"])
 
-        self.assertIn("Web-search research planning rules", thinking_kwargs["messages"][0]["content"])
+        self.assertIn("Web research:", thinking_kwargs["messages"][0]["content"])
         self.assertNotIn("Instant/no-thinking web lookup rules", thinking_kwargs["messages"][0]["content"])
         self.assertNotIn("instant_mode", thinking_kwargs["tool_context"])
         self.assertNotIn("instant_search_batch_size", thinking_kwargs["tool_context"])
@@ -5513,7 +5588,7 @@ class GenerateApiTests(ToolRegistryTestMixin, TestCase):
         self.assertTrue(thinking_system.startswith(get_system_prompt(instant_mode=False)))
         self.assertIn("Instant/no-thinking web lookup rules", instant_system)
         self.assertNotIn("Web-search research planning rules", instant_system)
-        self.assertIn("Web-search research planning rules", thinking_system)
+        self.assertIn("Web research:", thinking_system)
         self.assertNotIn("Instant/no-thinking web lookup rules", thinking_system)
 
         self.assertIs(instant_kwargs["think"], False)

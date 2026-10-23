@@ -39,6 +39,7 @@ from sandbox.config import (
     MEMORY_LIMIT,
     MEMORY_SWAP_LIMIT,
     MODEL_WORKSPACE_CONTAINER,
+    NETWORK_ENABLED,
     NETWORK_LIMIT_MBIT,
     PIDS_LIMIT,
     SANDBOX_IMAGE,
@@ -318,7 +319,7 @@ def _linux_venv_bind_source() -> str | None:
 # Regenerate sandbox.env from sandbox.json before each container lifecycle check.
 def _ensure_sandbox_config(config_path: str = CONFIG_FILE_PATH) -> None:
     try:
-        sync_sandbox_env(env_path=Path(config_path))
+        sync_sandbox_env(json_path=Path(config_path).with_suffix(".json"), env_path=Path(config_path))
     except OSError as exc:
         logger.warning("Could not synchronize sandbox config %s: %s", config_path, exc)
 
@@ -350,7 +351,9 @@ def _build_run_command(
     # is redesigned. The sandbox_user intentionally has passwordless sudo for
     # package-manager compatibility, and no-new-privileges would break sudo.
 
-    if NETWORK_LIMIT_MBIT > 0:
+    if not NETWORK_ENABLED:
+        command.extend(["--network", "none"])
+    elif NETWORK_LIMIT_MBIT > 0:
         command.extend(["--cap-add", "NET_ADMIN"])
 
     if include_storage_limit and STORAGE_LIMIT:
@@ -393,6 +396,7 @@ def _build_run_command(
         "-e", f"SANDBOX_WORKSPACE_CLEANUP_RECYCLE_SECONDS={WORKSPACE_CLEANUP_RECYCLE_SECONDS}",
         "-e", f"SANDBOX_WORKSPACE_CLEANUP_INTERVAL_SECONDS={WORKSPACE_CLEANUP_INTERVAL_SECONDS}",
         "-e", f"SANDBOX_NETWORK_LIMIT_MBIT={NETWORK_LIMIT_MBIT}",
+        "-e", f"SANDBOX_NETWORK_ENABLED={int(NETWORK_ENABLED)}",
         # Thread limits — propagated to ML libraries too.
         "-e", f"SANDBOX_THREAD_LIMIT={THREAD_LIMIT}",
         "-e", f"OMP_NUM_THREADS={THREAD_LIMIT}",

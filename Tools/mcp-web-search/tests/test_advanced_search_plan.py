@@ -120,29 +120,44 @@ def test_config_schema_mode_defaults_and_invalid_values_fall_back_to_advanced(tm
     legacy.write_text(json.dumps({"query": {"schema_mode": "legacy"}}), encoding="utf-8")
     assert load_search_config(legacy).query.schema_mode == "legacy"
 
-def test_advanced_schema_is_default_and_onion_is_capability_gated(monkeypatch):
+def test_compact_schema_is_default_and_onion_is_capability_gated(monkeypatch):
     monkeypatch.setattr(config_module, "load_search_config", lambda: _config(tor=False))
     schema = build_search_schema()
-    web_schema = schema["properties"]["web"]
-    assert schema["required"] == ["call_description"]
-    assert schema["minProperties"] == 2
-    assert set(schema["properties"]) == {
-        "call_description", "web", "academic", "shopping", "effort"
-    }
-    string_schema, batch_schema = web_schema["oneOf"]
+    assert schema["required"] == ["query"]
+    assert set(schema["properties"]) == {"query", "vertical", "effort", "description"}
+    string_schema, batch_schema = schema["properties"]["query"]["oneOf"]
     assert string_schema["type"] == "string"
-    assert string_schema["pattern"] == r"^\s*\S+(?:\s+\S+){0,9}\s*$"
-    assert batch_schema["type"] == "array"
+    assert "pattern" not in string_schema
     assert batch_schema["maxItems"] == 2
-    assert batch_schema["items"]["pattern"] == string_schema["pattern"]
-    assert "10-word limit applies separately" in web_schema["description"]
-    assert "Choose the query field by evidence type" in build_search_description()
-    description = build_search_description()
-    assert "at most two queries" in description
-    assert "Each query is limited independently" in description
-
+    assert "onion" not in schema["properties"]["vertical"]["enum"]
+    assert "query" in build_search_description()
     monkeypatch.setattr(config_module, "load_search_config", lambda: _config(tor=True))
-    assert "onion" in build_search_schema()["properties"]
+    assert "onion" in build_search_schema()["properties"]["vertical"]["enum"]
+
+
+@pytest.mark.parametrize("vertical", ["web", "academic", "shopping"])
+def test_compact_search_compiles_and_round_trips(monkeypatch, vertical):
+    monkeypatch.setattr(config_module, "load_search_config", lambda: _config())
+    prepared = prepare_search_arguments({"query": "M2 high speed steel properties", "vertical": vertical})
+    assert prepared["ok"] is True
+    assert prepared["search_request"]["queries"][0]["vertical"] == vertical
+    assert prepared["search_request"]["effort"] == "medium"
+    assert prepare_search_arguments(prepared["arguments"])["arguments"] == prepared["arguments"]
+
+
+@pytest.mark.parametrize("arguments", [
+    {"query": ""}, {"query": ["one", "two", "three"]},
+    {"query": "steel", "vertical": "invented"},
+    {"query": "steel", "vertical": "onion"},
+    {"query": "steel", "effort": "invented"},
+    {"query": "steel", "description": 42},
+    {"query": "steel", "web": "ambiguous"},
+])
+def test_compact_search_rejects_invalid_inputs_before_execution(monkeypatch, arguments):
+    monkeypatch.setattr(config_module, "load_search_config", lambda: _config())
+    prepared = prepare_search_arguments(arguments)
+    assert prepared["ok"] is False
+    assert prepared["error_result"]["sources"] == []
 
 
 def test_advanced_compiler_covers_every_operator_and_normalizes_stably():
@@ -162,9 +177,9 @@ def test_advanced_compiler_covers_every_operator_and_normalizes_stably():
 
 def test_advanced_plan_rejects_legacy_shape_and_is_atomic(monkeypatch):
     monkeypatch.setattr(config_module, "load_search_config", lambda: _config())
-    rejected = prepare_search_arguments({"query": "legacy query"})
-    assert rejected["ok"] is False
-    assert rejected["error_result"]["error"]["code"] == "INVALID_SEARCH_PLAN"
+    compact = prepare_search_arguments({"query": "compact query"})
+    assert compact["ok"] is True
+    assert compact["arguments"]["vertical"] == "web"
 
     plan = _plan()
     plan["web"] = [plan["web"], {"text": "query site:example.com"}]
@@ -195,29 +210,13 @@ def test_preflight_advertises_normalized_activity_description(monkeypatch):
         ("academic", "one two three four five six seven eight nine", 9, 8),
     ],
 )
-def test_public_preflight_enforces_vertical_word_limits(
+def test_public_preflight_accepts_queries_beyond_former_word_limits(
     monkeypatch, vertical, query, expected_count, limit
 ):
     monkeypatch.setattr(config_module, "load_search_config", lambda: _config())
-
-    rejected = prepare_search_arguments({
-        "call_description": "Check evidence",
-        vertical: query,
-        "effort": "medium",
-    })
-
-    assert rejected["ok"] is False
-    issue = rejected["error_result"]["error"]["issues"][0]
-    assert issue["path"] == f"$.{vertical}"
-    assert f"contains {expected_count}" in issue["message"]
-    assert f"at most {limit}" in issue["message"]
-    assert f"Delete at least {expected_count - limit} word" in issue["message"]
-    assert "Counted words: 1=one" in issue["message"]
-    context = rejected["error_result"]["model_context"]
-    assert "Required shape: one plain query string normally" in context
-    assert "Valid examples:" in context
-    assert "Received arguments:" in context
-    assert "Never repeat the rejected shape" in context
+    prepared = prepare_search_arguments({"query": query, "vertical": vertical})
+    assert prepared["ok"] is True
+    assert prepared["arguments"]["query"] == query
 
 
 def test_public_preflight_recovers_item_wrapper_as_batch(monkeypatch):
@@ -257,7 +256,7 @@ def test_public_preflight_accepts_two_query_batch_shapes(monkeypatch):
     assert multi_result["arguments"]["academic"] == "project evaluation paper"
 
 
-def test_public_preflight_applies_word_limit_to_each_batch_item_atomically(monkeypatch):
+def test_public_preflight_accepts_batch_without_word_counting(monkeypatch):
     monkeypatch.setattr(config_module, "load_search_config", lambda: _config())
     result = prepare_search_arguments({
         "call_description": "Compare repositories",
@@ -268,10 +267,8 @@ def test_public_preflight_applies_word_limit_to_each_batch_item_atomically(monke
         "effort": "medium",
     })
 
-    assert result["ok"] is False
-    assert result["arguments"] == {}
-    assert result["error_result"]["error"]["issues"][0]["path"] == "$.web[1]"
-    assert "web allows at most 10" in result["error_result"]["model_context"]
+    assert result["ok"] is True
+    assert len(result["search_request"]["queries"]) == 2
 
 
 def test_advanced_plan_requires_call_description_and_rejects_invalid_or_group():
@@ -425,3 +422,27 @@ def test_mixed_vertical_plan_runs_concurrently_and_preserves_metadata(monkeypatc
     assert result["sources"][0]["query_index"] == 1
     assert result["sources"][0]["vertical"] == "web"
     assert len({source["id"] for source in result["sources"]}) == 2
+
+
+def test_compact_search_executes_through_the_server_plan_pipeline(monkeypatch):
+    monkeypatch.setattr(config_module, "load_search_config", lambda: _config())
+    path = Path(__file__).resolve().parents[1] / "mcp-server.py"
+    spec = importlib.util.spec_from_file_location("compact_search_server_test", path)
+    server = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(server)
+    captured = []
+
+    async def fake_plan(request):
+        captured.append(request)
+        return {"sources": [{"url": "https://example.com/paper"}], "model_context": "Evidence"}
+
+    monkeypatch.setattr(server, "run_web_search_plan", fake_plan)
+    monkeypatch.setattr(server, "write_search_io_event", lambda *_: None)
+    result = asyncio.run(server._call_web_search({
+        "query": ["M2 high speed steel density", "M2 high speed steel thermal conductivity"],
+        "vertical": "academic",
+    }))
+    assert result["model_context"] == "Evidence"
+    assert len(captured) == 1
+    assert [query["vertical"] for query in captured[0]["queries"]] == ["academic", "academic"]
+    assert captured[0]["effort"] == "medium"
