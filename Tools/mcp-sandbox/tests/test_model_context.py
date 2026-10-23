@@ -145,7 +145,7 @@ def test_worker_reads_json_config_fresh_without_exporting_secrets(tmp_path):
     assert json.loads(described.stdout)["result"]["has_model_context"] is True
 
 
-def test_default_resources_and_module_settings_match(tmp_path):
+def test_default_resources_and_module_settings_match(tmp_path, monkeypatch):
     env = {key: value for key, value in os.environ.items() if not key.startswith("SANDBOX_")}
     env["SANDBOX_CONFIG_FILE"] = str(tmp_path / "absent.env")
     script = (
@@ -156,6 +156,7 @@ def test_default_resources_and_module_settings_match(tmp_path):
     env["PYTHONPATH"] = str(ROOT / "supervisor")
     result = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, text=True, check=True)
     assert json.loads(result.stdout) == ["8", 8, "1024", "6g", "8g"]
+    monkeypatch.syspath_prepend(str(ROOT.parents[1]))
     from Settings import settings
     expected = {"sandbox-cpu-limit": 8, "sandbox-thread-limit": 8, "sandbox-pids-limit": 1024,
                 "sandbox-memory-limit": 6, "sandbox-memory-swap-limit": 8, "sandbox-network-enabled": True}
