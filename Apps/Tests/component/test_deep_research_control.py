@@ -1,3 +1,5 @@
+# Copyright NEXTGGTECH. Elastic License 2.0.
+
 from __future__ import annotations
 
 import base64
@@ -11,10 +13,14 @@ from types import SimpleNamespace
 from unittest import mock
 from zipfile import ZipFile
 
+import pytest
 from django.test import SimpleTestCase, TestCase
 
-from Tools.deep_research import control, orchestrator
+from Tools.deep_research import control, export, orchestrator
 from Apps.UI import views
+
+
+pytestmark = [pytest.mark.component]
 
 
 class DeepResearchDirectStreamTests(SimpleTestCase):
@@ -211,7 +217,7 @@ class DeepResearchAttachmentChatApiTests(TestCase):
         self.assertEqual(request_message["images"], [image_data])
 
 
-class DeepResearchExportApiTests(SimpleTestCase):
+class DeepResearchExportApiTests(TestCase):
     RICH_REPORT = """# Architecture report
 
 ## Decision
@@ -299,7 +305,17 @@ flowchart LR
             model_context=self.RICH_REPORT,
         )
 
-        response = self.export("docx")
+        # The diagram renderer shells out to a local browser binary; replace
+        # only that boundary so the DOCX assembly pipeline stays exercised.
+        def fake_render(source, output_path, workspace) -> None:
+            from PIL import Image, ImageDraw
+
+            image = Image.new("RGB", (1600, 400), "white")
+            ImageDraw.Draw(image).rectangle([40, 80, 700, 320], outline="black", width=6)
+            image.save(output_path, "PNG")
+
+        with mock.patch.object(export, "_render_mermaid_png", side_effect=fake_render):
+            response = self.export("docx")
 
         self.assertEqual(response.status_code, 200)
         with ZipFile(BytesIO(response.content)) as archive:
@@ -320,13 +336,10 @@ flowchart LR
         self.assertIsNotNone(title_style)
         self.assertIsNone(title_style.find("./w:pPr/w:pBdr", namespace))
         self.assertEqual(title_style.find("./w:rPr/w:color", namespace).get(f"{{{namespace['w']}}}val"), "000000")
-        self.assertTrue(media)
-        self.assertGreaterEqual(diagram_size[0], 800)
-        with Image.open(BytesIO(diagram_bytes)).convert("RGB") as diagram:
-            red, green, blue = diagram.split()
-            from PIL import ImageChops
-            self.assertIsNone(ImageChops.difference(red, green).getbbox())
-            self.assertIsNone(ImageChops.difference(red, blue).getbbox())
+        self.assertEqual(len(media), 1)
+        self.assertEqual(diagram_size, (1600, 400))
+        # 1600 px wide is clamped to the 6.35 in display width (5806440 EMU).
+        self.assertIn('cx="5806440"', document_xml)
 
     def test_pdf_renders_report_pages_and_keeps_links(self) -> None:
         control.update_state(

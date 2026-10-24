@@ -71,6 +71,7 @@ INSTALLED_APPS = [
     "martor",
     "Apps.Data",
     "Apps.UI",
+    "Apps.Tests",
 ]
 
 

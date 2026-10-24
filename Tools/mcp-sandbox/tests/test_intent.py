@@ -25,7 +25,6 @@ def test_open_variants():
         nc = classify(cmd)
         assert nc is not None, f"Got None for: {cmd}"
         assert nc.intent == Intent.OPEN, f"Expected OPEN for: {cmd}, got {nc.intent}"
-    print(f"PASS: {len(cases)} OPEN variants all classified correctly")
 
 
 # head/tail/sed extract line ranges.
@@ -38,7 +37,6 @@ def test_open_line_ranges():
     assert nc.start_line == 10, f"start_line={nc.start_line}"
     assert nc.end_line == 50, f"end_line={nc.end_line}"
 
-    print("PASS: line ranges from head/sed extracted correctly")
 
 
 # All search commands classify as LOCATE.
@@ -54,7 +52,6 @@ def test_locate_variants():
         assert nc is not None, f"Got None for: {cmd}"
         assert nc.intent == Intent.LOCATE, f"Expected LOCATE for: {cmd}, got {nc.intent}"
         assert nc.pattern == expected_pattern, f"Expected pattern={expected_pattern!r}, got {nc.pattern!r} for: {cmd}"
-    print(f"PASS: {len(cases)} LOCATE variants all classified correctly")
 
 
 # ls/tree/find classify as SURVEY.
@@ -64,7 +61,6 @@ def test_survey_variants():
         nc = classify(cmd)
         assert nc is not None, f"Got None for: {cmd}"
         assert nc.intent == Intent.SURVEY, f"Expected SURVEY for: {cmd}, got {nc.intent}"
-    print(f"PASS: {len(cases)} SURVEY variants classified correctly")
 
 
 # cat file | head -n 20 → OPEN with line range.
@@ -75,7 +71,6 @@ def test_compound_cat_head():
     assert nc.was_compound is True
     assert nc.end_line == 20, f"Expected end_line=20, got {nc.end_line}"
     assert nc.target == "file.py", f"Expected target=file.py, got {nc.target}"
-    print(f"PASS: cat file | head -n 20 → OPEN [1:20] (was_compound={nc.was_compound})")
 
 
 # cat file | grep pattern → LOCATE.
@@ -86,7 +81,6 @@ def test_compound_cat_grep():
     assert nc.was_compound is True
     assert nc.pattern == "pattern", f"Expected pattern='pattern', got {nc.pattern!r}"
     assert nc.target == "file.py", f"Expected target=file.py, got {nc.target}"
-    print(f"PASS: cat file | grep pattern → LOCATE (was_compound={nc.was_compound})")
 
 
 # head -n 50 file | grep pattern → LOCATE.
@@ -95,7 +89,6 @@ def test_compound_head_grep():
     assert nc is not None
     assert nc.intent == Intent.LOCATE, f"Expected LOCATE, got {nc.intent}"
     assert nc.was_compound is True
-    print("PASS: head -n 50 file | grep pattern → LOCATE")
 
 
 # Execution commands return None (→ real bash).
@@ -114,7 +107,6 @@ def test_run_commands_return_none():
         # These should either return None or Intent.RUN
         if nc is not None:
             assert nc.intent == Intent.RUN, f"Expected RUN for: {cmd}, got {nc.intent}"
-    print(f"PASS: {len(run_cases)} RUN commands handled correctly")
 
 
 # &&, ||, ;, subshells, redirections → None (real bash).
@@ -134,7 +126,6 @@ def test_chains_return_none():
             assert nc.intent not in (Intent.OPEN, Intent.LOCATE, Intent.SURVEY), (
                 f"Should not route {cmd!r} as {nc.intent}"
             )
-    print(f"PASS: {len(chain_cases)} compound chains correctly passed to real bash")
 
 
 # grep -i → case_sensitive=False.
@@ -143,7 +134,6 @@ def test_locate_case_sensitivity():
     assert nc is not None
     assert nc.intent == Intent.LOCATE
     assert nc.case_sensitive is False, "Expected case_sensitive=False"
-    print("PASS: grep -ri → case_sensitive=False")
 
 
 # rg --type py → glob_pattern=*.py.
@@ -152,7 +142,6 @@ def test_locate_rg_type_flag():
     assert nc is not None
     assert nc.intent == Intent.LOCATE
     assert nc.glob_pattern == "*.py", f"Expected glob=*.py, got {nc.glob_pattern}"
-    print("PASS: rg --type py → glob_pattern=*.py")
 
 
 # find -name '*.py' -type f → NormalizedCommand with name_pattern/find_type.
@@ -224,39 +213,3 @@ def test_grep_inverted_falls_back():
         assert nc.intent == Intent.RUN
 
 
-if __name__ == "__main__":
-    tests = [
-        test_open_variants,
-        test_open_line_ranges,
-        test_locate_variants,
-        test_survey_variants,
-        test_compound_cat_head,
-        test_compound_cat_grep,
-        test_compound_head_grep,
-        test_run_commands_return_none,
-        test_chains_return_none,
-        test_locate_case_sensitivity,
-        test_locate_rg_type_flag,
-        test_find_carries_name_and_type,
-        test_grep_context_carried,
-        test_ls_la_includes_hidden,
-        test_du_falls_through_to_bash,
-        test_find_unsupported_flags_fall_back,
-        test_grep_files_with_matches,
-        test_grep_inverted_falls_back,
-    ]
-    passed = 0
-    failed = 0
-    for t in tests:
-        try:
-            t()
-            passed += 1
-        except Exception as e:
-            import traceback
-            print(f"FAIL: {t.__name__}: {e}")
-            traceback.print_exc()
-            failed += 1
-        print()
-
-    print(f"\n{'='*60}")
-    print(f"Results: {passed} passed, {failed} failed")

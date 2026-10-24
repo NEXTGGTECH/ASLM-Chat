@@ -150,6 +150,12 @@ def test_stream_emits_events_and_feeds_cache(monkeypatch, tmp_path):
     from core.cache.source_cache import SourceCache
     from core.read.service import _cache_key_for_read, _variant_label
 
+    # Cache safety checks resolve DNS; pin them to a public address so the
+    # test stays offline (fake-IP proxies resolve x.com to private ranges).
+    monkeypatch.setattr(
+        "core.fetch.url_utils._resolve_host_ips", lambda host: {"93.184.216.34"}
+    )
+
     cache = SourceCache(str(tmp_path / "src.db"))
     monkeypatch.setattr("core.cache.get_page_cache", lambda: cache)
 
