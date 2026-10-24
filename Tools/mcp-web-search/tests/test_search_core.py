@@ -277,26 +277,27 @@ def test_pacing_holds_engine_within_min_interval():
 def test_pacing_skipped_for_tolerant_engines():
     clock = _Clock()
     tracker = EngineHealthTracker(clock=clock)
-    assert tracker.allow("yep")          # yep min-interval is 0
-    assert tracker.allow("yep")          # so an immediate re-fire is allowed
+    assert tracker.allow("duckduckgo")          # duckduckgo min-interval is 0
+    assert tracker.allow("duckduckgo")          # so an immediate re-fire is allowed
 
 
 # --- engine selection ------------------------------------------------------------
 
 # All engines enabled — isolates breaker behaviour from the config layer.
-_ALL_ON = {n: True for n in ("google", "duckduckgo", "startpage", "qwant", "brave", "yandex", "yep")}
+_ALL_ON = {n: True for n in ("google", "duckduckgo", "startpage", "qwant", "brave", "yandex", "legacy_yandex")}
 
 
 def test_select_engines_low_default_pair():
     tracker = EngineHealthTracker(clock=_Clock())
     names = [e.name for e in select_engines("low", tracker, enabled=_ALL_ON)]
-    assert names == ["yandex", "duckduckgo"]
+    assert names == ["yandex", "legacy_yandex", "duckduckgo"]
 
 
 def test_select_engines_low_falls_back_to_startpage():
     clock = _Clock()
     tracker = EngineHealthTracker(clock=clock)
     tracker.record("yandex", status="blocked", fetch_ms=100, results=0)
+    tracker.record("legacy_yandex", status="blocked", fetch_ms=100, results=0)
     tracker.record("duckduckgo", status="blocked", fetch_ms=100, results=0)
     names = [e.name for e in select_engines("low", tracker, enabled=_ALL_ON)]
     assert names == ["startpage"]
@@ -305,7 +306,7 @@ def test_select_engines_low_falls_back_to_startpage():
 def test_select_engines_low_never_empty():
     clock = _Clock()
     tracker = EngineHealthTracker(clock=clock)
-    for engine in ("yandex", "duckduckgo", "startpage"):
+    for engine in ("yandex", "legacy_yandex", "duckduckgo", "startpage"):
         tracker.record(engine, status="blocked", fetch_ms=100, results=0)
     names = [e.name for e in select_engines("low", tracker, enabled=_ALL_ON)]
     assert names == ["duckduckgo"]  # first enabled lead, forced through an open breaker
@@ -357,25 +358,25 @@ def test_is_healthy_pure_read_no_side_effects():
 
 # --- per-engine config switches (TODO §D) -----------------------------------------
 
-def test_select_engines_default_config_excludes_yandex_and_yep():
-    # Shipped defaults: yandex/yep off. High tier is the widest fan-out — neither may appear.
+def test_select_engines_default_config_excludes_yandex_engines():
+    # Shipped defaults: both Yandex engines off. High tier is the widest fan-out — neither may appear.
     from core.config.settings import EnginesSection
 
     tracker = EngineHealthTracker(clock=_Clock())
     names = [e.name for e in select_engines("high", tracker, enabled=EnginesSection().as_map())]
     assert "yandex" not in names
-    assert "yep" not in names
+    assert "legacy_yandex" not in names
     assert "duckduckgo" in names  # the lead survives
 
 
-def test_select_engines_user_opts_yandex_and_yep_back_in():
+def test_select_engines_user_opts_yandex_engines_back_in():
     from core.config.settings import EnginesSection
 
-    enabled = EnginesSection(yandex=True, yep=True).as_map()
+    enabled = EnginesSection(yandex=True, legacy_yandex=True).as_map()
     tracker = EngineHealthTracker(clock=_Clock())
     names = [e.name for e in select_engines("high", tracker, enabled=enabled)]
     assert "yandex" in names
-    assert "yep" in names
+    assert "legacy_yandex" in names
 
 
 def test_select_engines_disabled_engine_never_forced():
@@ -409,7 +410,7 @@ def test_engines_config_section_loads(tmp_path):
     assert cfg.engines.yandex is True      # user opt-in honoured
     assert cfg.engines.brave is False      # explicit off honoured
     assert cfg.engines.duckduckgo is True  # absent → default on
-    assert cfg.engines.yep is False        # absent → default off
+    assert cfg.engines.legacy_yandex is False  # absent → default off
 
 
 # --- inline-parse policy (custom-domain scope + learned-slow) --------------------

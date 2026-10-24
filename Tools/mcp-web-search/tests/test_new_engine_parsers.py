@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 
-from core.engines import QwantParser, StartpageParser, YandexParser, YepParser
+from core.engines import QwantParser, StartpageParser, YandexParser
 from core.engines.models import ParseStatus
 
 
@@ -67,33 +67,6 @@ def test_qwant_datadome_interstitial_is_blocked():
 
 def test_qwant_invalid_json_is_changed():
     assert QwantParser().parse("<html>nope</html>").status == ParseStatus.CHANGED
-
-
-# --- Yep -------------------------------------------------------------------
-
-def test_yep_parses_results_and_strips_markup():
-    body = json.dumps(
-        [
-            {"type": "Navigation"},
-            {
-                "results": [
-                    {
-                        "type": "Organic",
-                        "title": "SuperFastPython",
-                        "url": "https://superfastpython.com/asyncio-wait/",
-                        "snippet": "use <b>asyncio</b> wait &amp; gather",
-                    }
-                ]
-            },
-        ]
-    )
-    result = YepParser().parse(body)
-    assert result.status == ParseStatus.SUCCESS
-    assert result.results[0].snippet == "use asyncio wait & gather"
-
-
-def test_yep_unexpected_shape_is_changed():
-    assert YepParser().parse(json.dumps({"results": []})).status == ParseStatus.CHANGED
 
 
 # --- Yandex ----------------------------------------------------------------
