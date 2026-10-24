@@ -247,7 +247,7 @@ class PrimpTransport:
 class AdaptiveTransport:
 
     # Initialize all transports: specialized httpx for Google, primp for hosts that
-    # reject generic TLS (Brave, Yandex, Startpage SERPs and the Qwant/Yep APIs),
+    # reject generic TLS (Brave, Yandex, Startpage SERPs and the Qwant API),
     # fast aiohttp for DuckDuckGo.
     def __init__(self, *, timeout_seconds: float = 8.0) -> None:
         self._fast = AiohttpTransport(timeout_seconds=timeout_seconds)
@@ -262,11 +262,12 @@ class AdaptiveTransport:
     # Hosts whose anti-bot TLS fingerprinting requires browser impersonation.
     _IMPERSONATED_HOSTS = frozenset(
         {
+            "www.bing.com",
             "search.brave.com",
             "yandex.com",
             "www.startpage.com",
             "api.qwant.com",
-            "api.yep.com",
+            "ya.ru",
         }
     )
 

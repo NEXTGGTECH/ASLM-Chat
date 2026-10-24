@@ -20,7 +20,6 @@ from ..engines import (
     QwantParser,
     StartpageParser,
     YandexParser,
-    YepParser,
 )
 from ..engines.models import EngineParseResult, EngineRequest
 from ..fetch.transport import AdaptiveTransport, TransportResponse
@@ -31,7 +30,6 @@ DEFAULT_ENGINES = (
     DuckDuckGoParser,
     YandexParser,
     QwantParser,
-    YepParser,
     StartpageParser,
 )
 
@@ -165,6 +163,20 @@ class SerpApi:
         parse_ms = 0.0
         try:
             async with asyncio.timeout(self.timeout_seconds):
+                # Warmup protocol (image engines): a token-hungry parser gets one
+                # cheap priming request first (e.g. DuckDuckGo's vqd), whose response
+                # is captured into the parser's own token cache before the real fetch.
+                needs_warmup = getattr(parser, "needs_warmup", None)
+                capture_response = getattr(parser, "capture_response", None)
+                if callable(needs_warmup) and needs_warmup(query):
+                    warmup_builder = getattr(parser, "build_warmup_request", None)
+                    if callable(warmup_builder):
+                        warmup_request = warmup_builder(
+                            query, region=region, safesearch=safesearch, timelimit=timelimit
+                        )
+                        warmup_response = await self._transport.fetch(warmup_request)
+                        if warmup_response.status < 400 and callable(capture_response):
+                            capture_response(warmup_request, warmup_response.text())
                 request = await _build_engine_request(
                     parser,
                     self._transport,
@@ -174,6 +186,8 @@ class SerpApi:
                     timelimit=timelimit,
                 )
                 response = await self._transport.fetch(request)
+                if response.status < 400 and callable(capture_response):
+                    capture_response(request, response.text())
             fetch_ms = (time.perf_counter() - fetch_started) * 1000
             http_status = response.status
             response_bytes = len(response.body)

@@ -37,11 +37,12 @@ from ..engines import (
     QwantParser,
     StartpageParser,
     YandexParser,
-    YepParser,
 )
+from core.engines.yandex import LegacyYandexParser
 from core.cache.source_cache import canonicalize_url
 from .health import EngineHealthTracker, get_health_tracker
-from .quality import infer_query_language, markdown_meta_date
+from .quality import markdown_meta_date
+from .query_locales import analyze_query
 from .serp_api import SerpApi, _get_transport
 from .triage import TriageAction, TriageSession
 
@@ -380,7 +381,7 @@ def _build_ui(sources: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 # Pick engines for a tier, honoring the per-engine config switch and the circuit breaker.
-# Config is policy (an engine the user turned off never enters a tier — Yandex/Yep default
+# Config is policy (an engine the user turned off never enters a tier — Yandex engines default
 # off, one flip re-enables them); the breaker is health. Never returns an empty list: low's
 # leads fall back to Startpage, and as a last resort the first ENABLED lead is forced even
 # through an open breaker. `enabled` overrides the config map (tests).
@@ -397,9 +398,12 @@ def select_engines(
 
     selected: list[type] = []
 
-    # low core: DDG (lead) + Yandex (opt-in), breaker-gated.
+    # low core: DDG (lead) + Yandex engines (opt-in), breaker-gated. The legacy
+    # widget rides the same tier: opt-in by config, paced by its own breaker row.
     if on(YandexParser) and tracker.allow(YandexParser.name):
         selected.append(YandexParser)
+    if on(LegacyYandexParser) and tracker.allow(LegacyYandexParser.name):
+        selected.append(LegacyYandexParser)
     if on(DuckDuckGoParser) and tracker.allow(DuckDuckGoParser.name):
         selected.append(DuckDuckGoParser)
     if not selected:
@@ -410,7 +414,7 @@ def select_engines(
             # Forced: low must never be empty. First enabled lead wins; an all-off
             # config is a misconfiguration and still gets DDG rather than nothing.
             forced = next(
-                (p for p in (DuckDuckGoParser, StartpageParser, YandexParser, GoogleParser) if on(p)),
+                (p for p in (DuckDuckGoParser, StartpageParser, YandexParser, LegacyYandexParser, GoogleParser) if on(p)),
                 DuckDuckGoParser,
             )
             selected.append(forced)
@@ -446,11 +450,9 @@ def select_engines(
     if effort == "medium":
         return selected
 
-    # high: Brave (rate-governed by its breaker) and Yep (max recall, opt-in).
+    # high: Brave (rate-governed by its breaker).
     if on(BraveParser) and tracker.allow(BraveParser.name):
         selected.append(BraveParser)
-    if on(YepParser) and tracker.allow(YepParser.name):
-        selected.append(YepParser)
     return selected
 
 
@@ -585,11 +587,14 @@ class WebSearchService:
         if not dates_resolved:
             query, timelimit = resolve_query_dates(query, load_search_config().query, timelimit)
 
-        # Region routing (§3.2): explicit region wins; otherwise Cyrillic and
-        # friends route to their home region instead of us-en.
-        language = infer_query_language(query)
+        # Region routing (§3.2): explicit region wins; otherwise the query's own
+        # script/stop-word locale (query_locales, 20 profiles) picks the home region —
+        # Latin queries also resolve via distinctive diacritics and stop-word hints,
+        # so French/Spanish/Turkish/... search their home region instead of us-en.
+        analysis = analyze_query(query)
+        language = analysis.language
         if not region:
-            region = {"ru": "ru-ru", "de": "de-de"}.get(language, "us-en")
+            region = analysis.region
 
         # Advanced vertical fields are routes, not boolean supplements. A dedicated
         # shopping query must return products with prices instead of spending the

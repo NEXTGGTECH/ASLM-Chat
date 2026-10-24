@@ -159,9 +159,63 @@ class HostedApiSection:
 
 # Per-engine kill switches for web_search's tiered selection (TODO §D). An engine set to
 # False never enters a tier — the user opts weak engines in, they are not opted out by
-# health at runtime (that's the breaker's job, this is policy). Yandex and Yep default OFF:
-# Yandex drags ad-redirects/mirrors on download-intent queries and Yep only ever added
-# high-tier recall. Turning either back on is one config flip, no code.
+# health at runtime (that's the breaker's job, this is policy). Both Yandex engines default
+# OFF: the native ya.ru SERP is captcha-gated for scripted clients (it relies on the
+# warm-browser fallback) and the legacy widget is Yandex's retired search product.
+@dataclass
+class RichCardsSection:
+    """Fail-open rich cards for top SERP results (core/cards). DEFAULT OFF: each
+    wikipedia card costs one extra API roundtrip per query; enable deliberately."""
+    enabled: bool = False
+    wikipedia: bool = True
+    stackexchange: bool = True
+    reddit: bool = True
+    max_cards: int = 3
+    timeout_seconds: float = 2.0
+    ttl_seconds: float = 86400.0
+    negative_ttl_seconds: float = 900.0
+
+
+@dataclass
+class ImageEnginesSection:
+    """Kill switches for the image vertical (engines/images.py). Defaults follow the
+    2026-10 live check: bing/brave/openverse answer from residential networks,
+    duckduckgo's i.js sits behind the botnet_challenge wall."""
+    bing: bool = True
+    brave: bool = True
+    duckduckgo: bool = False
+    openverse: bool = True
+
+    def as_map(self) -> dict[str, bool]:
+        return {"bing": self.bing, "brave": self.brave,
+                "duckduckgo": self.duckduckgo, "openverse": self.openverse}
+
+
+@dataclass
+class QueryRewriterSection:
+    """LLM subagent that rewrites conversational model thoughts into search queries.
+    Disabled by default: each enabled rewrite pays one model call (tens of seconds
+    on a 27B). Empty endpoint/model follow the ACTIVE chat model via
+    Tools/model_runtime_metadata.json + Settings/settings.json (ollama native or
+    OpenAI-compatible). Explicit endpoint overrides with an OpenAI-compatible
+    /chat/completions URL."""
+    enabled: bool = False
+    endpoint: str = ""
+    model: str = ""
+    timeout_seconds: float = 75.0
+    max_queries: int = 3
+    mode: str = "heuristic"  # heuristic | always
+
+
+@dataclass
+class LocalizationSection:
+    """Language-aware region routing and result-language scoring (query_locales)."""
+    enabled: bool = True
+    # Triage toll for a result written in a language the query did not use. Capped at
+    # 0.3 in code; 0.12 keeps one consensus vote (0.2+) above two foreign mismatches.
+    language_penalty: float = 0.12
+
+
 @dataclass
 class EnginesSection:
     google: bool = True
@@ -170,7 +224,7 @@ class EnginesSection:
     qwant: bool = True
     brave: bool = True
     yandex: bool = False
-    yep: bool = False
+    legacy_yandex: bool = False
 
     # {engine name: enabled} view for selection code.
     def as_map(self) -> dict[str, bool]:
@@ -181,7 +235,7 @@ class EnginesSection:
             "qwant": self.qwant,
             "brave": self.brave,
             "yandex": self.yandex,
-            "yep": self.yep,
+            "legacy_yandex": self.legacy_yandex,
         }
 
 
@@ -195,6 +249,10 @@ class SearchConfig:
     tor: TorSection = field(default_factory=TorSection)
     hosted_api: HostedApiSection = field(default_factory=HostedApiSection)
     profile_import: ProfileImportSection = field(default_factory=ProfileImportSection)
+    query_rewriter: QueryRewriterSection = field(default_factory=QueryRewriterSection)
+    image_engines: ImageEnginesSection = field(default_factory=ImageEnginesSection)
+    rich_cards: RichCardsSection = field(default_factory=RichCardsSection)
+    localization: LocalizationSection = field(default_factory=LocalizationSection)
     engines: EnginesSection = field(default_factory=EnginesSection)
 
 
@@ -286,6 +344,10 @@ def load_search_config(path: Path | None = None) -> SearchConfig:
     t = raw.get("tor", {})
     h = raw.get("hosted_api", {})
     p = raw.get("profile_import", {})
+    w = raw.get("query_rewriter", {})
+    l = raw.get("localization", {})
+    im = raw.get("image_engines", {})
+    rc = raw.get("rich_cards", {})
     g = raw.get("engines", {})
     _hosted_modes = {"content", "serp", "off"}
     _known_browsers = {"chrome", "edge", "brave", "firefox"}
@@ -370,6 +432,34 @@ def load_search_config(path: Path | None = None) -> SearchConfig:
             refresh_hours=float(p.get("refresh_hours", 12.0)),
             purge_on_disable=bool(p.get("purge_on_disable", True)),
         ),
+        query_rewriter=QueryRewriterSection(
+            enabled=bool(w.get("enabled", False)),
+            endpoint=str(w.get("endpoint", "")),
+            model=str(w.get("model", "")),
+            timeout_seconds=float(w.get("timeout_seconds", 75.0)),
+            max_queries=int(w.get("max_queries", 3)),
+            mode=_one_of(w.get("mode", "heuristic"), {"heuristic", "always"}, "heuristic"),
+        ),
+        image_engines=ImageEnginesSection(
+            bing=bool(im.get("bing", True)),
+            brave=bool(im.get("brave", True)),
+            duckduckgo=bool(im.get("duckduckgo", False)),
+            openverse=bool(im.get("openverse", True)),
+        ),
+        rich_cards=RichCardsSection(
+            enabled=bool(rc.get("enabled", False)),
+            wikipedia=bool(rc.get("wikipedia", True)),
+            stackexchange=bool(rc.get("stackexchange", True)),
+            reddit=bool(rc.get("reddit", True)),
+            max_cards=int(rc.get("max_cards", 3)),
+            timeout_seconds=float(rc.get("timeout_seconds", 2.0)),
+            ttl_seconds=float(rc.get("ttl_seconds", 86400.0)),
+            negative_ttl_seconds=float(rc.get("negative_ttl_seconds", 900.0)),
+        ),
+        localization=LocalizationSection(
+            enabled=bool(l.get("enabled", True)),
+            language_penalty=float(l.get("language_penalty", 0.12)),
+        ),
         engines=EnginesSection(
             google=bool(g.get("google", True)),
             duckduckgo=bool(g.get("duckduckgo", True)),
@@ -377,7 +467,7 @@ def load_search_config(path: Path | None = None) -> SearchConfig:
             qwant=bool(g.get("qwant", True)),
             brave=bool(g.get("brave", True)),
             yandex=bool(g.get("yandex", False)),
-            yep=bool(g.get("yep", False)),
+            legacy_yandex=bool(g.get("legacy_yandex", False)),
         ),
     )
 

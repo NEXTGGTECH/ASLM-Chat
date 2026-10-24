@@ -131,6 +131,10 @@
         {
             "id": "web-search-cache",
             "name": "WebSearch Cache"
+        },
+        {
+            "id": "web-search-images",
+            "name": "WebSearch Image Engines"
         }
     ],
     "settings": [
@@ -615,23 +619,14 @@
         },
         {
             "key": "web-search-engine-yandex",
-            "name": "Yandex",
+            "name": "Yandex (native ya.ru)",
             "type": "bool",
             "default": false,
             "engine": "python-runtime",
             "getExec": "main.py get_setting --key web-search-engine-yandex",
             "setExec": "main.py set_setting --key web-search-engine-yandex --value {value}",
-            "category": "web-search-engines"
-        },
-        {
-            "key": "web-search-engine-yep",
-            "name": "Yep",
-            "type": "bool",
-            "default": false,
-            "engine": "python-runtime",
-            "getExec": "main.py get_setting --key web-search-engine-yep",
-            "setExec": "main.py set_setting --key web-search-engine-yep --value {value}",
-            "category": "web-search-engines"
+            "category": "web-search-engines",
+            "description": "Native ya.ru SERP; captcha-gated for scripted clients, served through the warm-browser fallback"
         },
         {
             "key": "web-search-profile-import-enabled",
@@ -1041,6 +1036,169 @@
             "getExec": "main.py get_setting --key sandbox-docker-start-timeout-seconds",
             "setExec": "main.py set_setting --key sandbox-docker-start-timeout-seconds --value {value}",
             "category": "sandbox"
+        },
+        {
+            "key": "web-search-engine-legacy-yandex",
+            "name": "Yandex (legacy site-search widget)",
+            "type": "bool",
+            "default": false,
+            "engine": "python-runtime",
+            "getExec": "main.py get_setting --key web-search-engine-legacy-yandex",
+            "setExec": "main.py set_setting --key web-search-engine-legacy-yandex --value {value}",
+            "category": "web-search-engines",
+            "description": "The retired yandex.com/search/site widget; far more scrapeable than the native SERP"
+        },
+        {
+            "key": "web-search-image-engine-bing",
+            "name": "Bing Images",
+            "type": "bool",
+            "default": true,
+            "engine": "python-runtime",
+            "getExec": "main.py get_setting --key web-search-image-engine-bing",
+            "setExec": "main.py set_setting --key web-search-image-engine-bing --value {value}",
+            "category": "web-search-images"
+        },
+        {
+            "key": "web-search-image-engine-brave",
+            "name": "Brave Images",
+            "type": "bool",
+            "default": true,
+            "engine": "python-runtime",
+            "getExec": "main.py get_setting --key web-search-image-engine-brave",
+            "setExec": "main.py set_setting --key web-search-image-engine-brave --value {value}",
+            "category": "web-search-images"
+        },
+        {
+            "key": "web-search-image-engine-duckduckgo",
+            "name": "DuckDuckGo Images",
+            "type": "bool",
+            "default": false,
+            "engine": "python-runtime",
+            "getExec": "main.py get_setting --key web-search-image-engine-duckduckgo",
+            "setExec": "main.py set_setting --key web-search-image-engine-duckduckgo --value {value}",
+            "category": "web-search-images",
+            "description": "Its i.js endpoint sits behind an anti-bot challenge on most networks"
+        },
+        {
+            "key": "web-search-image-engine-openverse",
+            "name": "Openverse (CC-licensed)",
+            "type": "bool",
+            "default": true,
+            "engine": "python-runtime",
+            "getExec": "main.py get_setting --key web-search-image-engine-openverse",
+            "setExec": "main.py set_setting --key web-search-image-engine-openverse --value {value}",
+            "category": "web-search-images"
+        },
+        {
+            "key": "web-search-query-rewriter-enabled",
+            "name": "LLM query rewriter",
+            "type": "bool",
+            "default": false,
+            "engine": "python-runtime",
+            "getExec": "main.py get_setting --key web-search-query-rewriter-enabled",
+            "setExec": "main.py set_setting --key web-search-query-rewriter-enabled --value {value}",
+            "category": "web-search-search",
+            "description": "Rewrite conversational model thoughts into clean search queries via the active chat model (subagent call)"
+        },
+        {
+            "key": "web-search-query-rewriter-endpoint",
+            "name": "Query rewriter endpoint",
+            "type": "string",
+            "default": "",
+            "engine": "python-runtime",
+            "getExec": "main.py get_setting --key web-search-query-rewriter-endpoint",
+            "setExec": "main.py set_setting --key web-search-query-rewriter-endpoint --value {value}",
+            "category": "web-search-search",
+            "description": "Empty = follow the active chat model automatically. Set an OpenAI-compatible /chat/completions URL to override"
+        },
+        {
+            "key": "web-search-query-rewriter-model",
+            "name": "Query rewriter model",
+            "type": "string",
+            "default": "",
+            "engine": "python-runtime",
+            "getExec": "main.py get_setting --key web-search-query-rewriter-model",
+            "setExec": "main.py set_setting --key web-search-query-rewriter-model --value {value}",
+            "category": "web-search-search",
+            "description": "Empty = the active chat model. Set a model name to override"
+        },
+        {
+            "key": "web-search-query-rewriter-mode",
+            "name": "Query rewriter mode",
+            "type": "select",
+            "default": "heuristic",
+            "engine": "python-runtime",
+            "getExec": "main.py get_setting --key web-search-query-rewriter-mode",
+            "setExec": "main.py set_setting --key web-search-query-rewriter-mode --value {value}",
+            "category": "web-search-search",
+            "description": "heuristic only rewrites conversational-looking queries; always rewrites everything",
+            "allowedValues": [
+                "heuristic",
+                "always"
+            ]
+        },
+        {
+            "key": "web-search-localization-enabled",
+            "name": "Language-aware search",
+            "type": "bool",
+            "default": true,
+            "engine": "python-runtime",
+            "getExec": "main.py get_setting --key web-search-localization-enabled",
+            "setExec": "main.py set_setting --key web-search-localization-enabled --value {value}",
+            "category": "web-search-search",
+            "description": "Detect the query's locale and gently prefer results in that language"
+        },
+        {
+            "key": "web-search-localization-penalty",
+            "name": "Foreign-language penalty",
+            "type": "number",
+            "default": 0.12,
+            "engine": "python-runtime",
+            "getExec": "main.py get_setting --key web-search-localization-penalty",
+            "setExec": "main.py set_setting --key web-search-localization-penalty --value {value}",
+            "category": "web-search-search",
+            "description": "0-0.3 triage toll for results in a language the query did not use (0 disables)"
+        },
+        {
+            "key": "web-search-rich-cards-enabled",
+            "name": "Rich cards",
+            "type": "bool",
+            "default": false,
+            "engine": "python-runtime",
+            "getExec": "main.py get_setting --key web-search-rich-cards-enabled",
+            "setExec": "main.py set_setting --key web-search-rich-cards-enabled --value {value}",
+            "category": "web-search",
+            "description": "Wikipedia summary cards and forum discussion blocks for top results (adds latency)"
+        },
+        {
+            "key": "web-search-rich-cards-wikipedia",
+            "name": "Wikipedia cards",
+            "type": "bool",
+            "default": true,
+            "engine": "python-runtime",
+            "getExec": "main.py get_setting --key web-search-rich-cards-wikipedia",
+            "setExec": "main.py set_setting --key web-search-rich-cards-wikipedia --value {value}",
+            "category": "web-search"
+        },
+        {
+            "key": "web-search-rich-cards-stackexchange",
+            "name": "StackExchange discussions",
+            "type": "bool",
+            "default": true,
+            "engine": "python-runtime",
+            "getExec": "main.py get_setting --key web-search-rich-cards-stackexchange",
+            "setExec": "main.py set_setting --key web-search-rich-cards-stackexchange --value {value}",
+            "category": "web-search"
+        },
+        {
+            "key": "web-search-rich-cards-reddit",
+            "name": "Reddit discussions",
+            "type": "bool",
+            "default": true,
+            "engine": "python-runtime",
+            "getExec": "main.py get_setting --key web-search-rich-cards-reddit",
+            "setExec": "main.py set_setting --key web-search-rich-cards-reddit --value {value}",
+            "category": "web-search"
         }
     ],
     "downloadsBridge": {

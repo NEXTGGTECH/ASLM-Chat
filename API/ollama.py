@@ -524,6 +524,8 @@ def _run_tool_loop(
 ):
     """Resolve local tools through Ollama tool-calling with streaming output."""
 
+    # model_vision stays unset (fail-closed): the Ollama adapter does not expose a
+    # vision capability yet, so vision-only tools (image_search) are withheld.
     tools, tool_lookup = tool_registry.build_ollama_tools(
         tool_server_ids,
         engine="ollama-service",

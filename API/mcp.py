@@ -323,7 +323,11 @@ def _venv_subprocess_env(python_path: Path) -> dict[str, str]:
 
     from Services import venv_manager
 
-    env = venv_manager.get_subprocess_environment(python_path)
+    # Partial module updates can pair this file with an older venv_manager that
+    # lacks the helper; a plain environment keeps tool workers spawning instead
+    # of dropping every module tool from the registry.
+    build_environment = getattr(venv_manager, "get_subprocess_environment", None)
+    env = build_environment(python_path) if callable(build_environment) else os.environ.copy()
     apply_loopback_proxy_bypass(env)
     venv_path = python_path.parent.parent
     env["VIRTUAL_ENV"] = str(venv_path)
@@ -2092,6 +2096,31 @@ def _serialize_server(server_definition: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 # Build Ollama-compatible tool definitions.
+# Tools offered only to multimodal (vision-capable) models. The image vertical is
+# useless to a text-only model — it cannot look at what it found — so it stays out
+# of the tool list entirely instead of wasting a call round.
+VISION_ONLY_TOOL_IDS = frozenset({"image_search"})
+
+
+def model_supports_vision(engine: str | None, model_name: str | None) -> bool:
+    """Best-effort per-engine multimodality check (fail-closed on any doubt)."""
+    if not model_name:
+        return False
+    try:
+        if engine == "lms":
+            from API import lms as lms_api
+            return bool(lms_api._get_catalog_model_info(model_name).get("vision"))
+        if engine == "openai":
+            from API import openai as openai_api
+            return bool((openai_api.get_model_settings(model_name) or {}).get("supports_vision"))
+        if engine == "google-genai":
+            from API import google_genai as genai_api
+            return bool(genai_api._get_cached_model_capabilities(model_name).get("supports_vision"))
+    except Exception as exc:  # noqa: BLE001 — capability lookup must never break a call
+        logger.debug("vision capability lookup failed for %s/%s: %s", engine, model_name, exc)
+    return False
+
+
 def build_ollama_tools(
     server_ids: str | list[str] | None,
     engine: str | None = None,
@@ -2101,6 +2130,7 @@ def build_ollama_tools(
     allowed_tool_aliases: list[str] | set[str] | tuple[str, ...] | None = None,
     instant_mode: bool = False,
     instant_search_batch_size: int | None = None,
+    model_vision: bool | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
     """Return Ollama-compatible tool payloads for one or more selected servers."""
 
@@ -2130,6 +2160,10 @@ def build_ollama_tools(
         for tool_definition in server_definition["tools"]:
             alias = tool_definition["alias"]
             if allowed_aliases and alias not in allowed_aliases:
+                continue
+            # Vision gate: unknown capabilities (None) fail CLOSED — a text-only
+            # model must never see the image tools by accident.
+            if tool_definition.get("id") in VISION_ONLY_TOOL_IDS and model_vision is not True:
                 continue
             # Tool aliases are global in the conversation, so skip duplicates
             # when multiple selected servers resolve to the same public alias.

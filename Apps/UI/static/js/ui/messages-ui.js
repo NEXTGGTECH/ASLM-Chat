@@ -646,22 +646,31 @@ export function createMessagesUi(context, dependencies) {
 
   // Render one visible text segment as sanitized HTML.
   function renderMarkdownSegment(content, citationSources) {
-    const normalizedContent = normalizeLooseDisplayLatex(
+    // Inline image tokens leave the markdown pipeline as plain markers and re-enter
+    // the sanitized HTML as hydratable nodes (same pattern as LaTeX placeholders).
+    const imageTokens = extractImageTokenBlocks(
       normalizeCitationHandleSpacing(normalizeCitationHandleBrackets(content))
     );
+    const normalizedContent = normalizeLooseDisplayLatex(imageTokens.text);
     const visibleContent = normalizedContent;
     const latexBlocks = extractLatexBlocks(visibleContent);
     if (typeof marked === 'undefined' || typeof DOMPurify === 'undefined') {
-      const fallbackHtml = restoreLatexPlaceholders(
-        decorateCitationHandlesInHtml(escHtml(latexBlocks.text), citationSources),
-        latexBlocks.blocks
+      const fallbackHtml = restoreImagePlaceholders(
+        restoreLatexPlaceholders(
+          decorateCitationHandlesInHtml(escHtml(latexBlocks.text), citationSources),
+          latexBlocks.blocks
+        ),
+        imageTokens.blocks
       );
       return enhanceMarkdownCodeBlocks(renderLatexInHtml(fallbackHtml));
     }
 
-    const html = restoreLatexPlaceholders(
-      decorateCitationHandlesInHtml(DOMPurify.sanitize(marked.parse(latexBlocks.text)), citationSources),
-      latexBlocks.blocks
+    const html = restoreImagePlaceholders(
+      restoreLatexPlaceholders(
+        decorateCitationHandlesInHtml(DOMPurify.sanitize(marked.parse(latexBlocks.text)), citationSources),
+        latexBlocks.blocks
+      ),
+      imageTokens.blocks
     );
     return enhanceMarkdownCodeBlocks(renderLatexInHtml(html));
   }
@@ -1501,6 +1510,189 @@ export function createMessagesUi(context, dependencies) {
   // Activity timeline rendering.
   // Render thoughts, tool calls, and visible text into the assistant timeline.
 
+  // Inline image tokens ([[images: query]]) and image_search galleries.
+  // A token written by the model on its own line becomes a native photo row; the
+  // row is fetched lazily from the image-search endpoint and cached per query.
+  const IMAGE_TOKEN_RE = /^\[\[images:[ \t]+([^\n]{2,140}?)[ \t]*\]\][ \t]*$/gm;
+  const imageTokenCache = new Map(); // query -> Promise<images array>
+
+  function extractImageTokenBlocks(content) {
+    const blocks = [];
+    const text = String(content || '').replace(IMAGE_TOKEN_RE, function replacer(_match, query) {
+      const index = blocks.length;
+      blocks.push(String(query || '').trim());
+      return `%%ASLM-IMG${index}%%`;
+    });
+    return { text, blocks };
+  }
+
+  function restoreImagePlaceholders(html, blocks) {
+    if (!Array.isArray(blocks) || blocks.length === 0) {
+      return html;
+    }
+    let restored = html;
+    blocks.forEach(function restoreOne(query, index) {
+      const marker = `%%ASLM-IMG${index}%%`;
+      // The marker may survive inside a <p> block; replace any occurrence with the
+      // placeholder node the hydrator upgrades into a photo row.
+      const node = `<div class="msg-image-token" data-image-query="${escapeAttributeValue(query)}"></div>`;
+      restored = restored.split(marker).join(node);
+    });
+    return restored;
+  }
+
+  function imageTokenLoadingHtml() {
+    // Show nothing while the row resolves: the token stays blank until the
+    // gallery (or an explicit error hint) replaces it.
+    return '';
+  }
+
+  function renderImageRowHtml(images, query) {
+    const items = (images || []).slice(0, 12).map(function oneThumb(image) {
+      const thumb = String((image && (image.thumbnail_url || image.image_url)) || '');
+      if (!thumb) {
+        return '';
+      }
+      const page = String((image && image.page_url) || '');
+      const title = String((image && image.title) || query || '');
+      const openAttrs = page
+        ? ` href="${escapeAttributeValue(page)}" target="_blank" rel="noopener noreferrer"`
+        : '';
+      return `
+        <a class="msg-image-thumb"${openAttrs} title="${escapeAttributeValue(title)}">
+          <img src="${escapeAttributeValue(thumb)}" alt="${escapeAttributeValue(title)}" loading="lazy" />
+        </a>
+      `;
+    }).filter(Boolean).join('');
+    if (!items) {
+      return '';
+    }
+    return `<div class="msg-image-row">${items}</div>`;
+  }
+
+  // Resolved rows live briefly in sessionStorage so reopening the same chat
+  // does not re-run the search engines; errors are never cached.
+  const IMAGE_ROW_CACHE_PREFIX = 'aslm-image-row:';
+  const IMAGE_ROW_CACHE_TTL_MS = 30 * 60 * 1000;
+
+  function readStoredImageRow(key) {
+    try {
+      const raw = window.sessionStorage.getItem(IMAGE_ROW_CACHE_PREFIX + key);
+      if (!raw) {
+        return null;
+      }
+      const entry = JSON.parse(raw);
+      if (!entry || !Array.isArray(entry.images) || Date.now() - entry.at > IMAGE_ROW_CACHE_TTL_MS) {
+        window.sessionStorage.removeItem(IMAGE_ROW_CACHE_PREFIX + key);
+        return null;
+      }
+      return entry.images;
+    } catch (_error) {
+      return null;
+    }
+  }
+
+  function storeImageRow(key, images) {
+    try {
+      window.sessionStorage.setItem(
+        IMAGE_ROW_CACHE_PREFIX + key,
+        JSON.stringify({ at: Date.now(), images: images })
+      );
+    } catch (_error) {
+      // Full or unavailable sessionStorage — the in-memory cache still applies.
+    }
+  }
+
+  function fetchImageRow(query) {
+    const key = String(query || '').trim();
+    if (!key) {
+      return Promise.resolve([]);
+    }
+    if (imageTokenCache.has(key)) {
+      return imageTokenCache.get(key);
+    }
+    const stored = readStoredImageRow(key);
+    if (stored) {
+      const cachedRequest = Promise.resolve(stored);
+      imageTokenCache.set(key, cachedRequest);
+      return cachedRequest;
+    }
+    const request = postJson('/api/image-search/', {
+      query: key
+    })
+      .then(function onImages(data) {
+        if (data && data.ok === false && data.error) {
+          // Surface the server's reason (e.g. a non-vision model) in the row.
+          return [{ error: String(data.error) }];
+        }
+        const images = (data && Array.isArray(data.images) && data.images) || [];
+        if (images.length) {
+          storeImageRow(key, images);
+        }
+        return images;
+      })
+      .catch(function onImageError(error) {
+        // requestJson throws on non-2xx with the server's message preserved.
+        const message = String((error && error.message) || '');
+        return message ? [{ error: message }] : [];
+      });
+    imageTokenCache.set(key, request);
+    return request;
+  }
+
+  function resolveImageToken($token, query) {
+    $token.attr('data-image-state', 'loading');
+    $token.html(imageTokenLoadingHtml());
+    fetchImageRow(query).then(function fillToken(images) {
+      const errorHint = images && images.length === 1 && images[0] && images[0].error
+        ? String(images[0].error)
+        : '';
+      const html = errorHint ? '' : renderImageRowHtml(images, query);
+      $token.attr('data-image-state', html ? 'done' : 'empty');
+      // Found rows render the gallery; explicit errors show their reason;
+      // an empty result collapses to nothing.
+      $token.html(
+        html
+        || (errorHint ? `<span class="msg-image-row-hint is-empty">${escHtml(errorHint)}</span>` : '')
+      );
+    });
+  }
+
+  function hydrateImageTokens($root) {
+    $root.find('.msg-image-token:not([data-image-state])').each(function hydrateToken() {
+      const $token = window.jQuery(this);
+      const query = String($token.attr('data-image-query') || '').trim();
+      if (!query) {
+        $token.attr('data-image-state', 'empty');
+        return;
+      }
+      resolveImageToken($token, query);
+    });
+  }
+
+  function isImageSearchToolSegment(segment) {
+    const toolId = String(segment.toolId || '').toLowerCase();
+    const alias = String(segment.alias || '').toLowerCase();
+    return !!(segment && segment.toolUi && segment.toolUi.kind === 'image_search')
+      || toolId === 'image_search'
+      || alias.endsWith('__image_search');
+  }
+
+  function imageSearchImagesFromSegment(segment) {
+    const candidates = [
+      segment && segment.toolUi ? segment.toolUi.images : null,
+      segment && segment.structuredContent ? segment.structuredContent.images : null,
+      segment && segment.structuredContent && segment.structuredContent.ui
+        ? segment.structuredContent.ui.images : null
+    ];
+    for (let index = 0; index < candidates.length; index += 1) {
+      if (Array.isArray(candidates[index]) && candidates[index].length > 0) {
+        return candidates[index];
+      }
+    }
+    return [];
+  }
+
   // Search and read-page tool rendering.
   function isSearchToolSegment(segment) {
     const toolId = String(segment.toolId || '').toLowerCase();
@@ -1509,6 +1701,7 @@ export function createMessagesUi(context, dependencies) {
       || toolId === 'web_search_rich'
       || alias.endsWith('__web_search')
       || alias.endsWith('__web_search_rich')
+      || isImageSearchToolSegment(segment)
       || !!(segment.toolUi && segment.toolUi.compact);
   }
 
@@ -2130,6 +2323,9 @@ export function createMessagesUi(context, dependencies) {
   // Render one search tool activity card.
   function renderSearchToolCard(segment, toolSegmentIndex, options) {
     const renderOptions = options || {};
+    if (isImageSearchToolSegment(segment)) {
+      return renderImageSearchToolCard(segment, toolSegmentIndex, renderOptions);
+    }
     const normalizedRequest = normalizedSearchRequestFromSegment(segment);
     const preparedEntries = searchQueryEntriesFromSegment(segment);
     if (normalizedRequest && preparedEntries.length > 0) {
@@ -2190,6 +2386,39 @@ export function createMessagesUi(context, dependencies) {
         </div>
         ${chipsHtml || collapsedMoreHtml ? `<div class="msg-search-chips">${chipsHtml}${collapsedMoreHtml}</div>` : ''}
         ${hiddenChipsHtml || expandedMoreHtml ? `<div class="msg-search-extra-chips">${hiddenChipsHtml}${expandedMoreHtml}</div>` : ''}
+      </div>
+    `;
+  }
+
+  // Render one image_search tool call as a compact card with a thumbnail row.
+  function renderImageSearchToolCard(segment, toolSegmentIndex, renderOptions) {
+    const hasResult = segment.result !== null && segment.result !== undefined;
+    const args = segment.arguments && typeof segment.arguments === 'object' ? segment.arguments : {};
+    const query = String(args.query || (segment.toolUi && segment.toolUi.query) || '').trim();
+    const images = imageSearchImagesFromSegment(segment);
+    const isExpanded = !!renderOptions.expanded;
+    const status = segment.toolUi && segment.toolUi.status ? String(segment.toolUi.status) : '';
+    const isRejected = status === 'rejected';
+    const label = isRejected
+      ? `Bad query: ${query || 'query'}`
+      : hasResult
+        ? (images.length > 0 ? `Images for ${query || 'query'}` : `No images found for ${query || 'query'}`)
+        : `Searching images for ${query || 'query'}`;
+    const pendingHtml = hasResult ? '' : '<span class="msg-search-pending-dot"></span>';
+    const iconHtml = icons.WEB_SEARCH_ICON || icons.TOOL_SEARCH_ICON || icons.GLOBE_ICON;
+    const galleryHtml = images.length > 0
+      ? `<div class="msg-image-gallery">${renderImageRowHtml(images, query)}</div>`
+      : '';
+    const searchKey = searchSegmentKey(segment, toolSegmentIndex);
+    const searchKeyAttr = searchKey ? ` data-search-key="${escapeAttributeValue(searchKey)}"` : '';
+    return `
+      <div class="msg-search-card msg-search-card--images${hasResult ? ' is-done' : ' is-pending'}${isRejected ? ' is-error' : ''}${isExpanded ? ' is-expanded' : ''}${renderOptions.compactLabel ? ' msg-search-card--batch-item' : ''}" data-tool-segment-index="${toolSegmentIndex}"${searchKeyAttr}>
+        <div class="msg-search-line">
+          ${renderOptions.hideIcon ? '' : `<span class="msg-search-icon">${iconHtml}</span>`}
+          <span class="msg-search-label">${escHtml(label)}</span>
+          ${pendingHtml}
+        </div>
+        ${galleryHtml}
       </div>
     `;
   }
@@ -5900,6 +6129,7 @@ export function createMessagesUi(context, dependencies) {
       }
     });
     hydrateSandboxImages($stream);
+    hydrateImageTokens($stream);
     hydrateSharedImageCards($stream);
     if (browserPortalUi && typeof browserPortalUi.hydrate === 'function') {
       browserPortalUi.hydrate($stream);
@@ -6404,6 +6634,8 @@ export function createMessagesUi(context, dependencies) {
         .map(function activityEvent(segment) { return segment.event; }));
       if (renderOptions.streaming !== true) {
         hydrateMermaidDiagrams($stream);
+      hydrateImageTokens($stream);
+        hydrateImageTokens($stream);
       }
 
       if (shouldSyncOpenDrawer) {
@@ -6560,6 +6792,7 @@ export function createMessagesUi(context, dependencies) {
       .map(function activityEvent(segment) { return segment.event; }));
     if (renderOptions.streaming !== true) {
       hydrateMermaidDiagrams($stream);
+      hydrateImageTokens($stream);
     }
 
     if (shouldSyncOpenDrawer) {
@@ -7792,6 +8025,7 @@ export function createMessagesUi(context, dependencies) {
       .data('messageRow', $wrapper.closest('.msg'))
       .data('toolSegments', $wrapper.closest('.msg').data('toolSegments') || []);
     hydrateMermaidDiagrams($body);
+    hydrateImageTokens($body);
     if (isNearBottom && bodyEl) {
       bodyEl.scrollTop = bodyEl.scrollHeight;
     }
@@ -8075,6 +8309,7 @@ export function createMessagesUi(context, dependencies) {
       hydrate(root) {
         const $root = root ? $(root) : dom.$messagesInner;
         hydrateMermaidDiagrams($root);
+        hydrateImageTokens($root);
       }
     });
   }

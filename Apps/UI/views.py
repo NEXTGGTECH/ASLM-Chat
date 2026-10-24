@@ -8420,3 +8420,67 @@ class ChatView(TemplateView):
         context.update(_build_base_context())
         context["preload_chat_id"] = str(kwargs.get("chat_id", ""))
         return context
+
+
+# Resolve an inline [[images: ...]] token from an assistant message into a photo row.
+def image_search_api(request):
+    """Run the mcp-web-search image vertical for one query.
+
+    Deliberately NOT gated on the active model's vision capability: the gallery is
+    user-facing chat content — history written by a multimodal model must keep
+    rendering after switching to a text-only model. The multimodality gate lives
+    where it belongs, on the tool offered to the model (build_ollama_tools).
+    """
+
+    if request.method != "POST":
+        return JsonResponse({"error": "Invalid request method"}, status=405)
+
+    data = _read_json_request_body(request)
+    query = " ".join(str(data.get("query") or "").split())
+    if not query:
+        return JsonResponse({"error": "Missing query."}, status=400)
+
+    engine = str(data.get("engine") or "").strip() or None
+    model_name = str(data.get("model") or "").strip() or None
+
+    try:
+        limit = max(1, min(24, int(data.get("limit") or 12)))
+    except (TypeError, ValueError):
+        limit = 12
+
+    try:
+        _tools, tool_lookup = tool_registry.build_ollama_tools(
+            ["web_search"], engine=engine, model_name=model_name, model_vision=True
+        )
+        if "web_search__image_search" not in tool_lookup:
+            return JsonResponse({"ok": False, "error": "Image search tool is unavailable."}, status=503)
+        result = tool_registry.call_ollama_tool(
+            tool_lookup,
+            "web_search__image_search",
+            {"query": query, "limit": limit},
+        )
+    except Exception as exc:  # noqa: BLE001 — one token must never break the chat UI
+        logger.warning("Inline image search failed for %r: %s", query[:120], exc)
+        return JsonResponse({"ok": False, "error": "Image search failed."}, status=502)
+
+    # call_ollama_tool hands back either a serialized JSON string (plain results)
+    # or the {"_tool_result_content", "_tool_result_structured"} envelope (rich
+    # results) — unwrap both before reading the gallery payload.
+    payload = result
+    if isinstance(payload, str) and payload.strip().startswith("{"):
+        try:
+            payload = json.loads(payload)
+        except json.JSONDecodeError:
+            payload = None
+    if isinstance(payload, dict) and isinstance(payload.get("_tool_result_structured"), dict):
+        structured = payload["_tool_result_structured"]
+        ui = structured.get("ui") if isinstance(structured.get("ui"), dict) else structured
+    else:
+        ui = payload.get("ui") if isinstance(payload, dict) else None
+    images = (ui or {}).get("images") if isinstance(ui, dict) else None
+    return JsonResponse({
+        "ok": True,
+        "query": query,
+        "images": images or [],
+        "status": (ui or {}).get("status") if isinstance(ui, dict) else "empty",
+    })

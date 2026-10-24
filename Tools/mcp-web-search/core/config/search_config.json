@@ -1,64 +1,104 @@
 {
-  "search": {
-    "max_results": 10,
-    "total_context_budget": 40000,
-    "prefetch_fetch_timeout": 8.0,
-    "preview_max_chars": 4000
-  },
-  "extraction": {
-    "timeout_seconds": 25.0,
-    "max_page_chars": 20000,
-    "min_content_length": 800,
-    "enable_read_page_compress": true,
-    "read_page_compress_threshold_chars": 10000,
-    "read_page_compress_target_chars": 10000
-  },
-  "cache": {
-    "search_ttl_seconds": 21600,
-    "search_negative_ttl_seconds": 300,
-    "page_ttl_seconds": 86400,
-    "repeat_block_window_seconds": 30,
-    "seen_source_window_seconds": 30,
-    "prefetch_max_urls": 4
-  },
-  "query": {
-    "schema_mode": "advanced",
-    "year_hint_mode": "timelimit",
-    "year_hint_current": "m",
-    "year_hint_prev": "y",
-    "year_hint_older": null
-  },
-  "browser": {
-    "browser_fallback": "full"
-  },
-  "tor": {
-    "enabled": false
-  },
-  "engines": {
-    "google": true,
-    "duckduckgo": true,
-    "startpage": true,
-    "qwant": true,
-    "brave": true,
-    "yandex": false,
-    "yep": false
-  },
-  "hosted_api": {
-    "tavily": "content",
-    "firecrawl": "serp",
-    "brave": "serp",
-    "serpapi": "serp"
-  },
-  "profile_import": {
-    "enabled": false,
-    "browsers": ["chrome", "edge", "brave", "firefox"],
-    "domains": [
-      "google.com", "bing.com", "duckduckgo.com", "startpage.com",
-      "yandex.com", "yandex.ru", "qwant.com", "brave.com", "search.brave.com",
-      "reddit.com"
-    ],
-    "all_profiles": false,
-    "refresh_hours": 12.0,
-    "purge_on_disable": true
-  }
+    "search": {
+        "max_results": 10,
+        "total_context_budget": 40000,
+        "prefetch_fetch_timeout": 8.0,
+        "preview_max_chars": 4000
+    },
+    "extraction": {
+        "timeout_seconds": 25.0,
+        "max_page_chars": 20000,
+        "min_content_length": 800,
+        "enable_read_page_compress": true,
+        "read_page_compress_threshold_chars": 10000,
+        "read_page_compress_target_chars": 10000
+    },
+    "cache": {
+        "search_ttl_seconds": 21600,
+        "search_negative_ttl_seconds": 300,
+        "page_ttl_seconds": 86400,
+        "repeat_block_window_seconds": 30,
+        "seen_source_window_seconds": 30,
+        "prefetch_max_urls": 4
+    },
+    "query": {
+        "schema_mode": "advanced",
+        "year_hint_mode": "timelimit",
+        "year_hint_current": "m",
+        "year_hint_prev": "y",
+        "year_hint_older": null
+    },
+    "browser": {
+        "browser_fallback": "full"
+    },
+    "tor": {
+        "enabled": false
+    },
+    "engines": {
+        "google": true,
+        "duckduckgo": true,
+        "startpage": true,
+        "qwant": true,
+        "brave": true,
+        "yandex": false,
+        "legacy_yandex": false
+    },
+    "hosted_api": {
+        "tavily": "content",
+        "firecrawl": "serp",
+        "brave": "serp",
+        "serpapi": "serp"
+    },
+    "profile_import": {
+        "enabled": false,
+        "browsers": [
+            "chrome",
+            "edge",
+            "brave",
+            "firefox"
+        ],
+        "domains": [
+            "google.com",
+            "bing.com",
+            "duckduckgo.com",
+            "startpage.com",
+            "yandex.com",
+            "yandex.ru",
+            "qwant.com",
+            "brave.com",
+            "search.brave.com",
+            "reddit.com"
+        ],
+        "all_profiles": false,
+        "refresh_hours": 12.0,
+        "purge_on_disable": true
+    },
+    "query_rewriter": {
+        "enabled": false,
+        "endpoint": "",
+        "model": "",
+        "timeout_seconds": 75.0,
+        "max_queries": 3,
+        "mode": "heuristic"
+    },
+    "image_engines": {
+        "bing": true,
+        "brave": true,
+        "duckduckgo": false,
+        "openverse": true
+    },
+    "rich_cards": {
+        "enabled": false,
+        "wikipedia": true,
+        "stackexchange": true,
+        "reddit": true,
+        "max_cards": 3,
+        "timeout_seconds": 2.0,
+        "ttl_seconds": 86400.0,
+        "negative_ttl_seconds": 900.0
+    },
+    "localization": {
+        "enabled": true,
+        "language_penalty": 0.12
+    }
 }

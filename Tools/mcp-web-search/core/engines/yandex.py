@@ -20,13 +20,127 @@ _SUPPORTED_LANGS = frozenset(
 )
 
 
-# Yandex web parser using the site-search ("frame") widget endpoint.
+# Yandex web parser using the native ya.ru SERP.
 #
-# The main https://yandex.com/search/ SERP is captcha-gated for scripted clients.
-# The /search/site/ widget endpoint is far more scrapeable and renders organic
-# results with stable b-serp-item__* markup, which is what searxng relies on.
+# The native endpoint serves Yandex's current search markup (div.Organic with
+# OrganicTitle-Link anchors). It is aggressively captcha-gated for scripted
+# clients, so the expected production path is the warm-browser fallback: a real
+# Chromium render of the same URL passes where every HTTP fingerprint fails.
+# Ad placements carry the action-counter class and are skipped so only the
+# organic rank the user sees survives.
 class YandexParser:
     name = "yandex"
+    provider_family = "yandex"
+    search_url = "https://ya.ru/search/"
+
+    _BLOCK_MARKERS = ("showcaptcha", "smartcaptcha", "checkcaptcha", "robot check", "captcha")
+    _EMPTY_MARKERS = ("nothing found", "there are no search results", "ничего не нашлось", "ничего не найдено")
+    _VARIANTS = (
+        ("native_organic", "div.Organic"),
+        ("legacy_serp_items", "li[class*='serp-item']"),
+    )
+
+    # Build a native Yandex search request.
+    @staticmethod
+    def build_request(
+        query: str,
+        *,
+        region: str = "us-en",
+        safesearch: str = "moderate",
+        timelimit: str | None = None,
+        page: int = 1,
+    ) -> EngineRequest:
+        del safesearch, timelimit
+        _, language = split_region(region)
+        params = {"text": query}
+        if page > 1:
+            params["p"] = str(page - 1)
+        profile = for_engine("yandex")
+        headers = {"Accept-Language": "en-US,en;q=0.9"}
+        accept_language = accept_language_for(language)
+        if accept_language:
+            headers["Accept-Language"] = accept_language
+        return EngineRequest(
+            method="GET",
+            url=YandexParser.search_url,
+            params=params,
+            headers=headers,
+            primp_target=profile.primp_target,
+            primp_os=profile.primp_os,
+            identity_key="yandex",
+        )
+
+    # Parse a raw native Yandex HTML document into normalized results.
+    def parse(self, document: str) -> EngineParseResult:
+        lowered = document.lower()
+        blocked = any(marker in lowered for marker in self._BLOCK_MARKERS)
+        explicit_empty = any(marker in lowered for marker in self._EMPTY_MARKERS)
+
+        tree = parse_html(document)
+        variant, cards = first_cards(tree, self._VARIANTS)
+
+        results: list[SearchResult] = []
+        malformed = 0
+        for card in cards:
+            native_link = card.css_first("a.OrganicTitle-Link")
+            if native_link is not None and "action-counter" in (
+                native_link.attributes.get("class") or ""
+            ).split():
+                # Paid placements use Yandex tracking links and the action-counter
+                # class; they are not part of the organic rank the user sees.
+                continue
+            title = first_node_text(
+                card,
+                (
+                    ".OrganicTitleContentSpan",
+                    ".OrganicTitle-LinkText",
+                    "h3.b-serp-item__title a.b-serp-item__title-link",
+                    ".b-serp-item__title-link",
+                    "h3",
+                ),
+            )
+            href = first_attribute(
+                card,
+                (
+                    "a.OrganicTitle-Link",
+                    "a.b-serp-item__title-link",
+                    "h3 a",
+                    "a",
+                ),
+                "href",
+            )
+            snippet = first_node_text(
+                card,
+                (
+                    ".OrganicTextContentSpan",
+                    ".OrganicText",
+                    ".b-serp-item__content .b-serp-item__text",
+                    ".b-serp-item__text",
+                ),
+            )
+            if not title or not valid_http_url(href):
+                malformed += 1
+                continue
+            results.append(SearchResult(title=title, url=href, snippet=snippet))
+
+        return classify_parse(
+            engine=self.name,
+            results=results,
+            parser_variant=variant,
+            cards_seen=len(cards),
+            malformed_cards=malformed,
+            blocked=blocked and not results,
+            explicit_empty=explicit_empty,
+        )
+
+
+# Legacy Yandex web parser using the retired site-search ("frame") widget.
+#
+# The widget endpoint is Yandex's outdated search product; it stays scrapeable
+# long after the native SERP hardened, but its index and markup are frozen in
+# the legacy product. Kept for networks where the native SERP will not render.
+class LegacyYandexParser:
+    name = "legacy_yandex"
     provider_family = "yandex"
     search_url = "https://yandex.com/search/site/"
 
@@ -74,7 +188,7 @@ class YandexParser:
         cookies = {"yp": "1716337604.sp.family%3A0#1685406411.szm.1:1920x1080:1920x999"}
         return EngineRequest(
             method="GET",
-            url=YandexParser.search_url,
+            url=LegacyYandexParser.search_url,
             params=params,
             headers=headers,
             cookies=cookies,

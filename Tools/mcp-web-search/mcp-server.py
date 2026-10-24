@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 import sys
 import time
@@ -26,6 +27,7 @@ for _stream in (sys.stdout, sys.stderr):
 
 from core.logging_setup import setup_logging
 from core.mcp_contract import (
+    IMAGE_SEARCH_TOOL_DESCRIPTION,
     MCP_SERVER_DESCRIPTION,
     READ_PAGE_TOOL_DESCRIPTION,
     build_search_description,
@@ -40,6 +42,7 @@ from core.mcp_contract import (
 from core.read import run_read_page
 from core.search.web_search import run_web_search, run_web_search_batch, run_web_search_plan
 from core.search_io_logger import write_search_io_event
+from core.query.rewriter import expanded_queries, rewrite_query, rewrite_queries
 from urllib.parse import urlparse
 
 # Wire rotating file logs (web_search.log / read_page.log / core.log / mcp_trace.log)
@@ -80,6 +83,29 @@ TOOLS = [
         "parameters": build_search_schema(),
     },
     {
+        "id": "image_search",
+        "name": "Image Search",
+        "description": IMAGE_SEARCH_TOOL_DESCRIPTION,
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "query": {
+                    "description": "Plain search terms for the images (the user's language, no questions).",
+                    "type": "string",
+                    "minLength": 2,
+                },
+                "limit": {
+                    "description": "How many images to return (1-24, default 12).",
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 24,
+                },
+            },
+            "required": ["query"],
+        },
+    },
+    {
         "id": "read_page",
         "name": "Read Page",
         "description": READ_PAGE_TOOL_DESCRIPTION,
@@ -118,6 +144,82 @@ def supports(engine: str | None = None, model_name: str | None = None) -> bool:
     return engine in (None, "ollama-service", "lms", "openai", "google-genai")
 
 
+# Attach rich cards (wikipedia/discussions) to a finished web_search result.
+async def _attach_rich_cards(result: dict[str, Any], queries: list[str]) -> dict[str, Any]:
+    try:
+        from core.config import load_search_config
+        config = load_search_config().rich_cards
+        if not config.enabled:
+            return result
+        from core.cards import RichCardService
+
+        sources = result.get("sources") or []
+        language = ""
+        for query in queries:
+            if isinstance(query, str) and query.strip():
+                from core.search.query_locales import analyze_query
+                language = analyze_query(query).language
+                break
+        service = RichCardService()
+        cards = await service.build(sources, config, language=language or "en")
+        discussions = service.build_discussions(sources, config)
+        ui = result.setdefault("ui", {})
+        if cards:
+            ui["rich_cards"] = cards
+        if discussions:
+            ui["discussions"] = discussions
+        logger.info(
+            "mcp.web_search.rich_cards cards=%d discussions=%d",
+            len(cards), len(discussions.get("items", [])),
+        )
+    except Exception as exc:  # noqa: BLE001 — enrichment must never fail a search
+        logger.warning("rich cards skipped: %s", exc)
+    return result
+
+
+# Rewrite raw model-supplied query text before the plan compiler runs.
+async def _rewrite_search_args(args: dict[str, Any]) -> dict[str, Any]:
+    """Return args with query text replaced by rewriter output when it fires.
+
+    The model composes its own query strings, so the subagent must see them
+    BEFORE prepare_search_arguments compiles the advanced schema — rewritten
+    text then flows through the same operator extraction, tool_ui build, and
+    execution pipeline in every schema mode. Fail-open: any non-string shape
+    or disabled config returns the args untouched.
+    """
+    try:
+        if not isinstance(args, dict) or "query" not in args:
+            return args
+        raw = args["query"]
+        if isinstance(raw, str):
+            queries = [raw]
+        elif isinstance(raw, list) and raw and all(isinstance(item, str) for item in raw):
+            queries = list(raw)
+        else:
+            return args
+        if not any(str(item).strip() for item in queries):
+            return args
+        if len(queries) == 1:
+            fan_out = await expanded_queries(queries[0])
+            if fan_out:
+                queries = fan_out[:3]
+            else:
+                rewritten, changed = await rewrite_query(queries[0])
+                if not changed:
+                    return args
+                queries = [rewritten]
+        else:
+            queries, changed = await rewrite_queries(queries)
+            if not changed:
+                return args
+        rewritten_args = dict(args)
+        rewritten_args["query"] = queries[0] if len(queries) == 1 else queries
+        return rewritten_args
+    except Exception as exc:  # noqa: BLE001 — the rewriter must never break a search
+        logger.warning("query rewriter args pass-through failed: %s", exc)
+        return args
+
+
 # Run the ranked web_search pipeline (the model-facing default tool).
 #
 # The model routes query strings through the vertical fields and chooses effort. Recency
@@ -126,6 +228,9 @@ async def _call_web_search(
     args: dict[str, Any], *, preflight_warnings: list[dict[str, Any]] | None = None,
     instant_mode: bool = False,
 ) -> dict[str, Any]:
+    # Instant mode is the latency-critical path and keeps its own contract.
+    if not instant_mode:
+        args = await _rewrite_search_args(args)
     prepared = prepare_search_arguments(args, instant_mode=instant_mode)
     if not prepared.get("ok"):
         return dict(prepared.get("error_result") or {})
@@ -172,6 +277,7 @@ async def _call_web_search(
         "mcp.web_search.start effort=%s shopping=%s academic=%s onion=%s queries=%d query_preview=%r",
         effort, shopping, academic, onion, len(queries), query_preview,
     )
+
     started = time.perf_counter()
     try:
         if search_request.get("schema_mode") in {"advanced", "instant"}:
@@ -221,6 +327,9 @@ async def _call_web_search(
         "mcp.web_search.done effort=%s queries=%d sources=%d elapsed=%.3fs",
         effort, len(queries), len(result.get("sources", [])), elapsed,
     )
+    # Rich cards (config-gated, default OFF): wikipedia summary card + forum
+    # discussion block for the top results. Fail-open on any error.
+    result = await _attach_rich_cards(result, queries)
     write_search_io_event(
         {
             "layer": "mcp_adapter",
@@ -312,6 +421,132 @@ def _read_page_payload(urls: list[str], results: list[str]) -> dict[str, Any]:
 
 
 # Fetch one or many URLs as markdown and wrap them in the structured payload.
+# Run the image-search vertical and shape a gallery-friendly payload.
+# In-memory TTL cache for image results: reopening a chat re-resolves every
+# [[images:]] token, and re-running engines for the same query is pure latency.
+_IMAGE_CACHE_TTL_SECONDS = 1800.0
+_IMAGE_CACHE_MAX_ENTRIES = 100
+_image_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+
+
+def _image_cache_key(query: str, limit: int) -> str:
+    return f"{query.casefold()}|{limit}"
+
+
+def _cached_image_result(query: str, limit: int) -> dict[str, Any] | None:
+    entry = _image_cache.get(_image_cache_key(query, limit))
+    if entry is None or entry[0] <= time.monotonic():
+        return None
+    return copy.deepcopy(entry[1])
+
+
+def _store_image_result(query: str, limit: int, payload: dict[str, Any]) -> None:
+    if len(_image_cache) >= _IMAGE_CACHE_MAX_ENTRIES:
+        now = time.monotonic()
+        for key in [k for k, (expires, _) in _image_cache.items() if expires <= now]:
+            _image_cache.pop(key, None)
+        while len(_image_cache) >= _IMAGE_CACHE_MAX_ENTRIES:
+            _image_cache.pop(next(iter(_image_cache)))
+    _image_cache[_image_cache_key(query, limit)] = (
+        time.monotonic() + _IMAGE_CACHE_TTL_SECONDS,
+        copy.deepcopy(payload),
+    )
+
+
+async def _call_image_search(args: dict[str, Any]) -> dict[str, Any]:
+    from core.search.image_search import ImageSearchService
+
+    query = " ".join(str(args.get("query") or "").split())
+    if not query:
+        return {
+            "ui": {"kind": "image_search", "status": "error", "images": [], "error": "empty query"},
+            "tool_ui": {"kind": "image_search", "status": "error", "images": []},
+            "result": "Image search failed: query must be a non-empty string.",
+        }
+    try:
+        limit = max(1, min(24, int(args.get("limit") or 12)))
+    except (TypeError, ValueError):
+        limit = 12
+
+    cached = _cached_image_result(query, limit)
+    if cached is not None:
+        logger.info("mcp.image_search.cache hit query=%r", query[:120])
+        return cached
+
+    started = time.perf_counter()
+    try:
+        payload = await ImageSearchService().search(
+            query, limit=limit, timeout_seconds=8.0
+        )
+    except Exception as exc:  # noqa: BLE001 — the tool must fail soft
+        logger.warning("mcp.image_search.failed query=%r error=%s", query[:120], exc)
+        return {
+            "ui": {"kind": "image_search", "status": "error", "images": [], "error": str(exc)[:200]},
+            "tool_ui": {"kind": "image_search", "status": "error", "images": []},
+            "result": f"Image search failed: {exc}",
+        }
+
+    images = [
+        {
+            "id": f"img{index}",
+            "title": str(source.get("title") or ""),
+            "image_url": str(source.get("image_url") or ""),
+            "thumbnail_url": str(source.get("thumbnail_url") or source.get("image_url") or ""),
+            "page_url": str(source.get("url") or ""),
+            "source_domain": str(source.get("source_domain") or ""),
+            "width": source.get("width"),
+            "height": source.get("height"),
+            "engines": source.get("engines") or [],
+        }
+        for index, source in enumerate(payload.get("sources") or [], 1)
+        if source.get("image_url")
+    ]
+    ui = {
+        "kind": "image_search",
+        "status": "done" if images else "empty",
+        "query": payload.get("query") or query,
+        "language": payload.get("language") or "",
+        "result_count": len(images),
+        "images": images,
+    }
+    write_search_io_event(
+        {"layer": "mcp_adapter", "phase": "image_search.result", "tool_id": "image_search",
+         "query": query, "result_count": len(images)}
+    )
+    logger.info(
+        "mcp.image_search.done status=%s count=%d took=%.0fms",
+        ui["status"], len(images), (time.perf_counter() - started) * 1000,
+    )
+    # The model-facing result stays compact: it sees URLs + metadata and can fetch
+    # any image itself when it is multimodal; the rich gallery is UI-only.
+    result_lines = [
+        f'{item["id"]}: {item["title"][:80]} | {item["image_url"]}'
+        + (f' | page: {item["page_url"]}' if item["page_url"] else "")
+        for item in images
+    ]
+    model_context = (
+        f'Images for "{query}" ({len(images)}):\n' + "\n".join(result_lines)
+        if images
+        else f'No images found for "{query}".'
+    )
+    # model_context is the MCP contract's compact model-facing text: with it (plus
+    # the ui dict) _extract_structured_tool_result keeps the gallery metadata and
+    # the model sees the clean listing instead of a full JSON dump.
+    if images:
+        _store_image_result(query, limit, {
+            "ui": ui,
+            "tool_ui": ui,
+            "model_context": model_context,
+            "result": model_context,
+        })
+    return {
+        "ui": ui,
+        "tool_ui": ui,
+        "model_context": model_context,
+        "result": model_context,
+    }
+
+
 async def _call_read_page(args: dict[str, Any]) -> dict[str, Any]:
     import asyncio
 
@@ -383,6 +618,8 @@ async def call_tool(
             preflight_warnings=inherited_warnings,
             instant_mode=instant_mode,
         )
+    if tool_id == "image_search":
+        return await _call_image_search(args)
     if tool_id == "read_page":
         return await _call_read_page(args)
     raise ValueError(f"Unknown tool: {tool_id}")

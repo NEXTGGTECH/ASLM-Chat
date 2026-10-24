@@ -51,6 +51,19 @@ Example: {"query":"M2 high speed steel thermal conductivity","vertical":"academi
 WEB_SEARCH_TOOL_DESCRIPTION = ADVANCED_WEB_SEARCH_TOOL_DESCRIPTION
 
 
+IMAGE_SEARCH_TOOL_DESCRIPTION = (
+    "Search the web for images matching a query. Returns normalized image results: "
+    "full image URL, thumbnail, source page, dimensions. The query's own language "
+    "and region are auto-detected, so write it in the user's language. Offered only "
+    "to multimodal (vision-capable) models: you can pass any returned image_url to "
+    "your image input to actually look at it.\n\n"
+    "You may also embed images directly in your reply with the inline token "
+    "[[images: search terms]] on its own line in plain text — the chat UI renders it "
+    "as a native photo row for the user (the search runs automatically; you do not "
+    "need to call this tool for the token to work)."
+)
+
+
 READ_PAGE_TOOL_DESCRIPTION = """\
 Open one or more exact URLs and extract their readable text as markdown.
 

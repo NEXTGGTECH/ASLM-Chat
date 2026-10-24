@@ -2092,3 +2092,67 @@ img.msg-search-main-icon {
     height: clamp(260px, 48vh, 440px);
   }
 }
+
+/* ── Inline image rows ([[images: …]] tokens and image_search galleries) ────── */
+
+.msg-image-token {
+  margin: 8px 0;
+}
+
+.msg-image-row {
+  display: flex;
+  gap: 6px;
+  overflow-x: auto;
+  padding: 2px 0;
+  scrollbar-width: thin;
+}
+
+.msg-image-row.is-loading {
+  min-height: 64px;
+  align-items: center;
+  border: 1px dashed var(--activity-card-border);
+  border-radius: 10px;
+  padding: 8px 10px;
+}
+
+.msg-image-row-hint {
+  font-size: 12px;
+  opacity: 0.7;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.msg-image-row-hint.is-empty {
+  opacity: 0.5;
+}
+
+.msg-image-thumb {
+  flex: 0 0 auto;
+  width: 108px;
+  height: 108px;
+  border-radius: 10px;
+  overflow: hidden;
+  background: var(--activity-image-frame-bg, var(--activity-card-inner-bg));
+  border: 1px solid var(--activity-card-border);
+  display: block;
+}
+
+.msg-image-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.msg-image-thumb:hover {
+  border-color: var(--activity-card-border-hover);
+}
+
+.msg-search-card--images {
+  width: min(100%, 620px);
+}
+
+.msg-search-card--images .msg-image-gallery {
+  margin-top: 6px;
+}

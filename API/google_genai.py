@@ -1427,9 +1427,14 @@ def _build_google_tools(
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
     """Return Gemini-compatible tool declarations for one or more servers."""
 
+    try:
+        model_vision = bool(_get_cached_model_capabilities(model_name).get("supports_vision"))
+    except Exception:  # noqa: BLE001 — capability lookup must never break the loop
+        model_vision = False
     openai_tools, tool_lookup = tool_registry.build_ollama_tools(
         tool_server_ids,
         engine="google-genai",
+        model_vision=model_vision,
         model_name=model_name,
         tool_source_map=tool_context.get("tool_source_map") if isinstance(tool_context, dict) else None,
         allowed_tool_aliases=tool_context.get("allowed_tool_aliases") if isinstance(tool_context, dict) else None,
