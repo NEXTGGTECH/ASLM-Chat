@@ -145,8 +145,22 @@ def test_get_tool_python_returns_none_when_venv_missing(isolated_base, fake_requ
 def test_subprocess_environment_copies_host_environment(isolated_base):
     environment = venv_manager.get_subprocess_environment(Path("python"))
 
-    assert environment == venv_manager.os.environ
     assert environment is not venv_manager.os.environ
+    expected = venv_manager.os.environ.copy()
+    if venv_manager.sys.platform.startswith("linux"):
+        # Linux layers browser caches and scratch paths over the host copy.
+        expected.update({
+            "XDG_CACHE_HOME": "browsers",
+            "CLOAKBROWSER_CACHE_DIR": "browsers/cloakbrowser",
+            "CLOAKBROWSER_AUTO_UPDATE": "false",
+            "PLAYWRIGHT_BROWSERS_PATH": "browsers/playwright",
+            "PIP_NO_CACHE_DIR": "1",
+            "TMPDIR": str(isolated_base / "Data"),
+            "TEMP": str(isolated_base / "Data"),
+            "TMP": str(isolated_base / "Data"),
+        })
+
+    assert environment == expected
 
 
 # Package signatures.

@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import os
 import sys
 import types
 from pathlib import Path
@@ -85,7 +86,9 @@ def test_server_commands_reexec_into_venv(main_module, monkeypatch):
         main_module._maybe_reexec_in_server_venv("migrate")
 
     assert exc_info.value.code == 0
-    venv_python = REPO_ROOT / "Data" / "venvs" / "server" / "Scripts" / "python.exe"
+    scripts_dir = "Scripts" if os.name == "nt" else "bin"
+    executable = "python.exe" if os.name == "nt" else "python"
+    venv_python = REPO_ROOT / "Data" / "venvs" / "server" / scripts_dir / executable
     assert spawned["args"] == [str(venv_python), "-u", str(REPO_ROOT / "main.py"), "migrate"]
     assert spawned["env"]["ASLM_CHAT_ACTIVE_VENV"] == "server"
     assert spawned["env"].get("PYTHONHOME") is None
