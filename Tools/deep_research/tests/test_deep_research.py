@@ -12,10 +12,6 @@ from pathlib import Path
 from unittest import mock
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
 from Tools.deep_research import runner as deep_research
 from Tools.deep_research import service
 from API import mcp as tool_registry

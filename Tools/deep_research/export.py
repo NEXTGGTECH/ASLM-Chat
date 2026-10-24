@@ -673,7 +673,9 @@ def docx_bytes(report: str, title: str) -> bytes:
     normalized_title = str(title or "Research report").strip()
     body = _report_without_duplicate_title(report, normalized_title)
     soup = BeautifulSoup(_markdown_to_html(body), "html.parser")
-    with tempfile.TemporaryDirectory(prefix="aslm-research-docx-") as directory:
+    # Chromium keeps profile cache files locked briefly after exiting, so
+    # cleanup failures on Windows must not fail the export itself.
+    with tempfile.TemporaryDirectory(prefix="aslm-research-docx-", ignore_cleanup_errors=True) as directory:
         workspace = Path(directory)
         document = Document()
         _configure_document(document, normalized_title)
@@ -734,7 +736,9 @@ hr{{border:0;border-top:.7pt solid #000;margin:16pt 0}}img,svg{{max-width:100%}}
 
 
 def pdf_bytes(report: str, title: str) -> bytes:
-    with tempfile.TemporaryDirectory(prefix="aslm-research-pdf-") as directory:
+    # Chromium keeps profile cache files locked briefly after exiting, so
+    # cleanup failures on Windows must not fail the export itself.
+    with tempfile.TemporaryDirectory(prefix="aslm-research-pdf-", ignore_cleanup_errors=True) as directory:
         workspace = Path(directory)
         html_path = workspace / "report.html"
         pdf_path = workspace / "report.pdf"
