@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 from django.test import SimpleTestCase
-from Apps.UI.views import _resolve_history_char_budget
+from Apps.API.views import _resolve_history_char_budget
 
 
 pytestmark = [pytest.mark.component]

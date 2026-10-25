@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import pytest
 from django.test import SimpleTestCase
-from Apps.UI.views import _serialize_tool_activity_marker
+from Apps.API.views import _serialize_tool_activity_marker
 
 
 pytestmark = [pytest.mark.component]

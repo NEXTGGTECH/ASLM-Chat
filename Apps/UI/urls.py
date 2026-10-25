@@ -12,11 +12,9 @@ urlpatterns = [
     path("chat/<uuid:chat_id>/", views.ChatView.as_view(), name="chat_view"),
 
     # Chat APIs.
-    path("api/generate/", views.generate_api, name="generate_api"),
     path("api/chat/", views.chat_api, name="chat_api"),
     path("api/uploads/", views.upload_files_api, name="uploads_api"),
     path("api/uploads/<str:file_id>/content/", views.uploaded_file_content_api, name="uploaded_file_content_api"),
-    path("api/chat/abort/", views.abort_generation_api, name="abort_generation_api"),
     path("api/deep-research/control/", views.deep_research_control_api, name="deep_research_control_api"),
     path("api/deep-research/export/", views.deep_research_export_api, name="deep_research_export_api"),
     path("api/chat/<uuid:chat_id>/", views.load_chat_api, name="load_chat_api"),
@@ -32,24 +30,6 @@ urlpatterns = [
     path("api/chat/<uuid:chat_id>/rename/", views.rename_chat_api, name="rename_chat_api"),
     path("api/chat/<uuid:chat_id>/export/", views.export_chat_api, name="export_chat_api"),
     path("api/chat/<uuid:chat_id>/delete/", views.delete_chat_api, name="delete_chat_api"),
-
-    # Model discovery APIs.
-    path("api/models/", views.get_models_api, name="models_api"),
-    path("api/model_info/", views.get_model_info_api, name="model_info_api"),
-    path("api/model_capabilities/", views.get_model_capabilities_api, name="model_capabilities_api"),
-    path("api/inference_info/", views.get_inference_info_api, name="inference_info_api"),
-    path("api/context_usage/", views.get_context_usage_api, name="context_usage_api"),
-    path("api/context_compress/", views.context_compress_api, name="context_compress_api"),
-    path(
-        "api/context_compression/build_event/",
-        views.context_compression_build_event_api,
-        name="context_compression_build_event_api",
-    ),
-    path(
-        "api/context_compression/decide/",
-        views.context_compression_decide_api,
-        name="context_compression_decide_api",
-    ),
 
     # Tool discovery APIs.
     path("api/tools/", views.get_tools_api, name="tools_api"),

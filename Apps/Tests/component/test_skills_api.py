@@ -12,7 +12,7 @@ from django.urls import reverse
 from API import mcp as tool_registry
 from Settings import skills as skills_config
 from Apps.Data.models import Chat, Message
-from Apps.UI.views import _build_chat_history, _chat_is_first_user_turn, _compose_system_prompt
+from Apps.API.views import _build_chat_history, _chat_is_first_user_turn, _compose_system_prompt
 
 
 pytestmark = [pytest.mark.component]

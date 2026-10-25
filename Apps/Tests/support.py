@@ -10,7 +10,7 @@ from unittest.mock import patch
 from django.test import TestCase
 
 from API import mcp as tool_registry
-from Apps.UI.views import _clear_model_metadata_caches
+from Apps.API.views import _clear_model_metadata_caches
 
 
 # Provide an isolated Tools directory and metadata cache reset around tests.

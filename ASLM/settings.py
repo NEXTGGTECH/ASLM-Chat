@@ -70,6 +70,7 @@ INSTALLED_APPS = [
     "corsheaders",
     "martor",
     "Apps.Data",
+    "Apps.API",
     "Apps.UI",
     "Apps.Tests",
 ]

@@ -59,7 +59,7 @@ class StaticCacheVersionTests(SimpleTestCase):
 # Verify that the main page uses the configured engine and local server helpers.
 class MainViewTests(ToolRegistryTestMixin, TestCase):
     # Test main view includes runtime settings and local servers.
-    @patch("Apps.UI.views._resolve_request_engine", return_value="ollama-service")
+    @patch("Apps.API.views._resolve_request_engine", return_value="ollama-service")
     # Verify main view includes runtime settings and local servers.
     def test_main_view_includes_runtime_settings_and_local_servers(self, _mock_engine):
         self.write_server(

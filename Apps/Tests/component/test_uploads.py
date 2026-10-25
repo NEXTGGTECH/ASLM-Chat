@@ -14,10 +14,11 @@ from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import SimpleTestCase, TestCase
 from django.urls import reverse
 from Apps.Data.models import Chat, Message, MessageAttachment, MessageAttachmentKind
-from Apps.UI import upload_storage
-from Apps.UI.file_manifests import TEXT_PREVIEW_CHAR_LIMIT, build_uploaded_file_manifest, normalize_upload_name
-from Apps.UI.upload_storage import display_kind_for_upload
-from Apps.UI.views import _build_uploaded_file_context_entry, _build_uploaded_file_prompt_block, _apply_uploaded_file_manifests_to_llm_entry, _extract_attachment_text, _extract_uploaded_file_ids_from_message, _load_model_upload_manifests, _normalize_request_attachments, _normalize_uploaded_file_ids, _reveal_file_in_file_manager, _serialize_attachment_record, _selected_tools_include_sandbox
+from Services import upload_storage
+from Services.file_manifests import TEXT_PREVIEW_CHAR_LIMIT, build_uploaded_file_manifest, normalize_upload_name
+from Services.upload_storage import display_kind_for_upload
+from Apps.API.views import _build_uploaded_file_context_entry, _build_uploaded_file_prompt_block, _apply_uploaded_file_manifests_to_llm_entry, _extract_attachment_text, _extract_uploaded_file_ids_from_message, _load_model_upload_manifests, _normalize_request_attachments, _normalize_uploaded_file_ids, _serialize_attachment_record, _selected_tools_include_sandbox
+from Apps.UI.views import _reveal_file_in_file_manager
 
 
 pytestmark = [pytest.mark.component]

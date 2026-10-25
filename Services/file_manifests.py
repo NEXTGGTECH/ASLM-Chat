@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree
 
-from .markitdown_extractor import extract_markdown
+from Services.markitdown_extractor import extract_markdown
 
 
 TEXT_FILE_EXTENSIONS = {

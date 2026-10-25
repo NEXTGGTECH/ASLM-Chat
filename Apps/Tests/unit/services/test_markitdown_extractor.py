@@ -6,7 +6,7 @@ import io
 
 import pytest
 
-from Apps.UI import markitdown_extractor
+from Services import markitdown_extractor
 
 
 pytestmark = [pytest.mark.unit]

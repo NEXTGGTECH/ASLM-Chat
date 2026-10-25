@@ -6,7 +6,8 @@ import pytest
 from pathlib import Path
 from django.test import SimpleTestCase
 from API import mcp as tool_registry
-from Apps.UI.views import _build_activity_segments, _build_chat_title, _format_runtime_error, _parse_active_tool_slugs, _strip_llm_control_tokens
+from Apps.API.views import _build_activity_segments, _format_runtime_error, _parse_active_tool_slugs, _strip_llm_control_tokens
+from Apps.UI.views import _build_chat_title
 
 
 pytestmark = [pytest.mark.component]

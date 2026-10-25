@@ -7,7 +7,7 @@ from unittest.mock import Mock, patch
 from django.test import SimpleTestCase
 from API import ollama as ollama_api
 from API.ollama import _prepare_chat_kwargs, prepare_runtime as prepare_ollama_runtime
-from Apps.UI.views import _extract_ollama_model_info
+from Apps.API.views import _extract_ollama_model_info
 
 
 pytestmark = [pytest.mark.unit]

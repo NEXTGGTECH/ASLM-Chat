@@ -27,7 +27,7 @@ def chat_backend(ollama_server, isolated_settings, db):
     # Only the process-manager boundary is faked; generation flows through
     # the real llm_api dispatch into API.ollama and the fake HTTP server.
     with (
-        patch("Apps.UI.views.llm_api.prepare_runtime"),
+        patch("Apps.API.views.llm_api.prepare_runtime"),
         patch("API.ollama.prepare_runtime"),
         patch("Apps.UI.views.llm_api.generate_chat_title", return_value=""),
     ):

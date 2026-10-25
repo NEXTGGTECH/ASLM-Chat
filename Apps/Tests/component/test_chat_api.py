@@ -10,7 +10,7 @@ from django.urls import reverse
 from API import mcp as tool_registry
 from Tools.system_prompts import get_system_prompt
 from Apps.Data.models import Chat, Message, MessageAttachment
-from Apps.UI.views import _build_chat_history, _stream_chat_response
+from Apps.API.views import _build_chat_history, _stream_chat_response
 from Apps.Tests.support import ToolRegistryTestMixin
 
 
@@ -50,9 +50,9 @@ class ChatApiTests(ToolRegistryTestMixin, TestCase):
         self.assertEqual(response.json()["error"], "Missing model parameter")
 
     # Test chat API creates new chat and streams response.
-    @patch("Apps.UI.views.llm_api.prepare_runtime")
-    @patch("Apps.UI.views.llm_api.generate")
-    @patch("Apps.UI.views._resolve_request_engine", return_value="ollama-service")
+    @patch("Apps.API.views.llm_api.prepare_runtime")
+    @patch("Apps.API.views.llm_api.generate")
+    @patch("Apps.API.views._resolve_request_engine", return_value="ollama-service")
     # Verify chat api creates new chat and streams response.
     def test_chat_api_creates_new_chat_and_streams_response(
         self,
@@ -76,10 +76,10 @@ class ChatApiTests(ToolRegistryTestMixin, TestCase):
         mock_prepare_runtime.assert_any_call("ollama-service")
 
     # Test a generated title is stored and returned with a new chat.
-    @patch("Apps.UI.views.llm_api.prepare_runtime")
-    @patch("Apps.UI.views.llm_api.generate")
+    @patch("Apps.API.views.llm_api.prepare_runtime")
+    @patch("Apps.API.views.llm_api.generate")
     @patch("Apps.UI.views._build_model_info_payload", return_value={})
-    @patch("Apps.UI.views._resolve_request_engine", return_value="ollama-service")
+    @patch("Apps.API.views._resolve_request_engine", return_value="ollama-service")
     def test_chat_api_stores_generated_title(
         self,
         _mock_engine,
@@ -105,7 +105,7 @@ class ChatApiTests(ToolRegistryTestMixin, TestCase):
         self.mock_generate_chat_title.assert_called_once()
 
     @patch(
-        "Apps.UI.views.llm_api.get_model_settings",
+        "Apps.API.views.llm_api.get_model_settings",
         return_value={
             "capabilities": ["tools", "thinking"],
             "template": "{{ if .Tools }}{{ end }}{{ if .ToolCalls }}{{ end }}",
@@ -113,9 +113,9 @@ class ChatApiTests(ToolRegistryTestMixin, TestCase):
             "think_level_param_name": "think_level",
         },
     )
-    @patch("Apps.UI.views.llm_api.prepare_runtime")
-    @patch("Apps.UI.views.llm_api.generate")
-    @patch("Apps.UI.views._resolve_request_engine", return_value="ollama-service")
+    @patch("Apps.API.views.llm_api.prepare_runtime")
+    @patch("Apps.API.views.llm_api.generate")
+    @patch("Apps.API.views._resolve_request_engine", return_value="ollama-service")
     def test_same_chat_switches_from_instant_to_thinking_contract(
         self,
         _mock_engine,
@@ -206,9 +206,9 @@ class ChatApiTests(ToolRegistryTestMixin, TestCase):
         )
 
     # Test chat API supports an attachment-only prompt.
-    @patch("Apps.UI.views.llm_api.prepare_runtime")
-    @patch("Apps.UI.views.llm_api.generate")
-    @patch("Apps.UI.views._resolve_request_engine", return_value="lms")
+    @patch("Apps.API.views.llm_api.prepare_runtime")
+    @patch("Apps.API.views.llm_api.generate")
+    @patch("Apps.API.views._resolve_request_engine", return_value="lms")
     # Verify chat api creates attachment only thread.
     def test_chat_api_creates_attachment_only_thread(
         self,
@@ -243,15 +243,15 @@ class ChatApiTests(ToolRegistryTestMixin, TestCase):
 
     # Test chat API passes selected tool server to Ollama.
     @patch(
-        "Apps.UI.views.llm_api.get_model_settings",
+        "Apps.API.views.llm_api.get_model_settings",
         return_value={
             "capabilities": ["tools"],
             "template": "{{ if .Tools }}{{ end }}{{ if .ToolCalls }}{{ end }}",
         },
     )
-    @patch("Apps.UI.views.llm_api.prepare_runtime")
-    @patch("Apps.UI.views.llm_api.generate")
-    @patch("Apps.UI.views._resolve_request_engine", return_value="ollama-service")
+    @patch("Apps.API.views.llm_api.prepare_runtime")
+    @patch("Apps.API.views.llm_api.generate")
+    @patch("Apps.API.views._resolve_request_engine", return_value="ollama-service")
     # Verify chat api passes selected tool server to ollama.
     def test_chat_api_passes_selected_tool_server_to_ollama(
         self,
@@ -287,7 +287,7 @@ class ChatApiTests(ToolRegistryTestMixin, TestCase):
         self.assertEqual(Chat.objects.first().active_tool_slug, '["time_suite"]')
 
     # Test chat API rejects unknown tool server.
-    @patch("Apps.UI.views._resolve_request_engine", return_value="ollama-service")
+    @patch("Apps.API.views._resolve_request_engine", return_value="ollama-service")
     # Verify chat api rejects unknown tool server.
     def test_chat_api_rejects_unknown_tool_server(self, _mock_engine):
         response = self.client.post(
@@ -300,9 +300,9 @@ class ChatApiTests(ToolRegistryTestMixin, TestCase):
         self.assertIn("Unknown or unsupported tool server", response.json()["error"])
 
     # Test chat API stream includes server and tool markers.
-    @patch("Apps.UI.views.llm_api.prepare_runtime")
-    @patch("Apps.UI.views.llm_api.generate")
-    @patch("Apps.UI.views._resolve_request_engine", return_value="ollama-service")
+    @patch("Apps.API.views.llm_api.prepare_runtime")
+    @patch("Apps.API.views.llm_api.generate")
+    @patch("Apps.API.views._resolve_request_engine", return_value="ollama-service")
     # Verify chat api stream includes server and tool markers.
     def test_chat_api_stream_includes_server_and_tool_markers(
         self,
@@ -330,9 +330,9 @@ class ChatApiTests(ToolRegistryTestMixin, TestCase):
         self.assertIn('Done', body)
 
     # Test chat API keeps reasoning-only output instead of deleting it on abort.
-    @patch("Apps.UI.views.llm_api.prepare_runtime")
-    @patch("Apps.UI.views.llm_api.generate")
-    @patch("Apps.UI.views._resolve_request_engine", return_value="ollama-service")
+    @patch("Apps.API.views.llm_api.prepare_runtime")
+    @patch("Apps.API.views.llm_api.generate")
+    @patch("Apps.API.views._resolve_request_engine", return_value="ollama-service")
     # Verify chat api persists reasoning only response.
     def test_chat_api_persists_reasoning_only_response(
         self,
@@ -359,9 +359,9 @@ class ChatApiTests(ToolRegistryTestMixin, TestCase):
         self.assertEqual(assistant_message.llm_transcript[0]["thinking"], "Planning the answer.")
 
     # Test streamed reasoning is buffered before the full response completes.
-    @patch("Apps.UI.views.llm_api.prepare_runtime")
-    @patch("Apps.UI.views.llm_api.generate")
-    @patch("Apps.UI.views._resolve_request_engine", return_value="ollama-service")
+    @patch("Apps.API.views.llm_api.prepare_runtime")
+    @patch("Apps.API.views.llm_api.generate")
+    @patch("Apps.API.views._resolve_request_engine", return_value="ollama-service")
     # Verify chat api buffers reasoning while streaming.
     def test_chat_api_buffers_reasoning_while_streaming(
         self,
@@ -389,9 +389,9 @@ class ChatApiTests(ToolRegistryTestMixin, TestCase):
         b"".join(stream)
 
     # Test streaming compression can run during reasoning without waiting for the next send.
-    @patch("Apps.UI.views._build_manual_compression_event")
-    @patch("Apps.UI.views.llm_api.prepare_runtime")
-    @patch("Apps.UI.views.llm_api.generate")
+    @patch("Apps.API.views._build_manual_compression_event")
+    @patch("Apps.API.views.llm_api.prepare_runtime")
+    @patch("Apps.API.views.llm_api.generate")
     # Verify stream chat response auto compresses at reasoning safe point.
     def test_stream_chat_response_auto_compresses_at_reasoning_safe_point(
         self,
@@ -449,9 +449,9 @@ class ChatApiTests(ToolRegistryTestMixin, TestCase):
         self.assertTrue(compression_message.llm_transcript[0]["arguments"]["restart_generation"])
 
     # Test streaming compression also checks the threshold when a tool call starts.
-    @patch("Apps.UI.views._build_manual_compression_event")
-    @patch("Apps.UI.views.llm_api.prepare_runtime")
-    @patch("Apps.UI.views.llm_api.generate")
+    @patch("Apps.API.views._build_manual_compression_event")
+    @patch("Apps.API.views.llm_api.prepare_runtime")
+    @patch("Apps.API.views.llm_api.generate")
     # Verify stream chat response auto compresses at tool call safe point.
     def test_stream_chat_response_auto_compresses_at_tool_call_safe_point(
         self,
@@ -513,7 +513,7 @@ class ChatApiTests(ToolRegistryTestMixin, TestCase):
         self.assertEqual(compression_message.llm_transcript[0]["arguments"]["auto_trigger"], "tool_call")
 
     # Test the server-side history builder uses the current prompt for the 80% trigger.
-    @patch("Apps.UI.views.build_structured_history_summary")
+    @patch("Apps.API.views.build_structured_history_summary")
     # Verify build chat history compresses when current prompt crosses threshold.
     def test_build_chat_history_compresses_when_current_prompt_crosses_threshold(
         self,
@@ -549,9 +549,9 @@ class ChatApiTests(ToolRegistryTestMixin, TestCase):
         self.assertEqual(llm_messages[-1]["content"], current_user.content)
 
     # Test chat API persists generic attachments and builds LM Studio messages.
-    @patch("Apps.UI.views.llm_api.prepare_runtime")
-    @patch("Apps.UI.views.llm_api.generate")
-    @patch("Apps.UI.views._resolve_request_engine", return_value="lms")
+    @patch("Apps.API.views.llm_api.prepare_runtime")
+    @patch("Apps.API.views.llm_api.generate")
+    @patch("Apps.API.views._resolve_request_engine", return_value="lms")
     # Verify chat api persists generic attachments and builds lms messages.
     def test_chat_api_persists_generic_attachments_and_builds_lms_messages(
         self,
@@ -599,8 +599,8 @@ class ChatApiTests(ToolRegistryTestMixin, TestCase):
 
     # Test chat API rejects tool server when LM Studio model lacks tool support.
     @patch("Apps.Data.lms_presets.lms_api.get_model_settings", return_value={"supports_tool_calling": False, "supports_files": True})
-    @patch("Apps.UI.views.llm_api.get_model_settings", return_value={"supports_tool_calling": False, "supports_files": True})
-    @patch("Apps.UI.views._resolve_request_engine", return_value="lms")
+    @patch("Apps.API.views.llm_api.get_model_settings", return_value={"supports_tool_calling": False, "supports_files": True})
+    @patch("Apps.API.views._resolve_request_engine", return_value="lms")
     # Verify chat api rejects tool server when lms model lacks tool support.
     def test_chat_api_rejects_tool_server_when_lms_model_lacks_tool_support(
         self,
@@ -629,13 +629,13 @@ class ChatApiTests(ToolRegistryTestMixin, TestCase):
 
     # Test chat API rejects tool server when Ollama capabilities omit tools.
     @patch(
-        "Apps.UI.views.llm_api.get_model_settings",
+        "Apps.API.views.llm_api.get_model_settings",
         return_value={
             "capabilities": ["completion"],
             "template": "{{ if .Tools }}tools{{ end }}{{ if .ToolCalls }}calls{{ end }}",
         },
     )
-    @patch("Apps.UI.views._resolve_request_engine", return_value="ollama-service")
+    @patch("Apps.API.views._resolve_request_engine", return_value="ollama-service")
     # Verify chat api rejects tool server when ollama capabilities omit tools.
     def test_chat_api_rejects_tool_server_when_ollama_capabilities_omit_tools(
         self,
@@ -664,8 +664,8 @@ class ChatApiTests(ToolRegistryTestMixin, TestCase):
         self.assertIn("does not support tool calling", response.json()["error"])
 
     # Test chat API rejects tool server when OpenAI model lacks tool support.
-    @patch("Apps.UI.views.llm_api.get_model_settings", return_value={"supports_tool_calling": False, "supports_files": True})
-    @patch("Apps.UI.views._resolve_request_engine", return_value="openai")
+    @patch("Apps.API.views.llm_api.get_model_settings", return_value={"supports_tool_calling": False, "supports_files": True})
+    @patch("Apps.API.views._resolve_request_engine", return_value="openai")
     # Verify chat api rejects tool server when openai model lacks tool support.
     def test_chat_api_rejects_tool_server_when_openai_model_lacks_tool_support(
         self,
@@ -695,9 +695,9 @@ class ChatApiTests(ToolRegistryTestMixin, TestCase):
 
 
     # Test chat API saves visible content and machine transcript.
-    @patch("Apps.UI.views.llm_api.prepare_runtime")
-    @patch("Apps.UI.views.llm_api.generate")
-    @patch("Apps.UI.views._resolve_request_engine", return_value="ollama-service")
+    @patch("Apps.API.views.llm_api.prepare_runtime")
+    @patch("Apps.API.views.llm_api.generate")
+    @patch("Apps.API.views._resolve_request_engine", return_value="ollama-service")
     # Verify chat api saves visible content and machine transcript.
     def test_chat_api_saves_visible_content_and_machine_transcript(
         self,
@@ -729,9 +729,9 @@ class ChatApiTests(ToolRegistryTestMixin, TestCase):
         self.assertEqual(assistant_message.llm_transcript[1]["server_name"], "Time Suite")
 
     # Test chat API uses stored transcript for follow up messages.
-    @patch("Apps.UI.views.llm_api.prepare_runtime")
-    @patch("Apps.UI.views.llm_api.generate")
-    @patch("Apps.UI.views._resolve_request_engine", return_value="ollama-service")
+    @patch("Apps.API.views.llm_api.prepare_runtime")
+    @patch("Apps.API.views.llm_api.generate")
+    @patch("Apps.API.views._resolve_request_engine", return_value="ollama-service")
     # Verify chat api uses stored transcript for follow up messages.
     def test_chat_api_uses_stored_transcript_for_follow_up_messages(
         self,
@@ -769,9 +769,9 @@ class ChatApiTests(ToolRegistryTestMixin, TestCase):
         self.assertEqual(history_messages[-1]["content"], "Follow up")
 
     # Test chat API strips legacy UI markup when transcript is missing.
-    @patch("Apps.UI.views.llm_api.prepare_runtime")
-    @patch("Apps.UI.views.llm_api.generate")
-    @patch("Apps.UI.views._resolve_request_engine", return_value="ollama-service")
+    @patch("Apps.API.views.llm_api.prepare_runtime")
+    @patch("Apps.API.views.llm_api.generate")
+    @patch("Apps.API.views._resolve_request_engine", return_value="ollama-service")
     # Verify chat api strips legacy ui markup when transcript is missing.
     def test_chat_api_strips_legacy_ui_markup_when_transcript_is_missing(
         self,
@@ -801,9 +801,9 @@ class ChatApiTests(ToolRegistryTestMixin, TestCase):
         self.assertEqual(assistant_messages[0], {"role": "assistant", "content": "Visible answer"})
 
     # Test chat API strips service control tokens from visible output.
-    @patch("Apps.UI.views.llm_api.prepare_runtime")
-    @patch("Apps.UI.views.llm_api.generate")
-    @patch("Apps.UI.views._resolve_request_engine", return_value="lms")
+    @patch("Apps.API.views.llm_api.prepare_runtime")
+    @patch("Apps.API.views.llm_api.generate")
+    @patch("Apps.API.views._resolve_request_engine", return_value="lms")
     # Verify chat api strips service control tokens from visible output.
     def test_chat_api_strips_service_control_tokens_from_visible_output(
         self,
@@ -832,9 +832,9 @@ class GenerateApiTests(ToolRegistryTestMixin, TestCase):
         super().setUp()
         self.client = Client()
 
-    @patch("Apps.UI.views.llm_api.prepare_runtime")
-    @patch("Apps.UI.views.llm_api.generate")
-    @patch("Apps.UI.views._resolve_request_engine", return_value="ollama-service")
+    @patch("Apps.API.views.llm_api.prepare_runtime")
+    @patch("Apps.API.views.llm_api.generate")
+    @patch("Apps.API.views._resolve_request_engine", return_value="ollama-service")
     def test_generate_api_streams_without_db_writes(self, _mock_engine, mock_generate, _mock_prepare_runtime):
         mock_generate.return_value = [{"message": {"content": "Stateless reply"}}]
 
@@ -852,9 +852,9 @@ class GenerateApiTests(ToolRegistryTestMixin, TestCase):
         self.assertEqual(Chat.objects.count(), 0)
         self.assertEqual(Message.objects.count(), 0)
 
-    @patch("Apps.UI.views.llm_api.prepare_runtime")
-    @patch("Apps.UI.views.llm_api.generate")
-    @patch("Apps.UI.views._resolve_request_engine", return_value="ollama-service")
+    @patch("Apps.API.views.llm_api.prepare_runtime")
+    @patch("Apps.API.views.llm_api.generate")
+    @patch("Apps.API.views._resolve_request_engine", return_value="ollama-service")
     def test_generate_api_passes_messages_to_generate(self, _mock_engine, mock_generate, _mock_prepare_runtime):
         mock_generate.return_value = [{"message": {"content": "Follow-up"}}]
 
@@ -892,9 +892,9 @@ class GenerateApiTests(ToolRegistryTestMixin, TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.json()["error"], "Missing model parameter")
 
-    @patch("Apps.UI.views.llm_api.prepare_runtime")
-    @patch("Apps.UI.views.llm_api.generate")
-    @patch("Apps.UI.views._resolve_request_engine", return_value="ollama-service")
+    @patch("Apps.API.views.llm_api.prepare_runtime")
+    @patch("Apps.API.views.llm_api.generate")
+    @patch("Apps.API.views._resolve_request_engine", return_value="ollama-service")
     def test_generate_api_supports_inline_attachments(self, _mock_engine, mock_generate, _mock_prepare_runtime):
         mock_generate.return_value = [{"message": {"content": "Seen"}}]
 
@@ -923,15 +923,15 @@ class GenerateApiTests(ToolRegistryTestMixin, TestCase):
         self.assertIn("note.txt", str(user_entry.get("content") or ""))
 
     @patch(
-        "Apps.UI.views.llm_api.get_model_settings",
+        "Apps.API.views.llm_api.get_model_settings",
         return_value={
             "capabilities": ["tools"],
             "template": "{{ if .Tools }}{{ end }}{{ if .ToolCalls }}{{ end }}",
         },
     )
-    @patch("Apps.UI.views.llm_api.prepare_runtime")
-    @patch("Apps.UI.views.llm_api.generate")
-    @patch("Apps.UI.views._resolve_request_engine", return_value="ollama-service")
+    @patch("Apps.API.views.llm_api.prepare_runtime")
+    @patch("Apps.API.views.llm_api.generate")
+    @patch("Apps.API.views._resolve_request_engine", return_value="ollama-service")
     def test_generate_api_passes_tool_servers_to_generate(
         self,
         _mock_engine,
@@ -972,7 +972,7 @@ class GenerateApiTests(ToolRegistryTestMixin, TestCase):
         self.assertEqual(kwargs["tool_context"]["chat_id"], "tool-session")
 
     @patch(
-        "Apps.UI.views.llm_api.get_model_settings",
+        "Apps.API.views.llm_api.get_model_settings",
         return_value={
             "capabilities": ["tools", "thinking"],
             "template": "{{ if .Tools }}{{ end }}{{ if .ToolCalls }}{{ end }}",
@@ -980,9 +980,9 @@ class GenerateApiTests(ToolRegistryTestMixin, TestCase):
             "think_level_param_name": "think_level",
         },
     )
-    @patch("Apps.UI.views.llm_api.prepare_runtime")
-    @patch("Apps.UI.views.llm_api.generate")
-    @patch("Apps.UI.views._resolve_request_engine", return_value="ollama-service")
+    @patch("Apps.API.views.llm_api.prepare_runtime")
+    @patch("Apps.API.views.llm_api.generate")
+    @patch("Apps.API.views._resolve_request_engine", return_value="ollama-service")
     def test_generate_api_switches_prompt_schema_rounds_and_quotas_with_reasoning_mode(
         self,
         _mock_engine,
@@ -1111,9 +1111,9 @@ class GenerateApiTests(ToolRegistryTestMixin, TestCase):
         self.assertIsNone(tool_registry.consume_tool_quota(thinking_event, thinking_counters))
         self.assertIsNone(tool_registry.consume_tool_quota(thinking_event, thinking_counters))
 
-    @patch("Apps.UI.views.llm_api.prepare_runtime")
-    @patch("Apps.UI.views.llm_api.generate")
-    @patch("Apps.UI.views._resolve_request_engine", return_value="ollama-service")
+    @patch("Apps.API.views.llm_api.prepare_runtime")
+    @patch("Apps.API.views.llm_api.generate")
+    @patch("Apps.API.views._resolve_request_engine", return_value="ollama-service")
     def test_generate_api_replays_llm_transcript_in_history(self, _mock_engine, mock_generate, _mock_prepare_runtime):
         mock_generate.return_value = [{"message": {"content": "Done"}}]
 
@@ -1161,9 +1161,9 @@ class MessageIdAndRegenerateTests(ToolRegistryTestMixin, TestCase):
 
     # chat_api must return X-User-Message-ID and X-Assistant-Message-ID headers
     # so the frontend can stamp fresh rows without waiting for a page reload.
-    @patch("Apps.UI.views.llm_api.prepare_runtime")
-    @patch("Apps.UI.views.llm_api.generate")
-    @patch("Apps.UI.views._resolve_request_engine", return_value="ollama-service")
+    @patch("Apps.API.views.llm_api.prepare_runtime")
+    @patch("Apps.API.views.llm_api.generate")
+    @patch("Apps.API.views._resolve_request_engine", return_value="ollama-service")
     # Verify chat api returns message id headers.
     def test_chat_api_returns_message_id_headers(self, _mock_engine, mock_generate, _mock_runtime):
         mock_generate.return_value = [{"message": {"content": "Hi"}}]
@@ -1186,9 +1186,9 @@ class MessageIdAndRegenerateTests(ToolRegistryTestMixin, TestCase):
 
     # After a normal send + regenerate the chat must contain exactly one user
     # message — not two copies of the same prompt.
-    @patch("Apps.UI.views.llm_api.prepare_runtime")
-    @patch("Apps.UI.views.llm_api.generate")
-    @patch("Apps.UI.views._resolve_request_engine", return_value="ollama-service")
+    @patch("Apps.API.views.llm_api.prepare_runtime")
+    @patch("Apps.API.views.llm_api.generate")
+    @patch("Apps.API.views._resolve_request_engine", return_value="ollama-service")
     # Verify regenerate does not duplicate user message.
     def test_regenerate_does_not_duplicate_user_message(self, _mock_engine, mock_generate, _mock_runtime):
         mock_generate.return_value = [{"message": {"content": "Answer"}}]
@@ -1219,9 +1219,9 @@ class MessageIdAndRegenerateTests(ToolRegistryTestMixin, TestCase):
 
     # chat.updated_at must be bumped when messages are added so the sidebar
     # sort order stays correct.
-    @patch("Apps.UI.views.llm_api.prepare_runtime")
-    @patch("Apps.UI.views.llm_api.generate")
-    @patch("Apps.UI.views._resolve_request_engine", return_value="ollama-service")
+    @patch("Apps.API.views.llm_api.prepare_runtime")
+    @patch("Apps.API.views.llm_api.generate")
+    @patch("Apps.API.views._resolve_request_engine", return_value="ollama-service")
     # Verify chat updated at is bumped after generation.
     def test_chat_updated_at_is_bumped_after_generation(self, _mock_engine, mock_generate, _mock_runtime):
         import time

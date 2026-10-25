@@ -6,9 +6,9 @@ import json
 
 import pytest
 
-from Apps.UI import upload_storage
-from Apps.UI.upload_storage import UploadStorageTarget, save_upload_to_sandbox
-from Apps.UI.upload_storage import (
+from Services import upload_storage
+from Services.upload_storage import UploadStorageTarget, save_upload_to_sandbox
+from Services.upload_storage import (
     display_kind_for_upload,
     load_upload_manifest,
     model_upload_payload,
@@ -229,7 +229,7 @@ def test_display_kind_for_upload(name, mime, kind, label):
 
 # The public payload accepts manifests and plain dictionaries.
 def test_public_payload_accepts_manifest_or_dict():
-    from Apps.UI.file_manifests import build_uploaded_file_manifest
+    from Services.file_manifests import build_uploaded_file_manifest
 
     manifest = build_uploaded_file_manifest(b"content", name="a.txt", mime="text/plain")
     from_manifest = public_upload_payload(manifest)

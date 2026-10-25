@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 from unittest.mock import patch
 from django.test import TestCase
-from Apps.UI.views import _build_model_info_payload, _clear_model_metadata_caches
+from Apps.API.views import _build_model_info_payload, _clear_model_metadata_caches
 
 
 pytestmark = [pytest.mark.component]
@@ -23,7 +23,7 @@ class ModelInfoCacheTests(TestCase):
         super().tearDown()
 
     # Test cached model info is returned as a defensive copy.
-    @patch("Apps.UI.views.llm_api.get_model_settings")
+    @patch("Apps.API.views.llm_api.get_model_settings")
     # Verify model info payload cache returns detached copies.
     def test_model_info_payload_cache_returns_detached_copies(self, mock_get_model_settings):
         mock_get_model_settings.return_value = {

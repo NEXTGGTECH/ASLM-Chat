@@ -12,8 +12,8 @@ from typing import Any
 
 from Settings import settings
 
-from .file_manifests import UploadedFileManifest, build_uploaded_file_manifest, normalize_upload_name
-from .file_manifests import guess_upload_mime
+from Services.file_manifests import UploadedFileManifest, build_uploaded_file_manifest, normalize_upload_name
+from Services.file_manifests import guess_upload_mime
 
 
 SANDBOX_ROOT = settings.BASE_DIR / "Tools" / "mcp-sandbox" / "_sandbox"

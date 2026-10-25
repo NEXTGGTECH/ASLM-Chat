@@ -12,7 +12,7 @@ from django.test import SimpleTestCase, TestCase
 from django.urls import reverse
 from API import llm_api
 from Settings import settings as project_settings
-from Apps.UI.views import RequestEngineResolutionError, _resolve_request_engine
+from Apps.API.views import RequestEngineResolutionError, _resolve_request_engine
 
 
 pytestmark = [pytest.mark.component]
@@ -160,8 +160,8 @@ class DisabledEngineApiTests(TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn("not enabled", response.json()["error"])
 
-    @patch("Apps.UI.views.llm_api.prepare_runtime")
-    @patch("Apps.UI.views.llm_api.generate")
+    @patch("Apps.API.views.llm_api.prepare_runtime")
+    @patch("Apps.API.views.llm_api.generate")
     def test_chat_api_accepts_engine_query_param(self, mock_generate, _mock_prepare_runtime):
         mock_generate.return_value = [{"message": {"content": "Hi there"}}]
 
@@ -197,7 +197,7 @@ class RuntimeSettingsApiTests(TestCase):
     def setUp(self):
         super().setUp()
         self._engine_enabled_patch = patch(
-            "Apps.UI.views.settings.is_engine_enabled",
+            "Apps.API.views.settings.is_engine_enabled",
             return_value=True,
         )
         self._engine_enabled_patch.start()
@@ -303,7 +303,7 @@ class RuntimeSettingsApiTests(TestCase):
             mock_transition.assert_called_once_with("ollama-service", "ollama-service")
 
     # Test models API returns engine specific models.
-    @patch("Apps.UI.views._load_models_for_engine", return_value=["llama3"])
+    @patch("Apps.API.views._load_models_for_engine", return_value=["llama3"])
     # Verify models api returns engine specific models.
     def test_models_api_returns_engine_specific_models(self, mock_models):
         response = self.client.get(reverse("models_api"), {"engine": "lms"})
@@ -320,7 +320,7 @@ class RuntimeSettingsApiTests(TestCase):
         self.assertEqual(response.json()["error"], "Model parameter is required")
 
     # Test model info API maps unsupported engines to 501.
-    @patch("Apps.UI.views._build_model_info_payload", side_effect=NotImplementedError("Not supported"))
+    @patch("Apps.API.views._build_model_info_payload", side_effect=NotImplementedError("Not supported"))
     # Verify model info api returns 501 for unimplemented engines.
     def test_model_info_api_returns_501_for_unimplemented_engines(self, mock_build_payload):
         response = self.client.get(reverse("model_info_api"), {"engine": "ollama-service", "model": "model"})
@@ -330,7 +330,7 @@ class RuntimeSettingsApiTests(TestCase):
         mock_build_payload.assert_called_once()
 
     # Test inference info API returns a compact engine-independent payload.
-    @patch("Apps.UI.views._build_model_info_payload")
+    @patch("Apps.API.views._build_model_info_payload")
     # Verify inference info api returns unified payload.
     def test_inference_info_api_returns_unified_payload(self, mock_build_payload):
         mock_build_payload.return_value = {
@@ -368,7 +368,7 @@ class RuntimeSettingsApiTests(TestCase):
         mock_build_payload.assert_called_once_with("ollama-service", "llama3")
 
     # Test inference info can use the latest model selected through model info.
-    @patch("Apps.UI.views._build_model_info_payload")
+    @patch("Apps.API.views._build_model_info_payload")
     # Verify inference info api uses runtime selected model.
     def test_inference_info_api_uses_runtime_selected_model(self, mock_build_payload):
         mock_build_payload.return_value = {

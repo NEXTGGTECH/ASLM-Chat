@@ -8,7 +8,7 @@ import zipfile
 
 import pytest
 
-from Apps.UI.file_manifests import (
+from Services.file_manifests import (
     UploadedFileManifest,
     build_uploaded_file_manifest,
     guess_upload_mime,

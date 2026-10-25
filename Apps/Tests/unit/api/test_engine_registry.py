@@ -8,7 +8,7 @@ from unittest.mock import Mock, patch
 from django.test import SimpleTestCase
 from API import llm_api
 from API import mcp as tool_registry
-from Apps.UI.views import _extract_model_name
+from Apps.API.views import _extract_model_name
 
 
 pytestmark = [pytest.mark.unit]

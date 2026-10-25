@@ -17,7 +17,7 @@ class LmsPresetApiTests(TestCase):
     def setUp(self):
         super().setUp()
         self._engine_enabled_patch = patch(
-            "Apps.UI.views.settings.is_engine_enabled",
+            "Apps.API.views.settings.is_engine_enabled",
             return_value=True,
         )
         self._engine_enabled_patch.start()
@@ -27,7 +27,7 @@ class LmsPresetApiTests(TestCase):
         super().tearDown()
 
     # Test model info includes active LM Studio preset defaults.
-    @patch("Apps.UI.views.llm_api.get_model_settings")
+    @patch("Apps.API.views.llm_api.get_model_settings")
     @patch("Apps.Data.lms_presets.lms_api.get_model_settings")
     # Verify model info includes active lms preset defaults.
     def test_model_info_includes_active_lms_preset_defaults(self, mock_preset_settings, mock_model_settings):

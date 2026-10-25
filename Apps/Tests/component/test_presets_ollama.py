@@ -18,7 +18,7 @@ class OllamaPresetApiTests(ToolRegistryTestMixin, TestCase):
     def setUp(self):
         super().setUp()
         self._engine_enabled_patch = patch(
-            "Apps.UI.views.settings.is_engine_enabled",
+            "Apps.API.views.settings.is_engine_enabled",
             return_value=True,
         )
         self._engine_enabled_patch.start()
@@ -28,7 +28,7 @@ class OllamaPresetApiTests(ToolRegistryTestMixin, TestCase):
         super().tearDown()
 
     # Test model info includes active Ollama preset defaults and servers.
-    @patch("Apps.UI.views.llm_api.get_model_settings")
+    @patch("Apps.API.views.llm_api.get_model_settings")
     # Verify model info includes active ollama preset defaults and servers.
     def test_model_info_includes_active_ollama_preset_defaults_and_servers(self, mock_get_model_settings):
         self.write_server(

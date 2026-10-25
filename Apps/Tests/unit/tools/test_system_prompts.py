@@ -11,7 +11,7 @@ from API import mcp as tool_registry
 from API import ollama as ollama_api
 from API import openai as openai_api
 from Tools.system_prompts import get_system_prompt, is_instant_generation
-from Apps.UI.views import _build_generate_kwargs, _compose_system_prompt
+from Apps.API.views import _build_generate_kwargs, _compose_system_prompt
 
 
 pytestmark = [pytest.mark.unit]

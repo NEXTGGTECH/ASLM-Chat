@@ -20,7 +20,7 @@ from API import ollama as ollama_api
 from API import openai as openai_api
 from Settings import settings as project_settings
 from Apps.Data.models import Chat, ChatBranch, Message, MessageAttachment, MessageAttachmentKind, MessageImage
-from Apps.UI.views import _serialize_tool_call_marker
+from Apps.API.views import _serialize_tool_call_marker
 from Apps.Tests.support import ToolRegistryTestMixin
 
 
@@ -1042,7 +1042,7 @@ class ToolApiTests(ToolRegistryTestMixin, TestCase):
     def setUp(self):
         super().setUp()
         self._engine_enabled_patch = patch(
-            "Apps.UI.views.settings.is_engine_enabled",
+            "Apps.API.views.settings.is_engine_enabled",
             return_value=True,
         )
         self._engine_enabled_patch.start()

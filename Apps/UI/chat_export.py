@@ -12,7 +12,7 @@ from typing import Any, Iterable
 from urllib.parse import urlparse
 
 from Apps.Data.models import Chat, ChatBranch, MessageAttachment, MessageImage
-from Apps.UI.upload_storage import load_upload_manifest, resolve_uploaded_file_host_path
+from Services.upload_storage import load_upload_manifest, resolve_uploaded_file_host_path
 from Tools.deep_research.export import safe_filename
 
 

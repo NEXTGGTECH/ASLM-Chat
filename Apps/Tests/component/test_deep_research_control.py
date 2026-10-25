@@ -18,6 +18,7 @@ from django.test import SimpleTestCase, TestCase
 
 from Tools.deep_research import control, export, orchestrator
 from Apps.UI import views
+from Apps.API import views as api_views
 
 
 pytestmark = [pytest.mark.component]
@@ -787,7 +788,7 @@ class DeepResearchTranscriptReloadTests(SimpleTestCase):
             ]
         )
 
-        segments = views._build_activity_segments(message)
+        segments = api_views._build_activity_segments(message)
 
         research = next(segment for segment in segments if segment["type"] == "tool")
         self.assertEqual(research["toolUi"]["kind"], "deep_research")
@@ -821,7 +822,7 @@ class DeepResearchTranscriptReloadTests(SimpleTestCase):
 
         tools = [
             segment
-            for segment in views._build_activity_segments(message)
+            for segment in api_views._build_activity_segments(message)
             if segment["type"] == "tool"
         ]
 
