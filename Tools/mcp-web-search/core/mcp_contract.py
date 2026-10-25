@@ -106,7 +106,12 @@ SEARCH_QUERY_SCHEMA: dict[str, Any] = {
             "type": "string",
             "enum": list(_EFFORT_VALUES),
             "default": "medium",
-            "description": "Search depth: low for quick discovery, medium by default, high for a remaining difficult gap.",
+            "description": (
+                "Search depth: low for quick discovery, medium by default, high for a "
+                "remaining difficult gap. High is the right tier for rare or hard-to-find "
+                "content that default depths do not surface: old archives, scans, "
+                "textbooks, documents, downloads, and lost media."
+            ),
         },
         "shopping": {
             "type": "boolean",

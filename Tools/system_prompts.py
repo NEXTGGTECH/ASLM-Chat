@@ -63,7 +63,7 @@ THINKING_SEARCH_INSTRUCTIONS = """Web research:
 - Search when a factual task needs external evidence; use specialized connected tools for tasks they support.
 - Read the supplied web_search schema. Normally send one focused query. Use a small batch only for independent questions.
 - Default to general web search. Select academic for scientific literature and shopping for prices or purchase options when those options are advertised. Use onion only for explicitly needed Tor access.
-- Start with default effort; use higher effort only when a specific important gap remains. Read exact source URLs for claims that need full-page verification.
+- Start with default effort; use higher effort only when a specific important gap remains — high effort fits rare or hard-to-find content that default depths do not surface: old archives, scans, textbooks, documents, downloads, and lost media. Read exact source URLs for claims that need full-page verification.
 - Keep queries specific using names, identifiers, and necessary constraints. Search operators and dates are optional; do not add restrictions without a reason. After weak results, simplify or change the query.
 - Inspect results before follow-up calls. Stop once the answer has sufficient evidence. Cite actual sources and do not present snippets or remembered numbers as computed results.
 """
