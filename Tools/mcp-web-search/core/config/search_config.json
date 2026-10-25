@@ -79,7 +79,7 @@
         "enabled": false,
         "timeout_seconds": 75.0,
         "max_queries": 3,
-        "mode": "heuristic"
+        "mode": "always"
     },
     "image_engines": {
         "bing": true,

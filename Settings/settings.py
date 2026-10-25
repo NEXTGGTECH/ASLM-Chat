@@ -256,7 +256,7 @@ DEFAULTS: dict[str, Any] = {
     "web-search-image-engine-duckduckgo": False,
     "web-search-image-engine-openverse": True,
     "web-search-query-rewriter-enabled": False,
-    "web-search-query-rewriter-mode": "heuristic",
+    "web-search-query-rewriter-mode": "always",
     "web-search-localization-enabled": True,
     "web-search-localization-penalty": 0.12,
     "web-search-rich-cards-enabled": False,

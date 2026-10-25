@@ -39,8 +39,11 @@ from core.config import load_search_config
 logger = logging.getLogger("mcp.web_search.rewriter")
 
 REWRITER_SYSTEM_PROMPT = """You convert a researcher's raw thoughts into web-search queries.
-The thought may be rambling, conversational, or mixed-language. Extract the actual
-information need and return 1-3 effective search queries.
+First JUDGE the input: if it is already a clean, focused search query, APPROVE it —
+return exactly that query, unchanged, as the single element of "queries". Never
+rephrase, translate, or expand an already clean query.
+Otherwise the thought is rambling, conversational, or mixed-language: extract the
+actual information need and return 1-3 effective search queries.
 Rules: plain search terms only (no questions, no explanations), each under 140 chars,
 prefer the thought's language but add an English variant when it likely helps,
 pick the vertical honestly.
@@ -48,7 +51,7 @@ Output ONLY one JSON object, nothing else:
 {"queries": ["...", "..."], "vertical": "web|academic|shopping", "language": "ru|en|..."}"""
 
 _CACHE_TTL_SECONDS = 3600.0
-_cache: dict[tuple[RewriterTarget, str], tuple[list[str], float]] = {}
+_cache: dict[tuple[RewriterTarget, str], tuple[list[str], float, bool]] = {}
 _cache_lock = asyncio.Lock()
 _warned_no_target = False
 
@@ -78,7 +81,7 @@ def _load_engine_settings() -> dict[str, Any]:
 class RewriterConfigSnapshot:
     """Cheap per-call view of the rewriter config (loaded fresh each call)."""
 
-    __slots__ = ("enabled", "timeout_seconds", "max_queries", "mode")
+    __slots__ = ("enabled", "timeout_seconds", "max_queries", "mode", "markers")
 
     def __init__(self) -> None:
         section = load_search_config().query_rewriter
@@ -86,6 +89,7 @@ class RewriterConfigSnapshot:
         self.timeout_seconds = max(5.0, float(section.timeout_seconds))
         self.max_queries = max(1, int(section.max_queries))
         self.mode = section.mode
+        self.markers = tuple(section.conversational_markers)
 
 
 class RewriterTarget(NamedTuple):
@@ -97,22 +101,29 @@ class RewriterTarget(NamedTuple):
     api_key: str
 
 
-def looks_conversational(query: str) -> bool:
-    """Heuristic: does this string read like a thought rather than a search query?"""
+def _token_hits_stem(token: str, stem: str) -> bool:
+    return token == stem or (len(stem) >= 4 and token.startswith(stem))
+
+
+def looks_conversational(query: str, markers: tuple[str, ...] = ()) -> bool:
+    """Heuristic: does this string read like a thought rather than a search query?
+
+    Word-stem match over deployment-configured `markers` (search_config.json ->
+    query_rewriter.conversational_markers). There are NO built-in marker lists:
+    an empty marker set disables the gate entirely, making heuristic mode behave
+    like always (the model judges every query)."""
     text = str(query or "").strip()
     words = text.split()
     if len(words) >= 6:
         return True
     if "?" in text:
         return True
-    lowered = text.casefold()
+    if not markers:
+        return False
     return any(
-        marker in lowered
-        for marker in (
-            "хочу ", "найди ", "где ", "как ", "помню ", "кажется", "вроде",
-            "i need", "i want", "find me", "i saw", "i remember", "looking for",
-            "what is", "how do ", "how to ",
-        )
+        _token_hits_stem(word.casefold(), stem)
+        for word in words
+        for stem in markers
     ) and len(words) >= 3
 
 
@@ -235,7 +246,7 @@ async def rewrite_query(query: str) -> tuple[str, bool]:
     text = " ".join(str(query or "").split())
     if not config.enabled or not text:
         return text or query, False
-    if config.mode == "heuristic" and not looks_conversational(text):
+    if config.mode == "heuristic" and not looks_conversational(text, config.markers):
         return text, False
 
     target = _runtime_target()
@@ -253,7 +264,7 @@ async def rewrite_query(query: str) -> tuple[str, bool]:
     async with _cache_lock:
         cached = _cache.get(cache_key)
         if cached and cached[1] > time.monotonic():
-            return cached[0][0], True
+            return cached[0][0], cached[2]
 
     started = time.perf_counter()
     try:
@@ -267,8 +278,17 @@ async def rewrite_query(query: str) -> tuple[str, bool]:
     if not rewritten:
         return text, False
 
+    # The model judges: a single variant equal to the input is an APPROVAL —
+    # the query passes untouched (no rewrite happened, no cache entry needed).
+    if len(rewritten) == 1 and rewritten[0] == text:
+        logger.info(
+            "query rewriter: approved %r unchanged via %s/%s in %.1fs",
+            text[:80], target.flavor, target.model, time.perf_counter() - started,
+        )
+        return text, False
+
     async with _cache_lock:
-        _cache[cache_key] = (rewritten, time.monotonic() + _CACHE_TTL_SECONDS)
+        _cache[cache_key] = (rewritten, time.monotonic() + _CACHE_TTL_SECONDS, True)
     logger.info(
         "query rewriter: %r -> %r via %s/%s in %.1fs",
         text[:80], rewritten, target.flavor, target.model,
@@ -294,7 +314,7 @@ async def expanded_queries(query: str) -> list[str] | None:
     text = " ".join(str(query or "").split())
     if not config.enabled or not text:
         return None
-    if config.mode == "heuristic" and not looks_conversational(text):
+    if config.mode == "heuristic" and not looks_conversational(text, config.markers):
         return None
     target = _runtime_target()
     if target is None:
@@ -319,7 +339,10 @@ async def expanded_queries(query: str) -> list[str] | None:
         return None
     if not rewritten:
         return None
+    # Approval (single variant equal to the input): no fan-out, the query stands.
+    if len(rewritten) == 1 and rewritten[0] == text:
+        return None
     async with _cache_lock:
-        _cache[cache_key] = (rewritten, time.monotonic() + _CACHE_TTL_SECONDS)
+        _cache[cache_key] = (rewritten, time.monotonic() + _CACHE_TTL_SECONDS, True)
     logger.info("query rewriter fan-out: %r -> %r", text[:80], rewritten)
     return rewritten

@@ -193,14 +193,23 @@ class ImageEnginesSection:
 
 @dataclass
 class QueryRewriterSection:
-    """LLM subagent that rewrites conversational model thoughts into search queries.
-    Disabled by default: each enabled rewrite pays one model call (tens of seconds
-    on a 27B). Always uses the active chat engine and model from
+    """LLM subagent that judges and rewrites search queries.
+    Disabled by default: each evaluated query pays one model call (tens of seconds
+    on a 27B). In "always" mode (default) the model judges every query — an already
+    clean query is approved unchanged, a conversational thought gets rewritten. In
+    "heuristic" mode a local word-stem gate skips the model call for obviously clean
+    queries. Always uses the active chat engine and model from
     Tools/model_runtime_metadata.json + Settings/settings.json."""
     enabled: bool = False
     timeout_seconds: float = 75.0
     max_queries: int = 3
-    mode: str = "heuristic"  # heuristic | always
+    mode: str = "always"  # always (model judges) | heuristic (cheap gate first)
+    # Word-stem overrides for the conversational heuristic (rewriter.looks_conversational).
+    # NO built-in lists: empty (the default) disables the local gate entirely, so
+    # heuristic mode behaves like always. A deployment that wants a cheap local gate
+    # writes its own stems here (matched per word: equality, or prefix for stems
+    # of 4+ chars).
+    conversational_markers: tuple[str, ...] = ()
 
 
 @dataclass
@@ -442,7 +451,10 @@ def load_search_config(path: Path | None = None) -> SearchConfig:
             enabled=bool(w.get("enabled", False)),
             timeout_seconds=float(w.get("timeout_seconds", 75.0)),
             max_queries=int(w.get("max_queries", 3)),
-            mode=_one_of(w.get("mode", "heuristic"), {"heuristic", "always"}, "heuristic"),
+            mode=_one_of(w.get("mode", "always"), {"heuristic", "always"}, "always"),
+            conversational_markers=tuple(
+                _string_list(w.get("conversational_markers"), None, [])
+            ),
         ),
         image_engines=ImageEnginesSection(
             bing=bool(im.get("bing", True)),

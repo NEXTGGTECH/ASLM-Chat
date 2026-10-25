@@ -1102,7 +1102,7 @@
             "key": "web-search-query-rewriter-mode",
             "name": "Query rewriter mode",
             "type": "select",
-            "default": "heuristic",
+            "default": "always",
             "engine": "python-runtime",
             "getExec": "main.py get_setting --key web-search-query-rewriter-mode",
             "setExec": "main.py set_setting --key web-search-query-rewriter-mode --value {value}",
@@ -1110,7 +1110,8 @@
             "allowedValues": [
                 "heuristic",
                 "always"
-            ]
+            ],
+            "description": "How the rewriter decides to spend a model call. Always: the model judges every query — a clean one is approved unchanged, a conversational thought is rewritten (best quality, one model call per search). Heuristic: a local word-stem gate skips the model for obviously clean queries (cheaper on slow local models)."
         },
         {
             "key": "web-search-localization-enabled",
