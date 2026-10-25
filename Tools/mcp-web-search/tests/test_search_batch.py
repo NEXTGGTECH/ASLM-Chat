@@ -34,8 +34,8 @@ def test_legacy_query_schema_advertises_largest_vertical_batch(monkeypatch):
 
     assert string_schema["type"] == "string"
     assert batch_schema["type"] == "array"
-    assert SEARCH_BATCH_LIMIT == 2
-    assert batch_schema["maxItems"] == LEGACY_BATCH_LIMIT == 2
+    assert SEARCH_BATCH_LIMIT == 3
+    assert batch_schema["maxItems"] == LEGACY_BATCH_LIMIT == 3
     assert batch_schema["items"]["type"] == "string"
     assert "focused search query" in query_schema["description"]
 
@@ -44,6 +44,7 @@ def test_query_batch_coercion_caps_and_sanitizes_items():
     assert coerce_search_queries(["  first   query  ", "", "second", "third", "fourth"]) == [
         "first query",
         "second",
+        "third",
     ]
     assert coerce_search_queries('["alpha", "beta"]') == ["alpha", "beta"]
     assert coerce_search_queries({"query": ["alpha", "beta"]}) == ["alpha", "beta"]
@@ -59,16 +60,16 @@ def test_legacy_preflight_rejects_oversized_batch_instead_of_truncating(monkeypa
     })()
     monkeypatch.setattr(config_module, "load_search_config", lambda: cfg)
 
-    prepared = prepare_search_arguments({"query": ["alpha", "beta", "gamma"]})
+    prepared = prepare_search_arguments({"query": ["alpha", "beta", "gamma", "delta"]})
 
     assert prepared["ok"] is False
     assert prepared["error_result"]["error"]["code"] == "INVALID_SEARCH_PLAN"
     assert prepared["error_result"]["error"]["issues"] == [
-        {"path": "$.query", "message": "web permits at most 2 queries per call"}
+        {"path": "$.query", "message": "web permits at most 3 queries per call"}
     ]
 
 
-def test_legacy_preflight_caps_every_vertical_at_two_queries(monkeypatch):
+def test_legacy_preflight_caps_every_vertical_at_three_queries(monkeypatch):
     import core.config as config_module
 
     cfg = type("Cfg", (), {
@@ -78,25 +79,25 @@ def test_legacy_preflight_caps_every_vertical_at_two_queries(monkeypatch):
     monkeypatch.setattr(config_module, "load_search_config", lambda: cfg)
 
     shopping = prepare_search_arguments({
-        "query": [f"product {index}" for index in range(2)],
+        "query": [f"product {index}" for index in range(3)],
         "shopping": True,
     })
     academic = prepare_search_arguments({
-        "query": [f"paper {index}" for index in range(2)],
+        "query": [f"paper {index}" for index in range(3)],
         "academic": True,
     })
     too_many_shopping = prepare_search_arguments({
-        "query": [f"product {index}" for index in range(3)],
+        "query": [f"product {index}" for index in range(4)],
         "shopping": True,
     })
 
     assert shopping["ok"] is True
-    assert len(shopping["search_request"]["queries"]) == 2
+    assert len(shopping["search_request"]["queries"]) == 3
     assert academic["ok"] is True
-    assert len(academic["search_request"]["queries"]) == 2
+    assert len(academic["search_request"]["queries"]) == 3
     assert too_many_shopping["ok"] is False
     assert too_many_shopping["error_result"]["error"]["issues"] == [
-        {"path": "$.query", "message": "shopping permits at most 2 queries per call"}
+        {"path": "$.query", "message": "shopping permits at most 3 queries per call"}
     ]
 
 
@@ -104,7 +105,7 @@ def test_tool_descriptions_explain_inputs_without_research_planning_rules():
     for description in (LEGACY_WEB_SEARCH_TOOL_DESCRIPTION, ADVANCED_WEB_SEARCH_TOOL_DESCRIPTION):
         normalized = " ".join(description.split())
         assert "query" in normalized
-        assert "two independent" in normalized
+        assert "three independent" in normalized
         assert "site:" in normalized
         assert "read_page" in normalized
         assert "internal plan" not in normalized

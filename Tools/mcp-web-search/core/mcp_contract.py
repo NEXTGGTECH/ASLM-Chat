@@ -32,14 +32,14 @@ MCP_SERVER_DESCRIPTION = "Search and page-reading tools."
 
 
 LEGACY_WEB_SEARCH_TOOL_DESCRIPTION = """Search the web for facts, sources, and documentation.
-Pass query as one focused string or up to two independent queries. Use shopping=true for
+Pass query as one focused string or up to three independent queries. Use shopping=true for
 prices/offers or academic=true for papers. Effort defaults to medium. Optional search
 operators (site:, quoted phrases, after:) belong in query. Cite returned source handles
 and use read_page for full text when needed."""
 
 
 ADVANCED_WEB_SEARCH_TOOL_DESCRIPTION = """Search the web for facts, sources, documentation, and research.
-Pass query as a focused string or up to two independent query strings. Optional vertical
+Pass query as a focused string or up to three independent query strings. Optional vertical
 selects web (default), academic (papers), shopping (prices/offers), or onion when available.
 Optional description is a short UI label; effort defaults to medium. Search operators such
 as site:, quoted phrases, and after: can be included in query when needed.
@@ -57,10 +57,16 @@ IMAGE_SEARCH_TOOL_DESCRIPTION = (
     "and region are auto-detected, so write it in the user's language. Offered only "
     "to multimodal (vision-capable) models: you can pass any returned image_url to "
     "your image input to actually look at it.\n\n"
-    "You may also embed images directly in your reply with the inline token "
-    "[[images: search terms]] on its own line in plain text — the chat UI renders it "
-    "as a native photo row for the user (the search runs automatically; you do not "
-    "need to call this tool for the token to work)."
+    "When this tool returns images, you MUST include the display token "
+    "[[images: search terms]] in your final answer, replacing search terms with "
+    "the search query (2-140 characters). Put the token on its own line in plain "
+    "text, outside code blocks, inline code, quotes, links, and lists. The chat UI "
+    "replaces this service token with a native image gallery, just as citation "
+    "handles render search citations. URLs or img IDs alone do not display the "
+    "gallery. Do not emit an image token when no images were found.\n\n"
+    "Example after searching for red pandas:\n[[images: red pandas]]\n\n"
+    "You can also use this token without calling the tool: the chat UI runs the "
+    "image search automatically."
 )
 
 
@@ -94,7 +100,7 @@ SEARCH_QUERY_SCHEMA: dict[str, Any] = {
                     "items": {"type": "string", "minLength": 1, "maxLength": 220},
                 },
             ],
-            "description": "One focused search query or up to two independent queries.",
+            "description": "One focused search query or up to three independent queries.",
         },
         "effort": {
             "type": "string",
@@ -180,10 +186,10 @@ def build_search_schema() -> dict[str, Any]:
             "properties": {
                 "query": {
                     "oneOf": [query_string, {
-                        "type": "array", "minItems": 1, "maxItems": 2,
+                        "type": "array", "minItems": 1, "maxItems": SEARCH_BATCH_LIMIT,
                         "items": dict(query_string),
                     }],
-                    "description": "One focused query or up to two independent queries.",
+                    "description": "One focused query or up to three independent queries.",
                 },
                 "vertical": {"type": "string", "enum": verticals, "default": "web",
                              "description": "web: general; academic: papers; shopping: prices/offers."},
@@ -375,7 +381,7 @@ def invalid_search_plan_result(
     message = (
         "INVALID_SEARCH_PLAN: web_search rejected this call before running any search.\n"
         f"Failures: {details}\n"
-        "Required shape: query as one non-empty string or up to two strings; optional "
+        "Required shape: query as one non-empty string or up to three strings; optional "
         "vertical (web/academic/shopping), effort (low/medium/high), description (UI label).\n"
         'Valid examples: {"query":"project release notes"} or '
         '{"query":"steel thermal conductivity","vertical":"academic"}\n'

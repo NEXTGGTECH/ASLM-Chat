@@ -1524,14 +1524,9 @@ def _run_tool_loop(
 ):
     """Resolve local tools through LM Studio's OpenAI-compatible tool-calling."""
 
-    try:
-        model_vision = bool(_get_catalog_model_info(model_name).get("vision"))
-    except Exception:  # noqa: BLE001 — capability lookup must never break the loop
-        model_vision = False
     tools, tool_lookup = tool_registry.build_ollama_tools(
         tool_server_ids,
         engine="lms",
-        model_vision=model_vision,
         model_name=model_name,
         tool_source_map=tool_context.get("tool_source_map") if isinstance(tool_context, dict) else None,
         allowed_tool_aliases=tool_context.get("allowed_tool_aliases") if isinstance(tool_context, dict) else None,

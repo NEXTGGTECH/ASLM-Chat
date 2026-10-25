@@ -42,7 +42,7 @@ from core.mcp_contract import (
 from core.read import run_read_page
 from core.search.web_search import run_web_search, run_web_search_batch, run_web_search_plan
 from core.search_io_logger import write_search_io_event
-from core.query.rewriter import expanded_queries, rewrite_query, rewrite_queries
+from core.query.rewriter import expanded_queries, rewrite_queries
 from urllib.parse import urlparse
 
 # Wire rotating file logs (web_search.log / read_page.log / core.log / mcp_trace.log)
@@ -202,18 +202,21 @@ async def _rewrite_search_args(args: dict[str, Any]) -> dict[str, Any]:
         if len(queries) == 1:
             fan_out = await expanded_queries(queries[0])
             if fan_out:
-                queries = fan_out[:3]
+                vertical = str(args.get("vertical") or "web")
+                from core.query.search_plan import VERTICAL_QUERY_LIMITS
+                limit = 1 if coerce_search_effort(args) == "high" else VERTICAL_QUERY_LIMITS.get(vertical, 3)
+                queries = fan_out[:limit]
             else:
-                rewritten, changed = await rewrite_query(queries[0])
-                if not changed:
-                    return args
-                queries = [rewritten]
+                return args
         else:
             queries, changed = await rewrite_queries(queries)
             if not changed:
                 return args
         rewritten_args = dict(args)
         rewritten_args["query"] = queries[0] if len(queries) == 1 else queries
+        if not prepare_search_arguments(rewritten_args).get("ok"):
+            logger.warning("query rewriter produced an invalid search plan; using original arguments")
+            return args
         return rewritten_args
     except Exception as exc:  # noqa: BLE001 — the rewriter must never break a search
         logger.warning("query rewriter args pass-through failed: %s", exc)
@@ -529,6 +532,12 @@ async def _call_image_search(args: dict[str, Any]) -> dict[str, Any]:
         if images
         else f'No images found for "{query}".'
     )
+    if images:
+        model_context += (
+            "\n\nTo display these images, include the following service token in your final "
+            "answer on its own line, outside code blocks, inline code, quotes, links, and lists:\n"
+            f"[[images: {query[:140]}]]"
+        )
     # model_context is the MCP contract's compact model-facing text: with it (plus
     # the ui dict) _extract_structured_tool_result keeps the gallery metadata and
     # the model sees the clean listing instead of a full JSON dump.

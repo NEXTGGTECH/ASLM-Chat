@@ -30,7 +30,7 @@ def _worker(operation: str, payload: dict[str, Any]) -> dict[str, Any]:
     return envelope["result"]
 
 
-def test_worker_publishes_string_and_two_query_batch_inputs():
+def test_worker_publishes_string_and_three_query_batch_inputs():
     described = _worker("describe", {})
 
     web_tool = next(tool for tool in described["tools"] if tool["id"] == "web_search")
@@ -40,7 +40,7 @@ def test_worker_publishes_string_and_two_query_batch_inputs():
     assert web_string["type"] == "string"
     assert "pattern" not in web_string
     assert web_batch["type"] == "array"
-    assert web_batch["maxItems"] == 2
+    assert web_batch["maxItems"] == 3
     assert read_tool["parameters"]["properties"]["url"]["oneOf"][1]["type"] == "array"
 
 
@@ -55,13 +55,20 @@ def test_worker_preflight_matches_the_published_batch_contract():
     assert good["ok"] is True
     assert good["arguments"]["query"] == "github rate limit fallback"
 
+    batch = _worker("prepare", {
+        "tool_id": "web_search",
+        "arguments": {"query": ["first query", "second query", "third query"]},
+    })
+    assert batch["ok"] is True
+    assert len(batch["search_request"]["queries"]) == 3
+
     bad_cases = [
         (
             {
-                "query": ["one", "two", "three"],
+                "query": ["one", "two", "three", "four"],
                 "description": "Check search",
             },
-            "batch permits at most 2",
+            "batch permits at most 3",
         ),
     ]
     for arguments, expected_message in bad_cases:

@@ -10,7 +10,8 @@ small JSON object with plain search terms.
 
 The subagent always follows the active chat model: engine + model come from
 Tools/model_runtime_metadata.json (written by the chat on model selection) and the
-endpoint is resolved from the module's Settings/settings.json.
+endpoint is resolved by the module's shared settings reader (including environment
+overrides and defaults).
 
 Design constraints:
 - Fail-open: any error, timeout or malformed reply returns the input unchanged. The
@@ -23,10 +24,12 @@ Design constraints:
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import json
 import logging
 import time
 from pathlib import Path
+from functools import lru_cache
 from typing import Any, NamedTuple
 
 import httpx
@@ -51,7 +54,25 @@ _warned_no_target = False
 
 _TOOL_ROOT = Path(__file__).resolve().parents[2]  # .../Tools/mcp-web-search
 _RUNTIME_METADATA_FILE = _TOOL_ROOT.parent / "model_runtime_metadata.json"
-_ENGINE_SETTINGS_FILE = _TOOL_ROOT.parents[1] / "Settings" / "settings.json"
+
+
+@lru_cache(maxsize=1)
+def _project_settings():
+    """Load the shared settings reader even in the isolated tool environment."""
+    path = _TOOL_ROOT.parents[1] / "Settings" / "settings.py"
+    spec = importlib.util.spec_from_file_location("aslm_rewriter_settings", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_engine_settings() -> dict[str, Any]:
+    settings = _project_settings()
+    values = dict(settings.load_settings())
+    # Stored addresses omit schemes; the shared resolver restores HTTP/HTTPS.
+    for engine in ("lms", "openai", "google-genai"):
+        values[f"{engine.replace('-', '_')}_url"] = settings.get_engine_url(engine)
+    return values
 
 
 class RewriterConfigSnapshot:
@@ -115,15 +136,18 @@ def _chat_completions_url(base: str) -> str:
 def _runtime_target() -> RewriterTarget | None:
     """Resolve the active chat model into a callable endpoint. None when unknown."""
     try:
-        active = _read_json(_RUNTIME_METADATA_FILE).get("active") or {}
+        metadata = _read_json(_RUNTIME_METADATA_FILE)
+        active = metadata.get("active") if isinstance(metadata, dict) else None
     except (OSError, ValueError):
+        return None
+    if not isinstance(active, dict):
         return None
     engine = str(active.get("engine") or "").strip()
     model = str(active.get("model") or "").strip()
     if not engine or not model:
         return None
     try:
-        engine_settings = _read_json(_ENGINE_SETTINGS_FILE)
+        engine_settings = _load_engine_settings()
     except (OSError, ValueError):
         engine_settings = {}
 
@@ -135,7 +159,7 @@ def _runtime_target() -> RewriterTarget | None:
         return RewriterTarget("ollama", f"http://127.0.0.1:{port}/api/chat", model, "")
     if engine == "lms":
         base = _http_base(engine_settings.get("lms_url") or "127.0.0.1:1234")
-        return RewriterTarget("openai", f"{base}/v1/chat/completions", model, "")
+        return RewriterTarget("openai", _chat_completions_url(base), model, "")
     if engine == "openai":
         base = _http_base(engine_settings.get("openai_url"))
         if not base:
@@ -146,9 +170,14 @@ def _runtime_target() -> RewriterTarget | None:
         api_key = str(engine_settings.get("google_genai_api_key") or "").strip()
         if not api_key:
             return None
+        base = str(engine_settings.get("google_genai_url") or "https://generativelanguage.googleapis.com").strip().rstrip("/")
+        if "://" not in base:
+            base = "https://" + base
+        if base.endswith("/v1beta") or base.endswith("/v1"):
+            base = base.rsplit("/", 1)[0]
         return RewriterTarget(
             "openai",
-            "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+            f"{base}/v1beta/openai/chat/completions",
             model,
             api_key,
         )
@@ -188,9 +217,12 @@ async def _call_model(target: RewriterTarget, timeout_seconds: float, thought: s
         message = (choices[0].get("message") if choices else None) or {}
         content = message.get("content")
     parsed = _parse_model_reply(content)
+    raw_queries = parsed.get("queries")
+    if not isinstance(raw_queries, list):
+        raise ValueError("model reply queries must be an array")
     queries = [
         " ".join(str(q).split())
-        for q in (parsed.get("queries") or [])
+        for q in raw_queries
         if isinstance(q, str) and q.strip()
     ]
     return queries
@@ -256,7 +288,7 @@ async def rewrite_queries(queries: list[str]) -> tuple[list[str], bool]:
 
 
 async def expanded_queries(query: str) -> list[str] | None:
-    """Return the full rewritten variant list for one thought, or None when unchanged."""
+    """Return rewritten variants, including a single variant, or None on skip/failure."""
     global _warned_no_target
     config = RewriterConfigSnapshot()
     text = " ".join(str(query or "").split())
@@ -276,7 +308,7 @@ async def expanded_queries(query: str) -> list[str] | None:
     async with _cache_lock:
         cached = _cache.get(cache_key)
         if cached and cached[1] > time.monotonic():
-            return cached[0] if len(cached[0]) > 1 else None
+            return list(cached[0])
     try:
         rewritten = (await _call_model(target, config.timeout_seconds, text))[: config.max_queries]
     except Exception as exc:  # noqa: BLE001 — fail-open is the contract
@@ -286,12 +318,6 @@ async def expanded_queries(query: str) -> list[str] | None:
         )
         return None
     if not rewritten:
-        return None
-    if len(rewritten) == 1:
-        # Cache single-variant results so a follow-up rewrite_query() at the
-        # adapter does not pay a second model round-trip for the same thought.
-        async with _cache_lock:
-            _cache[cache_key] = (rewritten, time.monotonic() + _CACHE_TTL_SECONDS)
         return None
     async with _cache_lock:
         _cache[cache_key] = (rewritten, time.monotonic() + _CACHE_TTL_SECONDS)

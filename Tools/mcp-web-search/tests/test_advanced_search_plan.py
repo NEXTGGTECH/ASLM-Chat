@@ -128,7 +128,7 @@ def test_compact_schema_is_default_and_onion_is_capability_gated(monkeypatch):
     string_schema, batch_schema = schema["properties"]["query"]["oneOf"]
     assert string_schema["type"] == "string"
     assert "pattern" not in string_schema
-    assert batch_schema["maxItems"] == 2
+    assert batch_schema["maxItems"] == 3
     assert "onion" not in schema["properties"]["vertical"]["enum"]
     assert "query" in build_search_description()
     monkeypatch.setattr(config_module, "load_search_config", lambda: _config(tor=True))
@@ -146,7 +146,7 @@ def test_compact_search_compiles_and_round_trips(monkeypatch, vertical):
 
 
 @pytest.mark.parametrize("arguments", [
-    {"query": ""}, {"query": ["one", "two", "three"]},
+    {"query": ""}, {"query": ["one", "two", "three", "four"]},
     {"query": "steel", "vertical": "invented"},
     {"query": "steel", "vertical": "onion"},
     {"query": "steel", "effort": "invented"},
@@ -301,10 +301,10 @@ def test_advanced_plan_rejects_ambiguous_legacy_description_field():
     }
 
 
-def test_advanced_plan_enforces_two_query_total_atomically():
+def test_advanced_plan_enforces_three_query_total_atomically():
     plan = _plan()
     plan["web"] = [plan["web"], {"text": "second web intent"}]
-    plan["academic"] = {"text": "third academic intent"}
+    plan["academic"] = [{"text": "third academic intent"}, {"text": "fourth academic intent"}]
 
     with pytest.raises(PlanValidationError) as exc:
         prepare_advanced_search(plan, query_config=_config().query)
@@ -312,8 +312,7 @@ def test_advanced_plan_enforces_two_query_total_atomically():
     assert exc.value.issues == [{
         "path": "$",
         "message": (
-            "batch permits at most 2 queries total: either two in one vertical or one in "
-            "each of two verticals"
+            "batch permits at most 3 queries total"
         ),
     }]
 
@@ -439,10 +438,10 @@ def test_compact_search_executes_through_the_server_plan_pipeline(monkeypatch):
     monkeypatch.setattr(server, "run_web_search_plan", fake_plan)
     monkeypatch.setattr(server, "write_search_io_event", lambda *_: None)
     result = asyncio.run(server._call_web_search({
-        "query": ["M2 high speed steel density", "M2 high speed steel thermal conductivity"],
+        "query": ["M2 high speed steel density", "M2 high speed steel thermal conductivity", "M2 high speed steel heat capacity"],
         "vertical": "academic",
     }))
     assert result["model_context"] == "Evidence"
     assert len(captured) == 1
-    assert [query["vertical"] for query in captured[0]["queries"]] == ["academic", "academic"]
+    assert [query["vertical"] for query in captured[0]["queries"]] == ["academic", "academic", "academic"]
     assert captured[0]["effort"] == "medium"

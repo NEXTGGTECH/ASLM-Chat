@@ -2103,22 +2103,24 @@ VISION_ONLY_TOOL_IDS = frozenset({"image_search"})
 
 
 def model_supports_vision(engine: str | None, model_name: str | None) -> bool:
-    """Best-effort per-engine multimodality check (fail-closed on any doubt)."""
-    if not model_name:
-        return False
+    """Read normalized vision support from the shared runtime metadata."""
     try:
-        if engine == "lms":
-            from API import lms as lms_api
-            return bool(lms_api._get_catalog_model_info(model_name).get("vision"))
-        if engine == "openai":
-            from API import openai as openai_api
-            return bool((openai_api.get_model_settings(model_name) or {}).get("supports_vision"))
-        if engine == "google-genai":
-            from API import google_genai as genai_api
-            return bool(genai_api._get_cached_model_capabilities(model_name).get("supports_vision"))
-    except Exception as exc:  # noqa: BLE001 — capability lookup must never break a call
-        logger.debug("vision capability lookup failed for %s/%s: %s", engine, model_name, exc)
-    return False
+        payload = json.loads((TOOLS_DIR / "model_runtime_metadata.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    active = payload.get("active")
+    active = active if isinstance(active, dict) else {}
+    engine = str(engine or active.get("engine") or "").strip()
+    model_name = str(model_name or active.get("model") or "").strip()
+    models = payload.get("models")
+    if not engine or not model_name or not isinstance(models, dict):
+        return False
+    # An explicit model must never inherit capabilities from a different active model.
+    record = models.get(f"{engine}:{model_name}")
+    capabilities = record.get("capabilities") if isinstance(record, dict) else None
+    return isinstance(capabilities, dict) and capabilities.get("vision") is True
 
 
 def build_ollama_tools(
@@ -2138,6 +2140,9 @@ def build_ollama_tools(
         server_ids = [server_ids] if server_ids else []
     elif not server_ids:
         server_ids = []
+
+    if model_vision is None:
+        model_vision = model_supports_vision(engine, model_name)
 
     tools: list[dict[str, Any]] = []
     tool_lookup: dict[str, dict[str, Any]] = {}
