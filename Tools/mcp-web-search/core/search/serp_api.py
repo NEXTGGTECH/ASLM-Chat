@@ -6,7 +6,7 @@ import asyncio
 import contextlib
 import time
 from collections.abc import AsyncIterator
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from typing import Any, Protocol
 from urllib.parse import urlparse
 
@@ -82,6 +82,22 @@ def _error_parse_result(engine: str, message: str) -> EngineParseResult:
     return EngineParseResult(engine=engine, status=ParseStatus.ERROR, diagnostics=[message])
 
 
+# Drop the engine's stored HTTP cookies for the request host (captcha-burn recovery).
+# Best-effort: a store failure never blocks the retry itself.
+def _drop_identity_cookies(request: EngineRequest) -> int:
+    if not request.identity_key:
+        return 0
+    host = _host_of(request.url)
+    if not host:
+        return 0
+    try:
+        from ..fetch.browser.identity_store import get_identity_store
+
+        return get_identity_store().clear_http_cookies(request.identity_key, host)
+    except Exception:  # noqa: BLE001 — recovery must never break the fetch
+        return 0
+
+
 # Serialize one engine parse result into the final payload dict.
 def _parse_result_payload(
     result: EngineParseResult,
@@ -145,6 +161,10 @@ class SerpApi:
         await self.close()
 
     # Fetch one engine, parse its response, and return the serialized result dict.
+    # blocked_retries re-fetches on a BLOCKED outcome after dropping the engine's
+    # stored identity cookies: a captcha branch is usually pinned to the session
+    # cookie (sticky per identity), so a cookieless re-roll recovers it far more
+    # often than replaying the same request would.
     async def _run_engine(
         self,
         parser_type,
@@ -153,6 +173,7 @@ class SerpApi:
         region: str,
         safesearch: str,
         timelimit: str | None,
+        blocked_retries: int = 0,
     ) -> dict[str, Any]:
         parser = parser_type()
         fetch_started = time.perf_counter()
@@ -161,6 +182,7 @@ class SerpApi:
         transport = ""
         fetch_ms = 0.0
         parse_ms = 0.0
+        request: EngineRequest | None = None
         try:
             async with asyncio.timeout(self.timeout_seconds):
                 # Warmup protocol (image engines): a token-hungry parser gets one
@@ -207,6 +229,63 @@ class SerpApi:
         except Exception as exc:  # noqa: BLE001
             fetch_ms = (time.perf_counter() - fetch_started) * 1000
             result = _error_parse_result(parser.name, f"{type(exc).__name__}: {exc}")
+
+        # Captcha-burn recovery loop. A blocked branch sticks to TWO cookie jars the
+        # first attempt rode: the identity store (replayed into the request) and the
+        # transport's pooled client (primp keeps its own jar). Each retry drops both
+        # and re-fetches with identity_key cleared — a truly cookieless re-roll. The
+        # final outcome is what the health tracker records, so exhausted retries still
+        # cool the engine down instead of hiding the failure.
+        attempts = 0
+        parser_identity = request.identity_key if request is not None else ""
+        while (
+            blocked_retries > 0
+            and result.status == ParseStatus.BLOCKED
+            and attempts < blocked_retries
+            and request is not None
+        ):
+            attempts += 1
+            host = _host_of(request.url)
+            _drop_identity_cookies(request)
+            drop_clients = getattr(self._transport, "drop_identity_clients", None)
+            if callable(drop_clients) and host:
+                drop_clients(host)
+            try:
+                async with asyncio.timeout(self.timeout_seconds):
+                    request = await _build_engine_request(
+                        parser,
+                        self._transport,
+                        query,
+                        region=region,
+                        safesearch=safesearch,
+                        timelimit=timelimit,
+                    )
+                    # Naked fetch: no identity replay and no Set-Cookie capture, so the
+                    # retry cannot inherit or persist the burned branch.
+                    request = replace(request, identity_key="")
+                    response = await self._transport.fetch(request)
+                    request = replace(request, identity_key=parser_identity)
+            except TimeoutError:
+                result = _error_parse_result(parser.name, f"Timed out after {self.timeout_seconds:.1f}s")
+                result.status = ParseStatus.TIMEOUT
+                break
+            except Exception as exc:  # noqa: BLE001
+                result = _error_parse_result(parser.name, f"{type(exc).__name__}: {exc}")
+                break
+            fetch_ms = (time.perf_counter() - fetch_started) * 1000
+            http_status = response.status
+            response_bytes = len(response.body)
+            transport = response.transport
+            if response.status >= 400:
+                result = _error_parse_result(parser.name, f"HTTP {response.status}")
+                if response.status in {403, 429}:
+                    result.status = ParseStatus.BLOCKED
+            else:
+                parse_started = time.perf_counter()
+                result = parser.parse(response.text())
+                parse_ms = (time.perf_counter() - parse_started) * 1000
+            result.diagnostics.append(f"captcha retry {attempts}/{blocked_retries}")
+
         return _parse_result_payload(
             result,
             provider_family=str(getattr(parser, "provider_family", parser.name)),
@@ -234,6 +313,7 @@ class SerpApi:
         engine_queries: dict[str, str] | None = None,
         engine_timelimits: dict[str, str | None] | None = None,
         engine_omitted_operators: dict[str, tuple[str, ...]] | None = None,
+        engine_blocked_retries: dict[str, int] | None = None,
         deadline_seconds: float | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         query = " ".join(str(query or "").split()).strip()
@@ -254,6 +334,7 @@ class SerpApi:
                 region=region,
                 safesearch=safesearch,
                 timelimit=engine_timelimit,
+                blocked_retries=int((engine_blocked_retries or {}).get(parser_type.name, 0)),
             )
             payload["query"] = engine_query
             payload["timelimit"] = engine_timelimit

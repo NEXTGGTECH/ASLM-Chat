@@ -735,3 +735,171 @@ def test_had_productive_engine_distinguishes_empty_from_outage():
         {"engines": {"yandex": {"status": "timeout"}, "brave": {"status": "blocked"}}}
     ) is False
     assert _had_productive_engine({"engines": {}}) is False
+
+
+# --- captcha-burn retry (SerpApi blocked_retries) ----------------------------------
+
+from core.engines.models import EngineParseResult, EngineRequest, ParseStatus, SearchResult
+from core.fetch._base import TransportResponse
+
+
+class _RetryFakeParser:
+    """Blocked on the first two touches, full SERP on the third."""
+
+    name = "retry_fake"
+    provider_family = "retry_fake"
+    calls = 0
+
+    @staticmethod
+    def build_request(query, *, region="us-en", safesearch="moderate", timelimit=None, page=1):
+        return EngineRequest(
+            method="GET", url="https://retry.test/search", identity_key="retry_fake"
+        )
+
+    def parse(self, document):
+        type(self).calls += 1
+        if type(self).calls < 3:
+            return EngineParseResult(engine=self.name, status=ParseStatus.BLOCKED)
+        return EngineParseResult(
+            engine=self.name,
+            status=ParseStatus.SUCCESS,
+            results=[SearchResult(title="ok", url="https://ok.test/a", snippet="s")],
+        )
+
+
+class _AlwaysBlockedParser(_RetryFakeParser):
+    name = "retry_blocked"
+    provider_family = "retry_blocked"
+
+    def parse(self, document):
+        type(self).calls += 1
+        return EngineParseResult(engine=self.name, status=ParseStatus.BLOCKED)
+
+
+class _FakeTransport:
+    def __init__(self):
+        self.fetches = 0
+        self.drops = 0
+        self.client_drops = 0
+        self.naked_fetches = 0
+
+    async def fetch(self, request):
+        self.fetches += 1
+        if not request.identity_key:
+            self.naked_fetches += 1
+        return TransportResponse(status=200, body=b"<html></html>", transport="fake")
+
+    def drop_identity_clients(self, host):
+        self.client_drops += 1
+        return 1
+
+    async def close(self):
+        return None
+
+
+def _run_retry_case(monkeypatch, parser_type, blocked_retries):
+    from core.search import serp_api
+
+    transport = _FakeTransport()
+
+    def fake_drop(request):
+        transport.drops += 1
+        return 0
+
+    monkeypatch.setattr(serp_api, "_drop_identity_cookies", fake_drop)
+    api = serp_api.SerpApi(transport=transport, engines=(parser_type,))
+    payload = asyncio.run(
+        api._run_engine(
+            parser_type, "q", region="us-en", safesearch="moderate",
+            timelimit=None, blocked_retries=blocked_retries,
+        )
+    )
+    return payload, transport
+
+
+def test_blocked_retry_recovers_after_identity_reset(monkeypatch):
+    _RetryFakeParser.calls = 0
+    payload, transport = _run_retry_case(monkeypatch, _RetryFakeParser, blocked_retries=3)
+    assert payload["status"] == "success"
+    assert payload["sources"][0]["url"] == "https://ok.test/a"
+    assert transport.fetches == 3      # first attempt + 2 retries
+    assert transport.drops == 2        # cookie branch dropped before each retry
+    assert transport.client_drops == 2  # pooled primp client dropped per retry
+    assert transport.naked_fetches == 2  # retries fetch with identity_key cleared
+    assert "captcha retry 2/3" in payload["diagnostics"]
+
+
+def test_blocked_retry_exhausts_and_stays_blocked(monkeypatch):
+    _AlwaysBlockedParser.calls = 0
+    payload, transport = _run_retry_case(monkeypatch, _AlwaysBlockedParser, blocked_retries=3)
+    assert payload["status"] == "blocked"
+    assert transport.fetches == 4      # first attempt + 3 retries
+    assert transport.drops == 3
+    assert transport.client_drops == 3
+    assert transport.naked_fetches == 3
+    assert "captcha retry 3/3" in payload["diagnostics"]
+
+
+def test_blocked_retry_off_by_default(monkeypatch):
+    _AlwaysBlockedParser.calls = 0
+    payload, transport = _run_retry_case(monkeypatch, _AlwaysBlockedParser, blocked_retries=0)
+    assert payload["status"] == "blocked"
+    assert transport.fetches == 1
+    assert transport.drops == 0
+
+
+# --- adaptive Yandex UA mode -------------------------------------------------------
+
+_GOOD_YANDEX_HTML = (
+    '<html><body><div class="Organic"><h2><a class="OrganicTitle-Link" '
+    'href="https://ok.test/x"><span class="OrganicTitle-LinkText">Title</span></a></h2>'
+    '<div class="OrganicTextContentSpan">text</div></div></body></html>'
+)
+
+
+def _reset_yandex_ua_state():
+    from core.engines import yandex as yz
+
+    yz._ua_mode = "yabrowser"
+    yz._plain_until = 0.0
+    yz._blocked_streak = 0
+
+
+def test_yandex_default_leg_sends_yabrowser_ua():
+    _reset_yandex_ua_state()
+    from core.engines.yandex import YandexParser
+
+    req = YandexParser.build_request("q", region="us-en")
+    assert "YaBrowser" in req.headers.get("User-Agent", "")
+    assert req.primp_target == "chrome"  # pinned chromium TLS
+
+
+def test_yandex_blocked_streak_flips_to_plain_then_recovers():
+    _reset_yandex_ua_state()
+    from core.engines import yandex as yz
+    from core.engines.yandex import YandexParser
+
+    parser = YandexParser()
+    parser.parse("<html>smartcaptcha</html>")
+    req = YandexParser.build_request("q", region="us-en")
+    assert "YaBrowser" in req.headers.get("User-Agent", "")  # one strike is not enough
+
+    parser.parse("<html>smartcaptcha</html>")  # second consecutive block flips
+    req = YandexParser.build_request("q", region="us-en")
+    assert "User-Agent" not in req.headers  # plain leg: the proven no-UA recipe
+
+    yz._plain_until = 0.0  # cooldown elapsed
+    req = YandexParser.build_request("q", region="us-en")
+    assert "YaBrowser" in req.headers.get("User-Agent", "")
+
+
+def test_yandex_success_resets_blocked_streak():
+    _reset_yandex_ua_state()
+    from core.engines.yandex import YandexParser
+
+    parser = YandexParser()
+    parser.parse("<html>smartcaptcha</html>")   # streak 1
+    assert parser.parse(_GOOD_YANDEX_HTML).status.value == "success"  # streak reset
+    parser.parse("<html>smartcaptcha</html>")   # streak 1 again — no flip
+    req = YandexParser.build_request("q", region="us-en")
+    assert "YaBrowser" in req.headers.get("User-Agent", "")

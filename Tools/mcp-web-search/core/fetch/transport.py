@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -214,6 +215,19 @@ class PrimpTransport:
             self._clients[key] = client
         return client
 
+    # Drop every cached client for a host. A primp client keeps its own cookie jar,
+    # and captcha-sensitive engines (ya.ru) burn that jar fast — a retry needs a
+    # fresh connection, not the same sticky session.
+    def drop_clients(self, host: str) -> int:
+        prefix = f"{host}:"
+        doomed = [key for key in self._clients if key.startswith(prefix)]
+        for key in doomed:
+            client = self._clients.pop(key, None)
+            if client is not None:
+                with contextlib.suppress(Exception):
+                    client.close()
+        return len(doomed)
+
     # Execute one HTTP request synchronously using the matching primp client.
     def _fetch_sync(self, request: EngineRequest) -> TransportResponse:
         host = request.url.split("/", 3)[2]
@@ -286,6 +300,11 @@ class AdaptiveTransport:
             response = await self._fast.fetch(request)
         _capture_identity_cookies(request, host, response)
         return response
+
+    # Captcha-burn recovery: drop the host's impersonated client (its internal cookie
+    # jar is the sticky identity that captcha branches pin to).
+    def drop_identity_clients(self, host: str) -> int:
+        return self._impersonated.drop_clients(host)
 
     # Close all underlying transports.
     async def close(self) -> None:

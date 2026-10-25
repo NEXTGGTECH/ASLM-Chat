@@ -722,6 +722,14 @@ class WebSearchService:
             engine_omitted_operators={
                 name: item.omitted_operators for name, item in provider_queries.items()
             },
+            # Captcha-retry budget (native Yandex): only the high tier pays for identity
+            # re-rolls — a BLOCKED SERP is usually a sticky cookie branch, and a
+            # cookieless retry recovers it cheaply (SerpApi._run_engine).
+            engine_blocked_retries=(
+                {YandexParser.name: 3}
+                if profile.name == "high" and YandexParser in engines
+                else None
+            ),
             deadline_seconds=profile.deadline * 0.8,
         )
         if profile.parse_budget:

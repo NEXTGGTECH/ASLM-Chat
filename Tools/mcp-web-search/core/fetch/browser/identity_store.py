@@ -329,6 +329,40 @@ class IdentityStore:
     def http_cookie_header(self, owner: str, host: str) -> str:
         return "; ".join(f"{n}={v}" for n, v in self.http_cookies_map(owner, host).items())
 
+    # Drop the owner's HTTP-earned cookies whose domain matches the host. Captcha-burn
+    # recovery: a BLOCKED SERP is usually pinned to the engine's sticky session cookie,
+    # so a retry must clear the branch instead of replaying it. Returns rows removed.
+    def clear_http_cookies(self, owner: str, host: str) -> int:
+        owner = (owner or "").strip()
+        if not owner or not host:
+            return 0
+        try:
+            rows = self._get_conn().execute(
+                "SELECT domain, name FROM http_cookies WHERE owner = ?", (owner,)
+            ).fetchall()
+        except sqlite3.DatabaseError as exc:
+            logger.warning("identity_store: cookie clear-read failed for %r: %s", owner, exc)
+            return 0
+        doomed = [
+            (owner, str(row["domain"]), str(row["name"]))
+            for row in rows
+            if _domain_matches(str(row["domain"]), host)
+        ]
+        if not doomed:
+            return 0
+        with self._write_lock:
+            conn = self._get_conn()
+            try:
+                with conn:
+                    conn.executemany(
+                        "DELETE FROM http_cookies WHERE owner = ? AND domain = ? AND name = ?",
+                        doomed,
+                    )
+            except sqlite3.DatabaseError as exc:
+                logger.warning("identity_store: cookie clear failed for %r: %s", owner, exc)
+                return 0
+        return len(doomed)
+
     # ── Imported-browser cookie layer (opt-in profile import) ─────────────────────────
     # A third, family-keyed layer, distinct from the warm-browser generations (rotated) and
     # the per-engine http_cookies (self-earned). These are cookies imported wholesale from the

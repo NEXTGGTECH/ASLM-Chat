@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import time
+
 from ..fetch.profiles import accept_language_for, build_nav_headers, for_engine
-from .models import EngineParseResult, EngineRequest, SearchResult
+from .models import EngineParseResult, EngineRequest, ParseStatus, SearchResult
 from .parsing import (
     classify_parse,
     first_attribute,
@@ -18,6 +20,50 @@ from .parsing import (
 _SUPPORTED_LANGS = frozenset(
     {"ru", "en", "be", "fr", "de", "id", "kk", "tt", "tr", "uk"}
 )
+
+
+# ── adaptive User-Agent mode (native ya.ru) ────────────────────────────────────
+# Default leg: a Yandex Browser UA on top of the pinned chrome TLS — for ya.ru the
+# most coherent client story (their own Chromium). Measured at parity with the
+# cookieless "no UA" recipe, but the two legs' captcha dice are independent, so
+# when the Yandex leg runs into a captcha streak the engine temporarily drops the
+# explicit UA (the proven no-identity recipe) for a cooldown window, then returns
+# to the default. Mode state is module-level: parse() feeds outcomes, build_request
+# reads the mode (plain assignments only — no awaits, GIL is the lock).
+_YB_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/146.0.0.0 YaBrowser/26.10.0.0 Safari/537.36"
+)
+_PLAIN_MODE_SECONDS = 15 * 60.0
+_BLOCKED_STRIKES_TO_FLIP = 2
+
+_ua_mode = "yabrowser"  # "yabrowser" | "plain"
+_plain_until = 0.0
+_blocked_streak = 0
+
+
+# The User-Agent header value for the current mode ("" = send no UA header).
+def _active_user_agent() -> str:
+    global _ua_mode
+    if _ua_mode == "plain":
+        if time.monotonic() < _plain_until:
+            return ""
+        _ua_mode = "yabrowser"  # cooldown elapsed — back to the default leg
+    return _YB_USER_AGENT
+
+
+# Feed one parse outcome into the mode state machine.
+def _note_parse_outcome(status: ParseStatus) -> None:
+    global _blocked_streak, _ua_mode, _plain_until
+    if status == ParseStatus.BLOCKED:
+        _blocked_streak += 1
+        if _blocked_streak >= _BLOCKED_STRIKES_TO_FLIP:
+            _ua_mode = "plain"
+            _plain_until = time.monotonic() + _PLAIN_MODE_SECONDS
+    else:
+        _blocked_streak = 0
+        if _ua_mode == "plain" and time.monotonic() >= _plain_until:
+            _ua_mode = "yabrowser"
 
 
 # Yandex web parser using the native ya.ru SERP.
@@ -55,18 +101,25 @@ class YandexParser:
         params = {"text": query}
         if page > 1:
             params["p"] = str(page - 1)
-        profile = for_engine("yandex")
         headers = {"Accept-Language": "en-US,en;q=0.9"}
         accept_language = accept_language_for(language)
         if accept_language:
             headers["Accept-Language"] = accept_language
+        user_agent = _active_user_agent()
+        if user_agent:
+            headers["User-Agent"] = user_agent
         return EngineRequest(
             method="GET",
             url=YandexParser.search_url,
             params=params,
             headers=headers,
-            primp_target=profile.primp_target,
-            primp_os=profile.primp_os,
+            # ya.ru captcha-gates primp's firefox fingerprint on sight (0/4 in testing)
+            # while chrome/edge TLS pass consistently. The UA (or its absence — see
+            # _active_user_agent) is the whole header identity Yandex sees — pin it
+            # to chromium instead of the deterministic for_engine profile (which
+            # hashes to a firefox one for this engine).
+            primp_target="chrome",
+            primp_os="windows",
             identity_key="yandex",
         )
 
@@ -123,7 +176,7 @@ class YandexParser:
                 continue
             results.append(SearchResult(title=title, url=href, snippet=snippet))
 
-        return classify_parse(
+        outcome = classify_parse(
             engine=self.name,
             results=results,
             parser_variant=variant,
@@ -132,6 +185,8 @@ class YandexParser:
             blocked=blocked and not results,
             explicit_empty=explicit_empty,
         )
+        _note_parse_outcome(outcome.status)
+        return outcome
 
 
 # Legacy Yandex web parser using the retired site-search ("frame") widget.
