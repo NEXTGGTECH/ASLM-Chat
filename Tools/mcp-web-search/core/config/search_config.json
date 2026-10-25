@@ -10,8 +10,8 @@
         "max_page_chars": 20000,
         "min_content_length": 800,
         "enable_read_page_compress": true,
-        "read_page_compress_threshold_chars": 10000,
-        "read_page_compress_target_chars": 10000
+        "read_page_compress_threshold_chars": 40000,
+        "read_page_compress_target_chars": 35000
     },
     "cache": {
         "search_ttl_seconds": 21600,
