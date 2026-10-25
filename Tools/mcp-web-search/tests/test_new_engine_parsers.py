@@ -1,6 +1,6 @@
 # Copyright NEXTGGTECH. Elastic License 2.0.
 
-"""Offline parser coverage for the Qwant, Yep, Yandex and Startpage engines.
+"""Offline parser coverage for the Qwant, Yandex and Startpage engines.
 
 These exercise parse() against synthetic fixtures only (no network), guarding
 against silent regressions when a SERP's markup or API shape drifts.

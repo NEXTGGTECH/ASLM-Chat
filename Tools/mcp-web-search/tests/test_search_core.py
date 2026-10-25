@@ -160,10 +160,10 @@ def test_triage_skip_title_is_skipped():
 def test_triage_revisit_takes_best_positional_view_and_upgrades():
     session = TriageSession("python asyncio tutorial")
     # Weak engine, mid rank → lands in queue.
-    decision = _ingest(session, engine="yep", family="yep", rank=5)
+    decision = _ingest(session, engine="qwant", family="qwant", rank=5)
     assert decision.action == TriageAction.QUEUE
     # The same page then surfaces at Google rank 1: the base must be re-priced to the
-    # strongest single-engine view (not stay at the yep-rank-9 view) and the second
+    # strongest single-engine view instead of the initial Qwant rank 5; the second
     # family's vote lands on top → PARSE upgrade.
     upgraded = session.ingest_revisit(
         engine="google", provider_family="google", rank=1,
@@ -177,7 +177,7 @@ def test_triage_revisit_takes_best_positional_view_and_upgrades():
 def test_triage_vote_weight_follows_family_class():
     def bump_from(family: str) -> float:
         session = TriageSession("python asyncio tutorial")
-        _ingest(session, engine="yep", family="yep", rank=5)
+        _ingest(session, engine="qwant", family="qwant", rank=5)
         before = session.score_of("https://ex.com/a")
         session.ingest_vote(provider_family=family, url="https://ex.com/a")
         return session.score_of("https://ex.com/a") - before
@@ -188,7 +188,7 @@ def test_triage_vote_weight_follows_family_class():
 
 def test_triage_google_startpage_one_family_vote():
     session = TriageSession("python asyncio tutorial")
-    decision = _ingest(session, engine="yep", family="yep", rank=5)
+    decision = _ingest(session, engine="qwant", family="qwant", rank=5)
     assert decision.action == TriageAction.QUEUE
     score_before = session.score_of("https://ex.com/a")
     session.ingest_vote(provider_family="google", url="https://ex.com/a")
@@ -503,8 +503,8 @@ def test_web_search_medium_parses_winners_and_ranks(monkeypatch):
         },
         {
             "type": "source",
-            "engine": "yep",
-            "provider_family": "yep",
+            "engine": "qwant",
+            "provider_family": "qwant",
             "rank": 9,
             "url": {"url": "https://meh.com/page", "host": "meh.com"},
             "serp": {"title": "asyncio", "snippet": "asyncio tutorial", "fetch_ms": 900, "parse_ms": 2},

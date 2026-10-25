@@ -92,8 +92,6 @@ WEB_SEARCH_CONFIG_SETTINGS = {
     "web-search-image-engine-duckduckgo": ("image_engines", "duckduckgo"),
     "web-search-image-engine-openverse": ("image_engines", "openverse"),
     "web-search-query-rewriter-enabled": ("query_rewriter", "enabled"),
-    "web-search-query-rewriter-endpoint": ("query_rewriter", "endpoint"),
-    "web-search-query-rewriter-model": ("query_rewriter", "model"),
     "web-search-query-rewriter-mode": ("query_rewriter", "mode"),
     "web-search-localization-enabled": ("localization", "enabled"),
     "web-search-localization-penalty": ("localization", "language_penalty"),
@@ -191,6 +189,8 @@ DECIMAL_SETTING_KEYS = frozenset(
 
 REMOVED_TOOL_SETTING_KEYS = frozenset(
     {
+        "web-search-query-rewriter-endpoint",
+        "web-search-query-rewriter-model",
         "web-search-profile-import-browsers",
         "web-search-profile-import-domains",
         "sandbox-image-source",
@@ -255,8 +255,6 @@ DEFAULTS: dict[str, Any] = {
     "web-search-image-engine-duckduckgo": False,
     "web-search-image-engine-openverse": True,
     "web-search-query-rewriter-enabled": False,
-    "web-search-query-rewriter-endpoint": "",
-    "web-search-query-rewriter-model": "",
     "web-search-query-rewriter-mode": "heuristic",
     "web-search-localization-enabled": True,
     "web-search-localization-penalty": 0.12,
@@ -649,6 +647,8 @@ def _load_web_search_config_payload() -> dict[str, Any]:
 # Generate managed search_config.json values without replacing JSON-only sections.
 def _write_web_search_config(settings_data: dict[str, Any]) -> None:
     payload = _load_web_search_config_payload()
+    for key in ("endpoint", "model"):
+        payload.get("query_rewriter", {}).pop(key, None)
     for section_name, section_values in WEB_SEARCH_STATIC_CONFIG.items():
         payload.setdefault(section_name, {}).update(section_values)
 

@@ -195,13 +195,9 @@ class ImageEnginesSection:
 class QueryRewriterSection:
     """LLM subagent that rewrites conversational model thoughts into search queries.
     Disabled by default: each enabled rewrite pays one model call (tens of seconds
-    on a 27B). Empty endpoint/model follow the ACTIVE chat model via
-    Tools/model_runtime_metadata.json + Settings/settings.json (ollama native or
-    OpenAI-compatible). Explicit endpoint overrides with an OpenAI-compatible
-    /chat/completions URL."""
+    on a 27B). Always uses the active chat engine and model from
+    Tools/model_runtime_metadata.json + Settings/settings.json."""
     enabled: bool = False
-    endpoint: str = ""
-    model: str = ""
     timeout_seconds: float = 75.0
     max_queries: int = 3
     mode: str = "heuristic"  # heuristic | always
@@ -434,8 +430,6 @@ def load_search_config(path: Path | None = None) -> SearchConfig:
         ),
         query_rewriter=QueryRewriterSection(
             enabled=bool(w.get("enabled", False)),
-            endpoint=str(w.get("endpoint", "")),
-            model=str(w.get("model", "")),
             timeout_seconds=float(w.get("timeout_seconds", 75.0)),
             max_queries=int(w.get("max_queries", 3)),
             mode=_one_of(w.get("mode", "heuristic"), {"heuristic", "always"}, "heuristic"),

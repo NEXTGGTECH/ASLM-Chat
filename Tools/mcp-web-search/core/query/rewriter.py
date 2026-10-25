@@ -2,17 +2,15 @@
 
 """Optional LLM query rewriter: turn conversational model "thoughts" into search queries.
 
-Models routinely write friend-style requests into the search field ("где бы посмотреть
-как люди делают ту штуку с графиками") instead of effective query terms. When enabled,
+Models routinely write conversational requests into the search field ("where can I
+see how people make those charts") instead of effective query terms. When enabled,
 each incoming query string is treated as raw intent and rewritten by a subagent call:
 a local model with a CLEAN context — only the machine-format instruction — returns one
 small JSON object with plain search terms.
 
-The subagent follows the ACTIVE chat model by default: engine + model come from
+The subagent always follows the active chat model: engine + model come from
 Tools/model_runtime_metadata.json (written by the chat on model selection) and the
-endpoint is resolved from the module's Settings/settings.json. Explicit "endpoint"/
-"model" config values override the automatic choice; an explicit endpoint is expected
-to be an OpenAI-compatible /chat/completions URL.
+endpoint is resolved from the module's Settings/settings.json.
 
 Design constraints:
 - Fail-open: any error, timeout or malformed reply returns the input unchanged. The
@@ -47,7 +45,7 @@ Output ONLY one JSON object, nothing else:
 {"queries": ["...", "..."], "vertical": "web|academic|shopping", "language": "ru|en|..."}"""
 
 _CACHE_TTL_SECONDS = 3600.0
-_cache: dict[str, tuple[list[str], float]] = {}
+_cache: dict[tuple[RewriterTarget, str], tuple[list[str], float]] = {}
 _cache_lock = asyncio.Lock()
 _warned_no_target = False
 
@@ -59,14 +57,11 @@ _ENGINE_SETTINGS_FILE = _TOOL_ROOT.parents[1] / "Settings" / "settings.json"
 class RewriterConfigSnapshot:
     """Cheap per-call view of the rewriter config (loaded fresh each call)."""
 
-    __slots__ = ("enabled", "endpoint", "model", "timeout_seconds", "max_queries", "mode")
+    __slots__ = ("enabled", "timeout_seconds", "max_queries", "mode")
 
     def __init__(self) -> None:
         section = load_search_config().query_rewriter
-        # endpoint/model stay optional: empty means "follow the active chat model".
         self.enabled = bool(section.enabled)
-        self.endpoint = str(section.endpoint or "").strip()
-        self.model = str(section.model or "").strip()
         self.timeout_seconds = max(5.0, float(section.timeout_seconds))
         self.max_queries = max(1, int(section.max_queries))
         self.mode = section.mode
@@ -134,9 +129,9 @@ def _runtime_target() -> RewriterTarget | None:
 
     if engine == "ollama-service":
         try:
-            port = int(engine_settings.get("ollama-service_port") or 30002)
+            port = int(engine_settings.get("ollama-service_port") or 20003)
         except (TypeError, ValueError):
-            port = 30002
+            port = 20003
         return RewriterTarget("ollama", f"http://127.0.0.1:{port}/api/chat", model, "")
     if engine == "lms":
         base = _http_base(engine_settings.get("lms_url") or "127.0.0.1:1234")
@@ -158,20 +153,6 @@ def _runtime_target() -> RewriterTarget | None:
             api_key,
         )
     return None
-
-
-def _resolve_target(config: RewriterConfigSnapshot) -> RewriterTarget | None:
-    """Explicit config endpoint/model win; otherwise follow the active chat model."""
-    runtime = _runtime_target()
-    url = config.endpoint or (runtime.url if runtime else "")
-    model = config.model or (runtime.model if runtime else "")
-    if not url or not model:
-        return None
-    # An explicitly configured endpoint is always treated as OpenAI-compatible;
-    # automatic resolution keeps the native dialect for the loopback Ollama engine.
-    if config.endpoint:
-        return RewriterTarget("openai", url, model, "")
-    return RewriterTarget(runtime.flavor, url, model, runtime.api_key)
 
 
 def _parse_model_reply(content: Any) -> dict[str, Any]:
@@ -225,21 +206,22 @@ async def rewrite_query(query: str) -> tuple[str, bool]:
     if config.mode == "heuristic" and not looks_conversational(text):
         return text, False
 
-    async with _cache_lock:
-        cached = _cache.get(text)
-        if cached and cached[1] > time.monotonic():
-            return cached[0][0], True
-
-    target = _resolve_target(config)
+    target = _runtime_target()
     if target is None:
         if not _warned_no_target:
             _warned_no_target = True
             logger.warning(
-                "query rewriter enabled but no model to call (no explicit endpoint/model "
-                "and no active runtime model in %s) — queries pass through unchanged",
+                "query rewriter enabled but no active runtime model in %s; "
+                "queries pass through unchanged",
                 _RUNTIME_METADATA_FILE.name,
             )
         return text, False
+
+    cache_key = (target, text)
+    async with _cache_lock:
+        cached = _cache.get(cache_key)
+        if cached and cached[1] > time.monotonic():
+            return cached[0][0], True
 
     started = time.perf_counter()
     try:
@@ -254,7 +236,7 @@ async def rewrite_query(query: str) -> tuple[str, bool]:
         return text, False
 
     async with _cache_lock:
-        _cache[text] = (rewritten, time.monotonic() + _CACHE_TTL_SECONDS)
+        _cache[cache_key] = (rewritten, time.monotonic() + _CACHE_TTL_SECONDS)
     logger.info(
         "query rewriter: %r -> %r via %s/%s in %.1fs",
         text[:80], rewritten, target.flavor, target.model,
@@ -282,11 +264,7 @@ async def expanded_queries(query: str) -> list[str] | None:
         return None
     if config.mode == "heuristic" and not looks_conversational(text):
         return None
-    async with _cache_lock:
-        cached = _cache.get(text)
-        if cached and cached[1] > time.monotonic():
-            return cached[0] if len(cached[0]) > 1 else None
-    target = _resolve_target(config)
+    target = _runtime_target()
     if target is None:
         if not _warned_no_target:
             _warned_no_target = True
@@ -294,6 +272,11 @@ async def expanded_queries(query: str) -> list[str] | None:
                 "query rewriter enabled but no model to call — queries pass through unchanged",
             )
         return None
+    cache_key = (target, text)
+    async with _cache_lock:
+        cached = _cache.get(cache_key)
+        if cached and cached[1] > time.monotonic():
+            return cached[0] if len(cached[0]) > 1 else None
     try:
         rewritten = (await _call_model(target, config.timeout_seconds, text))[: config.max_queries]
     except Exception as exc:  # noqa: BLE001 — fail-open is the contract
@@ -308,9 +291,9 @@ async def expanded_queries(query: str) -> list[str] | None:
         # Cache single-variant results so a follow-up rewrite_query() at the
         # adapter does not pay a second model round-trip for the same thought.
         async with _cache_lock:
-            _cache[text] = (rewritten, time.monotonic() + _CACHE_TTL_SECONDS)
+            _cache[cache_key] = (rewritten, time.monotonic() + _CACHE_TTL_SECONDS)
         return None
     async with _cache_lock:
-        _cache[text] = (rewritten, time.monotonic() + _CACHE_TTL_SECONDS)
+        _cache[cache_key] = (rewritten, time.monotonic() + _CACHE_TTL_SECONDS)
     logger.info("query rewriter fan-out: %r -> %r", text[:80], rewritten)
     return rewritten

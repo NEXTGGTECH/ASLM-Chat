@@ -57,15 +57,21 @@ def test_non_object_settings_file_is_ignored(isolated_settings):
 
 
 # Removed legacy tool keys are silently dropped from loaded snapshots.
-def test_removed_tool_setting_keys_are_dropped(isolated_settings):
+@pytest.mark.parametrize("key", [
+    "sandbox-image-source",
+    "web-search-query-rewriter-endpoint",
+    "web-search-query-rewriter-model",
+])
+def test_removed_tool_setting_keys_are_dropped(isolated_settings, monkeypatch, key):
     isolated_settings.joinpath("settings_file.json").write_text(
-        json.dumps({"sandbox-image-source": "local", "ui-port": 20001}),
+        json.dumps({key: "legacy", "ui-port": 20001}),
         encoding="utf-8",
     )
+    monkeypatch.setenv(project_settings._to_env_var_name(key), "legacy-override")
 
     data = project_settings.load_settings()
 
-    assert "sandbox-image-source" not in data
+    assert key not in data
     assert data["ui-port"] == 20001
 
 
@@ -131,6 +137,26 @@ def test_save_settings_syncs_generated_tool_configs(isolated_settings):
         isolated_settings.joinpath("browser_agent_config_file.json").read_text(encoding="utf-8")
     )
     assert browser_doc["browser_headless"] is True
+
+
+# Synchronization removes old rewriter overrides while preserving JSON-only options.
+def test_save_settings_removes_legacy_query_rewriter_overrides(isolated_settings):
+    path = project_settings.WEB_SEARCH_CONFIG_FILE
+    path.write_text(json.dumps({"query_rewriter": {
+        "endpoint": "http://legacy.invalid/chat/completions",
+        "model": "legacy-model",
+        "timeout_seconds": 42,
+        "max_queries": 2,
+    }}), encoding="utf-8")
+
+    project_settings.save_settings({"web-search-query-rewriter-enabled": True})
+
+    section = json.loads(path.read_text(encoding="utf-8"))["query_rewriter"]
+    assert "endpoint" not in section
+    assert "model" not in section
+    assert section["enabled"] is True
+    assert section["timeout_seconds"] == 42
+    assert section["max_queries"] == 2
 
 
 # set() persists the value and mirrors it into the module manifest.
