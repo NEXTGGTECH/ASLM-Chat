@@ -86,7 +86,7 @@ WEB_SEARCH_CONFIG_SETTINGS = {
     "web-search-engine-qwant": ("engines", "qwant"),
     "web-search-engine-brave": ("engines", "brave"),
     "web-search-engine-yandex": ("engines", "yandex"),
-    "web-search-engine-legacy-yandex": ("engines", "legacy_yandex"),
+    "web-search-buffer-engine": ("buffer_engine", "enabled"),
     "web-search-image-engine-bing": ("image_engines", "bing"),
     "web-search-image-engine-brave": ("image_engines", "brave"),
     "web-search-image-engine-duckduckgo": ("image_engines", "duckduckgo"),
@@ -193,6 +193,7 @@ REMOVED_TOOL_SETTING_KEYS = frozenset(
         "web-search-query-rewriter-model",
         "web-search-profile-import-browsers",
         "web-search-profile-import-domains",
+        "web-search-engine-legacy-yandex",
         "sandbox-image-source",
         "sandbox-auto-start-docker",
     }
@@ -249,7 +250,7 @@ DEFAULTS: dict[str, Any] = {
     "web-search-engine-qwant": True,
     "web-search-engine-brave": True,
     "web-search-engine-yandex": False,
-    "web-search-engine-legacy-yandex": False,
+    "web-search-buffer-engine": True,
     "web-search-image-engine-bing": True,
     "web-search-image-engine-brave": True,
     "web-search-image-engine-duckduckgo": False,
@@ -649,6 +650,9 @@ def _write_web_search_config(settings_data: dict[str, Any]) -> None:
     payload = _load_web_search_config_payload()
     for key in ("endpoint", "model"):
         payload.get("query_rewriter", {}).pop(key, None)
+    # The legacy Yandex widget left the engines rotation for the buffer_engine
+    # section; prune the stale key so old installs stop carrying it.
+    payload.get("engines", {}).pop("legacy_yandex", None)
     for section_name, section_values in WEB_SEARCH_STATIC_CONFIG.items():
         payload.setdefault(section_name, {}).update(section_values)
 

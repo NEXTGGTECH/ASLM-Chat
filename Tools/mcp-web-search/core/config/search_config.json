@@ -40,8 +40,10 @@
         "startpage": true,
         "qwant": true,
         "brave": true,
-        "yandex": false,
-        "legacy_yandex": false
+        "yandex": false
+    },
+    "buffer_engine": {
+        "enabled": true
     },
     "hosted_api": {
         "tavily": "content",

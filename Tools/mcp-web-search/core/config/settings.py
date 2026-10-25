@@ -220,7 +220,6 @@ class EnginesSection:
     qwant: bool = True
     brave: bool = True
     yandex: bool = False
-    legacy_yandex: bool = False
 
     # {engine name: enabled} view for selection code.
     def as_map(self) -> dict[str, bool]:
@@ -231,8 +230,17 @@ class EnginesSection:
             "qwant": self.qwant,
             "brave": self.brave,
             "yandex": self.yandex,
-            "legacy_yandex": self.legacy_yandex,
         }
+
+
+@dataclass
+class BufferEngineSection:
+    """Emergency reserve engine (the legacy Yandex site-search widget).
+
+    The buffer never participates in normal tier rotation: select_engines fires it
+    only when every regular engine is switched off in config or blocked by its
+    circuit breaker, so a search still returns some results instead of none."""
+    enabled: bool = True
 
 
 @dataclass
@@ -250,6 +258,7 @@ class SearchConfig:
     rich_cards: RichCardsSection = field(default_factory=RichCardsSection)
     localization: LocalizationSection = field(default_factory=LocalizationSection)
     engines: EnginesSection = field(default_factory=EnginesSection)
+    buffer_engine: BufferEngineSection = field(default_factory=BufferEngineSection)
 
 
 _cached_config: SearchConfig | None = None
@@ -345,6 +354,7 @@ def load_search_config(path: Path | None = None) -> SearchConfig:
     im = raw.get("image_engines", {})
     rc = raw.get("rich_cards", {})
     g = raw.get("engines", {})
+    buf = raw.get("buffer_engine", {})
     _hosted_modes = {"content", "serp", "off"}
     _known_browsers = {"chrome", "edge", "brave", "firefox"}
     if isinstance(g, dict):
@@ -461,7 +471,9 @@ def load_search_config(path: Path | None = None) -> SearchConfig:
             qwant=bool(g.get("qwant", True)),
             brave=bool(g.get("brave", True)),
             yandex=bool(g.get("yandex", False)),
-            legacy_yandex=bool(g.get("legacy_yandex", False)),
+        ),
+        buffer_engine=BufferEngineSection(
+            enabled=bool(buf.get("enabled", True)),
         ),
     )
 

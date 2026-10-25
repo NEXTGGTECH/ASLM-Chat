@@ -284,31 +284,67 @@ def test_pacing_skipped_for_tolerant_engines():
 # --- engine selection ------------------------------------------------------------
 
 # All engines enabled — isolates breaker behaviour from the config layer.
-_ALL_ON = {n: True for n in ("google", "duckduckgo", "startpage", "qwant", "brave", "yandex", "legacy_yandex")}
+_ALL_ON = {n: True for n in ("google", "duckduckgo", "startpage", "qwant", "brave", "yandex")}
 
 
 def test_select_engines_low_default_pair():
     tracker = EngineHealthTracker(clock=_Clock())
-    names = [e.name for e in select_engines("low", tracker, enabled=_ALL_ON)]
-    assert names == ["yandex", "legacy_yandex", "duckduckgo"]
+    names = [e.name for e in select_engines("low", tracker, enabled=_ALL_ON, buffer=False)]
+    assert names == ["yandex", "duckduckgo"]
 
 
 def test_select_engines_low_falls_back_to_startpage():
     clock = _Clock()
     tracker = EngineHealthTracker(clock=clock)
     tracker.record("yandex", status="blocked", fetch_ms=100, results=0)
-    tracker.record("legacy_yandex", status="blocked", fetch_ms=100, results=0)
     tracker.record("duckduckgo", status="blocked", fetch_ms=100, results=0)
-    names = [e.name for e in select_engines("low", tracker, enabled=_ALL_ON)]
+    names = [e.name for e in select_engines("low", tracker, enabled=_ALL_ON, buffer=False)]
     assert names == ["startpage"]
 
 
 def test_select_engines_low_never_empty():
     clock = _Clock()
     tracker = EngineHealthTracker(clock=clock)
-    for engine in ("yandex", "legacy_yandex", "duckduckgo", "startpage"):
+    for engine in ("yandex", "duckduckgo", "startpage"):
         tracker.record(engine, status="blocked", fetch_ms=100, results=0)
-    names = [e.name for e in select_engines("low", tracker, enabled=_ALL_ON)]
+    names = [e.name for e in select_engines("low", tracker, enabled=_ALL_ON, buffer=False)]
+    assert names == ["duckduckgo"]  # first enabled lead, forced through an open breaker
+
+
+def test_select_engines_buffer_not_in_normal_rotation():
+    # The legacy Yandex widget is the emergency buffer: with regular engines alive
+    # it must never appear in any tier, even when the buffer switch is on.
+    tracker = EngineHealthTracker(clock=_Clock())
+    names = [e.name for e in select_engines("high", tracker, enabled=_ALL_ON, buffer=True)]
+    assert "legacy_yandex" not in names
+    assert "duckduckgo" in names
+
+
+def test_select_engines_buffer_fires_when_all_regular_dead():
+    # Every regular engine breaker-blocked → the buffer takes the load.
+    clock = _Clock()
+    tracker = EngineHealthTracker(clock=clock)
+    for engine in ("yandex", "duckduckgo", "startpage", "google", "qwant", "brave"):
+        tracker.record(engine, status="blocked", fetch_ms=100, results=0)
+    names = [e.name for e in select_engines("high", tracker, enabled=_ALL_ON, buffer=True)]
+    assert names == ["legacy_yandex"]
+
+
+def test_select_engines_buffer_fires_when_all_disabled():
+    # Every regular engine switched off in config → the buffer takes the load.
+    tracker = EngineHealthTracker(clock=_Clock())
+    all_off = {n: False for n in _ALL_ON}
+    names = [e.name for e in select_engines("low", tracker, enabled=all_off, buffer=True)]
+    assert names == ["legacy_yandex"]
+
+
+def test_select_engines_buffer_respects_own_breaker():
+    # The buffer itself blocked → selection falls through to the forced lead.
+    clock = _Clock()
+    tracker = EngineHealthTracker(clock=clock)
+    for engine in ("yandex", "duckduckgo", "startpage", "legacy_yandex"):
+        tracker.record(engine, status="blocked", fetch_ms=100, results=0)
+    names = [e.name for e in select_engines("low", tracker, enabled=_ALL_ON, buffer=True)]
     assert names == ["duckduckgo"]  # first enabled lead, forced through an open breaker
 
 
@@ -369,14 +405,14 @@ def test_select_engines_default_config_excludes_yandex_engines():
     assert "duckduckgo" in names  # the lead survives
 
 
-def test_select_engines_user_opts_yandex_engines_back_in():
+def test_select_engines_user_opts_native_yandex_back_in():
     from core.config.settings import EnginesSection
 
-    enabled = EnginesSection(yandex=True, legacy_yandex=True).as_map()
+    enabled = EnginesSection(yandex=True).as_map()
     tracker = EngineHealthTracker(clock=_Clock())
-    names = [e.name for e in select_engines("high", tracker, enabled=enabled)]
+    names = [e.name for e in select_engines("high", tracker, enabled=enabled, buffer=False)]
     assert "yandex" in names
-    assert "legacy_yandex" in names
+    assert "legacy_yandex" not in names  # buffer role only, never rotation
 
 
 def test_select_engines_disabled_engine_never_forced():
@@ -388,14 +424,14 @@ def test_select_engines_disabled_engine_never_forced():
     tracker = EngineHealthTracker(clock=clock)
     for engine in ("duckduckgo", "startpage"):
         tracker.record(engine, status="blocked", fetch_ms=100, results=0)
-    names = [e.name for e in select_engines("low", tracker, enabled=EnginesSection().as_map())]
+    names = [e.name for e in select_engines("low", tracker, enabled=EnginesSection().as_map(), buffer=False)]
     assert names == ["duckduckgo"]
 
 
 def test_select_engines_all_disabled_still_returns_lead():
     tracker = EngineHealthTracker(clock=_Clock())
     all_off = {n: False for n in _ALL_ON}
-    names = [e.name for e in select_engines("low", tracker, enabled=all_off)]
+    names = [e.name for e in select_engines("low", tracker, enabled=all_off, buffer=False)]
     assert names == ["duckduckgo"]  # misconfiguration guard: never return zero engines
 
 
@@ -405,12 +441,20 @@ def test_engines_config_section_loads(tmp_path):
     from core.config.settings import load_search_config
 
     cfg_path = tmp_path / "search_config.json"
-    cfg_path.write_text(_json.dumps({"engines": {"yandex": True, "brave": False}}), encoding="utf-8")
+    cfg_path.write_text(
+        _json.dumps({"engines": {"yandex": True, "brave": False}}), encoding="utf-8"
+    )
     cfg = load_search_config(cfg_path)
     assert cfg.engines.yandex is True      # user opt-in honoured
     assert cfg.engines.brave is False      # explicit off honoured
     assert cfg.engines.duckduckgo is True  # absent → default on
-    assert cfg.engines.legacy_yandex is False  # absent → default off
+    assert cfg.buffer_engine.enabled is True  # absent → buffer defaults on
+
+    cfg_path.write_text(
+        _json.dumps({"buffer_engine": {"enabled": False}}), encoding="utf-8"
+    )
+    cfg = load_search_config(cfg_path)
+    assert cfg.buffer_engine.enabled is False  # explicit off honoured
 
 
 # --- inline-parse policy (custom-domain scope + learned-slow) --------------------

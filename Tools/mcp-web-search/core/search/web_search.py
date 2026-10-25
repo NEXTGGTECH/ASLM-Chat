@@ -383,38 +383,49 @@ def _build_ui(sources: list[dict[str, Any]]) -> dict[str, Any]:
 # Pick engines for a tier, honoring the per-engine config switch and the circuit breaker.
 # Config is policy (an engine the user turned off never enters a tier — Yandex engines default
 # off, one flip re-enables them); the breaker is health. Never returns an empty list: low's
-# leads fall back to Startpage, and as a last resort the first ENABLED lead is forced even
-# through an open breaker. `enabled` overrides the config map (tests).
+# leads fall back to Startpage, then to the emergency buffer (the legacy Yandex widget,
+# buffer_engine.enabled), and as a last resort the first ENABLED lead is forced even
+# through an open breaker. `enabled`/`buffer` override the config maps (tests).
 def select_engines(
-    effort: str, tracker: EngineHealthTracker, *, enabled: dict[str, bool] | None = None
+    effort: str,
+    tracker: EngineHealthTracker,
+    *,
+    enabled: dict[str, bool] | None = None,
+    buffer: bool | None = None,
 ) -> list[type]:
-    if enabled is None:
-        from core.config import load_search_config
+    from core.config import load_search_config
 
-        enabled = load_search_config().engines.as_map()
+    cfg = load_search_config()
+    if enabled is None:
+        enabled = cfg.engines.as_map()
+    if buffer is None:
+        buffer = cfg.buffer_engine.enabled
 
     def on(parser: type) -> bool:
         return bool(enabled.get(parser.name, True))
 
     selected: list[type] = []
 
-    # low core: DDG (lead) + Yandex engines (opt-in), breaker-gated. The legacy
-    # widget rides the same tier: opt-in by config, paced by its own breaker row.
+    # low core: DDG (lead) + native Yandex (opt-in), breaker-gated. The legacy
+    # Yandex widget is NOT part of rotation — it is the emergency buffer below.
     if on(YandexParser) and tracker.allow(YandexParser.name):
         selected.append(YandexParser)
-    if on(LegacyYandexParser) and tracker.allow(LegacyYandexParser.name):
-        selected.append(LegacyYandexParser)
     if on(DuckDuckGoParser) and tracker.allow(DuckDuckGoParser.name):
         selected.append(DuckDuckGoParser)
     if not selected:
         # Leads are cooling down or switched off — pull the reserve.
         if on(StartpageParser) and tracker.allow(StartpageParser.name):
             selected.append(StartpageParser)
+        elif buffer and tracker.allow(LegacyYandexParser.name):
+            # Emergency buffer: every regular engine is off in config or blocked by
+            # its breaker — the legacy Yandex widget takes the load so the search
+            # still returns results instead of none.
+            selected.append(LegacyYandexParser)
         else:
             # Forced: low must never be empty. First enabled lead wins; an all-off
             # config is a misconfiguration and still gets DDG rather than nothing.
             forced = next(
-                (p for p in (DuckDuckGoParser, StartpageParser, YandexParser, LegacyYandexParser, GoogleParser) if on(p)),
+                (p for p in (DuckDuckGoParser, StartpageParser, YandexParser, GoogleParser) if on(p)),
                 DuckDuckGoParser,
             )
             selected.append(forced)

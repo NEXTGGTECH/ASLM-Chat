@@ -628,6 +628,17 @@
             "category": "web-search-engines"
         },
         {
+            "key": "web-search-buffer-engine",
+            "name": "Emergency Search Fallback (Yandex legacy widget)",
+            "description": "Enable fallback search when all regular engines are unavailable",
+            "type": "bool",
+            "default": true,
+            "engine": "python-runtime",
+            "getExec": "main.py get_setting --key web-search-buffer-engine",
+            "setExec": "main.py set_setting --key web-search-buffer-engine --value {value}",
+            "category": "web-search-engines"
+        },
+        {
             "key": "web-search-profile-import-enabled",
             "name": "Enable browser profile import",
             "description": "Import cookies from Chrome/Edge/Brave/Firefox",
@@ -1035,16 +1046,6 @@
             "getExec": "main.py get_setting --key sandbox-docker-start-timeout-seconds",
             "setExec": "main.py set_setting --key sandbox-docker-start-timeout-seconds --value {value}",
             "category": "sandbox"
-        },
-        {
-            "key": "web-search-engine-legacy-yandex",
-            "name": "Yandex (legacy site-search widget)",
-            "type": "bool",
-            "default": false,
-            "engine": "python-runtime",
-            "getExec": "main.py get_setting --key web-search-engine-legacy-yandex",
-            "setExec": "main.py set_setting --key web-search-engine-legacy-yandex --value {value}",
-            "category": "web-search-engines"
         },
         {
             "key": "web-search-image-engine-bing",
