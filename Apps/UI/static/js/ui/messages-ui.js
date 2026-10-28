@@ -1547,27 +1547,76 @@ export function createMessagesUi(context, dependencies) {
     return '';
   }
 
+  function imageThumbSrc(image) {
+    return String((image && (image.thumbnail_url || image.image_url)) || '');
+  }
+
+  function renderImageLinkHtml(image, query, className, extraHtml) {
+    const thumb = imageThumbSrc(image);
+    if (!thumb) {
+      return '';
+    }
+    const page = String((image && image.page_url) || '');
+    const title = String((image && image.title) || query || '');
+    const openAttrs = page
+      ? ` href="${escapeAttributeValue(page)}" target="_blank" rel="noopener noreferrer"`
+      : '';
+    return `
+      <a class="${className}"${openAttrs} title="${escapeAttributeValue(title)}">
+        <img src="${escapeAttributeValue(thumb)}" alt="${escapeAttributeValue(title)}" loading="lazy" />
+        ${extraHtml || ''}
+      </a>
+    `;
+  }
+
   function renderImageRowHtml(images, query) {
     const items = (images || []).slice(0, 12).map(function oneThumb(image) {
-      const thumb = String((image && (image.thumbnail_url || image.image_url)) || '');
-      if (!thumb) {
-        return '';
-      }
-      const page = String((image && image.page_url) || '');
-      const title = String((image && image.title) || query || '');
-      const openAttrs = page
-        ? ` href="${escapeAttributeValue(page)}" target="_blank" rel="noopener noreferrer"`
-        : '';
-      return `
-        <a class="msg-image-thumb"${openAttrs} title="${escapeAttributeValue(title)}">
-          <img src="${escapeAttributeValue(thumb)}" alt="${escapeAttributeValue(title)}" loading="lazy" />
-        </a>
-      `;
+      return renderImageLinkHtml(image, query, 'msg-image-thumb', '');
     }).filter(Boolean).join('');
     if (!items) {
       return '';
     }
     return `<div class="msg-image-row">${items}</div>`;
+  }
+
+  // Thinking-mode image_search card: one large lead tile plus up to four smaller
+  // tiles; results beyond the mosaic collapse into a "+N" badge on the last tile.
+  const IMAGE_MOSAIC_TILES = 5;
+
+  function renderImageMosaicHtml(images, query) {
+    const usable = (images || []).filter(function hasThumb(image) {
+      return !!imageThumbSrc(image);
+    });
+    if (usable.length === 0) {
+      return '';
+    }
+    const shown = usable.slice(0, IMAGE_MOSAIC_TILES);
+    const hiddenCount = usable.length - shown.length;
+    const tiles = shown.map(function oneTile(image, index) {
+      const moreHtml = hiddenCount > 0 && index === shown.length - 1
+        ? `<span class="msg-image-more">+${hiddenCount}</span>`
+        : '';
+      return renderImageLinkHtml(image, query, 'msg-image-tile', moreHtml);
+    }).join('');
+    return `<div class="msg-image-mosaic" data-count="${shown.length}">${tiles}</div>`;
+  }
+
+  // In instant mode the answer's own [[images: …]] gallery replaces the
+  // image_search card, so the card is dropped once the answer cites images.
+  function withoutCitedInstantImageCards(segments) {
+    const tokenTest = new RegExp(IMAGE_TOKEN_RE.source, 'm');
+    const citesImages = segments.some(function hasImageToken(segment) {
+      return !!segment && segment.type === 'text' && tokenTest.test(String(segment.content || ''));
+    });
+    if (!citesImages) {
+      return segments;
+    }
+    return segments.filter(function keepSegment(segment) {
+      return !(segment
+        && segment.type === 'tool'
+        && isImageSearchToolSegment(segment)
+        && isInstantSearchFlowSegment(segment));
+    });
   }
 
   // Resolved rows live briefly in sessionStorage so reopening the same chat
@@ -2406,8 +2455,11 @@ export function createMessagesUi(context, dependencies) {
         : `Searching images for ${query || 'query'}`;
     const pendingHtml = hasResult ? '' : '<span class="msg-search-pending-dot"></span>';
     const iconHtml = icons.WEB_SEARCH_ICON || icons.TOOL_SEARCH_ICON || icons.GLOBE_ICON;
-    const galleryHtml = images.length > 0
-      ? `<div class="msg-image-gallery">${renderImageRowHtml(images, query)}</div>`
+    const galleryInnerHtml = isInstantSearchFlowSegment(segment)
+      ? renderImageRowHtml(images, query)
+      : renderImageMosaicHtml(images, query);
+    const galleryHtml = galleryInnerHtml
+      ? `<div class="msg-image-gallery">${galleryInnerHtml}</div>`
       : '';
     const searchKey = searchSegmentKey(segment, toolSegmentIndex);
     const searchKeyAttr = searchKey ? ` data-search-key="${escapeAttributeValue(searchKey)}"` : '';
@@ -6376,6 +6428,7 @@ export function createMessagesUi(context, dependencies) {
         return !(segment && segment.type === 'thought');
       });
     }
+    renderSegments = withoutCitedInstantImageCards(renderSegments);
     if (deepResearchUi && typeof deepResearchUi.ingestTimeline === 'function') {
       deepResearchUi.ingestTimeline(renderSegments);
     }

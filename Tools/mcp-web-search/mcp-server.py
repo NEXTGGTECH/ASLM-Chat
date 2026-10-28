@@ -456,11 +456,34 @@ def _store_image_result(query: str, limit: int, payload: dict[str, Any]) -> None
     )
 
 
+def _image_engine_summary(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Compact per-engine diagnostics for the image-search logs."""
+
+    summary: list[dict[str, Any]] = []
+    for name, engine in (payload.get("engines") or {}).items():
+        if not isinstance(engine, dict):
+            continue
+        summary.append({
+            "engine": str(name),
+            "status": engine.get("status"),
+            "http_status": engine.get("http_status"),
+            "fetch_ms": engine.get("fetch_ms"),
+            "transport": engine.get("transport"),
+            "results": len(engine.get("sources") or []),
+        })
+    return summary
+
+
 async def _call_image_search(args: dict[str, Any]) -> dict[str, Any]:
     from core.search.image_search import ImageSearchService
 
     query = " ".join(str(args.get("query") or "").split())
     if not query:
+        logger.warning("mcp.image_search.rejected reason=empty_query args=%r", args)
+        write_search_io_event(
+            {"layer": "mcp_adapter", "phase": "image_search.error", "tool_id": "image_search",
+             "query": "", "error": "empty query"}
+        )
         return {
             "ui": {"kind": "image_search", "status": "error", "images": [], "error": "empty query"},
             "tool_ui": {"kind": "image_search", "status": "error", "images": []},
@@ -473,16 +496,36 @@ async def _call_image_search(args: dict[str, Any]) -> dict[str, Any]:
 
     cached = _cached_image_result(query, limit)
     if cached is not None:
-        logger.info("mcp.image_search.cache hit query=%r", query[:120])
+        cached_count = int((cached.get("ui") or {}).get("result_count") or 0)
+        logger.info("mcp.image_search.cache_hit query=%r limit=%d count=%d", query[:120], limit, cached_count)
+        write_search_io_event(
+            {"layer": "mcp_adapter", "phase": "image_search.result", "tool_id": "image_search",
+             "query": query, "limit": limit, "cached": True, "result_count": cached_count}
+        )
         return cached
 
+    logger.info("mcp.image_search.start query=%r limit=%d", query[:120], limit)
+    write_search_io_event(
+        {"layer": "mcp_adapter", "phase": "image_search.request", "tool_id": "image_search",
+         "query": query, "limit": limit}
+    )
     started = time.perf_counter()
     try:
         payload = await ImageSearchService().search(
             query, limit=limit, timeout_seconds=8.0
         )
     except Exception as exc:  # noqa: BLE001 — the tool must fail soft
-        logger.warning("mcp.image_search.failed query=%r error=%s", query[:120], exc)
+        elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
+        logger.warning(
+            "mcp.image_search.failed query=%r took=%.0fms error=%s: %s",
+            query[:120], elapsed_ms, type(exc).__name__, exc,
+            exc_info=True,
+        )
+        write_search_io_event(
+            {"layer": "mcp_adapter", "phase": "image_search.error", "tool_id": "image_search",
+             "query": query, "limit": limit, "elapsed_ms": elapsed_ms,
+             "error": f"{type(exc).__name__}: {exc}"[:400]}
+        )
         return {
             "ui": {"kind": "image_search", "status": "error", "images": [], "error": str(exc)[:200]},
             "tool_ui": {"kind": "image_search", "status": "error", "images": []},
@@ -512,14 +555,35 @@ async def _call_image_search(args: dict[str, Any]) -> dict[str, Any]:
         "result_count": len(images),
         "images": images,
     }
+    elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
+    engines_summary = _image_engine_summary(payload)
     write_search_io_event(
         {"layer": "mcp_adapter", "phase": "image_search.result", "tool_id": "image_search",
-         "query": query, "result_count": len(images)}
+         "query": query, "limit": limit, "cached": False,
+         "region": payload.get("region") or "", "language": payload.get("language") or "",
+         "elapsed_ms": elapsed_ms, "result_count": len(images),
+         "engines": engines_summary,
+         "images": [
+             {"id": item["id"], "title": item["title"][:120], "image_url": item["image_url"],
+              "page_url": item["page_url"], "engines": item["engines"]}
+             for item in images
+         ]}
     )
     logger.info(
-        "mcp.image_search.done status=%s count=%d took=%.0fms",
-        ui["status"], len(images), (time.perf_counter() - started) * 1000,
+        "mcp.image_search.done query=%r status=%s count=%d region=%s took=%.0fms engines=%s",
+        query[:120], ui["status"], len(images), payload.get("region") or "-", elapsed_ms,
+        ", ".join(
+            f"{item['engine']}:{item['status']}/{item['http_status'] or '-'}/{item['results']}"
+            for item in engines_summary
+        ) or "-",
     )
+    for item in engines_summary:
+        if item["status"] not in {"success", "partial"} or not item["results"]:
+            logger.warning(
+                "mcp.image_search.engine_issue query=%r engine=%s status=%s http=%s fetch=%sms results=%d",
+                query[:120], item["engine"], item["status"], item["http_status"],
+                item["fetch_ms"], item["results"],
+            )
     # The model-facing result stays compact: it sees URLs + metadata and can fetch
     # any image itself when it is multimodal; the rich gallery is UI-only.
     result_lines = [

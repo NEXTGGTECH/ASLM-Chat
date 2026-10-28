@@ -247,7 +247,11 @@ class ResearchV2Tests(unittest.TestCase):
         self.assertEqual(len(web_calls), 1)
         self.assertTrue(
             all(
-                len(call.args[2]["queries"]) <= orchestrator.MAX_QUERIES_PER_ITERATION
+                len(
+                    call.args[2]["query"]
+                    if isinstance(call.args[2]["query"], list)
+                    else [call.args[2]["query"]]
+                ) <= orchestrator.MAX_QUERIES_PER_ITERATION
                 for call in web_calls
             )
         )
@@ -409,25 +413,43 @@ class ResearchV2Tests(unittest.TestCase):
         self.assertEqual(result["sources"], [])
         call_tool.assert_not_called()
 
-    def test_model_written_search_operators_are_structured_without_losing_slot(self) -> None:
-        arguments = orchestrator._tool_query_arguments(
+    def test_search_calls_follow_simple_web_search_contract(self) -> None:
+        calls = orchestrator._tool_search_calls(
             [
                 {
-                    "text": 'site:docs.python.org "free-threaded mode" filetype:html -forum',
+                    "text": 'site:docs.python.org "free-threaded mode" -forum',
                     "vertical": "web",
                     "purpose": "Find official documentation",
-                }
+                },
+                {
+                    "text": "transformer attention complexity",
+                    "vertical": "academic",
+                    "purpose": "Find papers",
+                },
             ],
             1,
         )
 
-        query = arguments["queries"][0]
-        self.assertNotIn("site:", query["text"])
-        self.assertNotIn("filetype:", query["text"])
-        self.assertEqual(query["operators"]["site_include"], ["docs.python.org"])
-        self.assertEqual(query["operators"]["file_types"], ["html"])
-        self.assertEqual(query["operators"]["exact_phrases"], ["free-threaded mode"])
-        self.assertEqual(query["operators"]["exclude_terms"], ["forum"])
+        # One call per vertical: a call carries a single vertical under the
+        # simple web_search contract.
+        self.assertEqual(
+            [call["vertical"] for call in calls],
+            ["web", "academic"],
+        )
+        web_call = calls[0]
+        self.assertEqual(
+            set(web_call),
+            {"query", "vertical", "effort", "description"},
+        )
+        self.assertEqual(web_call["query"], 'site:docs.python.org "free-threaded mode" -forum')
+        self.assertEqual(web_call["effort"], "medium")
+        self.assertEqual(web_call["description"], "Find official documentation")
+
+        single = orchestrator._tool_search_calls(
+            [{"text": "python asyncio tutorial", "vertical": "web", "purpose": ""}],
+            2,
+        )
+        self.assertEqual(single[0]["query"], "python asyncio tutorial")
 
     def test_research_waits_for_explicit_approval_before_any_search(self) -> None:
         session_id = "deep-research:10000000000000000000000000000001"
@@ -870,15 +892,18 @@ class ResearchV2Tests(unittest.TestCase):
             mock.patch.object(orchestrator.llm_api, "generate", side_effect=fake_generate)
         )
 
+        search_calls: list[dict] = []
+
         def fake_tool(_lookup, alias, arguments, context=None):
             del context
             timeline.append(f"tool:{alias}")
             if alias == "web_search__web_search":
+                # Mixed web/academic selection: one simple-shape call per vertical.
                 self.assertEqual(
-                    [query["text"] for query in arguments["queries"]],
-                    ["query one", "query two"],
+                    set(arguments),
+                    {"query", "vertical", "effort", "description"},
                 )
-                self.assertLessEqual(len(arguments["queries"]), 2)
+                search_calls.append(arguments)
             return _source_result()
 
         call_tool = self.enterContext(
@@ -892,7 +917,11 @@ class ResearchV2Tests(unittest.TestCase):
         result = self._run(session_id, auto_approve=True)
 
         self.assertEqual(result["ui"]["queries_used"], 2)
-        self.assertEqual(call_tool.call_count, 1)
+        self.assertEqual(len(search_calls), 2)
+        self.assertEqual(
+            {(call["vertical"], call["query"]) for call in search_calls},
+            {("web", "query one"), ("academic", "query two")},
+        )
         self.assertEqual(timeline[-1], "model:synthesis")
         self.assertIn("tool:web_search__web_search", timeline[:-1])
 

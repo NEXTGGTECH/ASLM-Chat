@@ -896,99 +896,34 @@ def _read_citation_map(
     return "Citation mapping for the full pages below:\n" + "\n".join(lines)
 
 
-def _structured_search_text(value: Any) -> tuple[str, dict[str, Any]]:
-    """Move common model-written operators out of advanced query text."""
+def _tool_search_calls(queries: list[dict[str, str]], iteration: int) -> list[dict[str, Any]]:
+    """Build one simple-shape web_search call per vertical.
 
-    text = _normalize_query_text(value)
-    operators: dict[str, Any] = {}
-    list_fields = {
-        "site": "site_include",
-        "-site": "site_exclude",
-        "filetype": "file_types",
-        "intitle": "title_terms",
-        "inurl": "url_terms",
-    }
-    operator_pattern = re.compile(
-        r'(?<!\S)(-?site|filetype|intitle|inurl|after|before):(?:"([^"]+)"|(\S+))',
-        flags=re.I,
-    )
-
-    def move_operator(match: re.Match[str]) -> str:
-        prefix = match.group(1).casefold()
-        raw_value = (match.group(2) or match.group(3) or "").strip(" \t\r\n,;()[]{}")
-        if not raw_value:
-            return " "
-        if prefix in {"after", "before"}:
-            operators[prefix] = raw_value[:10]
-        else:
-            field = list_fields[prefix]
-            values = operators.setdefault(field, [])
-            if raw_value not in values:
-                limit = 253 if "site" in field else (12 if field == "file_types" else 80)
-                values.append(raw_value[:limit])
-        return " "
-
-    text = operator_pattern.sub(move_operator, text)
-
-    exact_phrases: list[str] = []
-
-    def move_phrase(match: re.Match[str]) -> str:
-        phrase = re.sub(r"\s+", " ", match.group(1)).strip()
-        if phrase and phrase not in exact_phrases and len(exact_phrases) < 4:
-            exact_phrases.append(phrase[:120])
-        return " "
-
-    text = re.sub(r'"([^"]+)"', move_phrase, text)
-    if exact_phrases:
-        operators["exact_phrases"] = exact_phrases
-
-    excluded_terms: list[str] = []
-
-    def move_exclusion(match: re.Match[str]) -> str:
-        term = match.group(1).strip()
-        if term and term not in excluded_terms and len(excluded_terms) < 6:
-            excluded_terms.append(term[:80])
-        return " "
-
-    text = re.sub(r"(?<!\S)-([\w.-]+)", move_exclusion, text)
-    if excluded_terms:
-        operators["exclude_terms"] = excluded_terms
-
-    text = re.sub(r"(?<!\S)OR(?!\S)", " ", text, flags=re.I)
-    text = re.sub(r"[()\[\]{}]+", " ", text)
-    text = _normalize_query_text(text)
-    if not text:
-        fallback_terms = [
-            str(item)
-            for key, raw in operators.items()
-            for item in (raw if isinstance(raw, list) else [raw])
-            if key not in {"site_include", "site_exclude", "file_types", "after", "before"}
-        ]
-        text = _normalize_query_text(" ".join(fallback_terms)) or "authoritative source"
-    return text, operators
-
-
-def _tool_query_arguments(queries: list[dict[str, str]], iteration: int) -> dict[str, Any]:
+    The web-search contract accepts ``{"query", "vertical", "effort",
+    "description"}`` where ``query`` is one plain string or a short list of
+    strings and search operators (site:, quoted phrases, -term) stay inline in
+    the text.  A call carries a single vertical, so a mixed web/academic/
+    shopping batch splits into consecutive calls.
+    """
     description = next(
         (str(query.get("purpose") or "").strip() for query in queries if query.get("purpose")),
         f"Investigating evidence gap {iteration}",
     )
     description = re.sub(r"\s+", " ", description).strip()[:76] or "Investigating evidence gap"
-    canonical_queries: list[dict[str, Any]] = []
+    grouped: dict[str, list[str]] = {}
     for query in queries[:MAX_QUERIES_PER_ITERATION]:
-        text, operators = _structured_search_text(query.get("text"))
-        item: dict[str, Any] = {
-            "vertical": _safe_vertical(query.get("vertical")),
-            "text": text,
+        text = _normalize_query_text(query.get("text"))
+        if text:
+            grouped.setdefault(_safe_vertical(query.get("vertical")), []).append(text)
+    return [
+        {
+            "query": texts if len(texts) > 1 else texts[0],
+            "vertical": vertical,
+            "effort": "medium",
+            "description": description,
         }
-        if operators:
-            item["operators"] = operators
-        canonical_queries.append(item)
-    return {
-        "description": description,
-        "queries": canonical_queries,
-        "effort": "medium",
-    }
+        for vertical, texts in grouped.items()
+    ]
 
 
 def _safe_source_preview(source: Mapping[str, Any]) -> dict[str, Any]:
@@ -1760,35 +1695,42 @@ def run_deep_research_v2(
                 plan_version=plan_version,
                 data={"queries": unique_selected},
             )
-            search_args = _tool_query_arguments(unique_selected, iteration)
-            try:
-                search_result = tool_registry.call_ollama_tool(
-                    tool_lookup,
-                    "web_search__web_search",
-                    search_args,
-                    context=tool_context,
+            search_sources: list[dict[str, Any]] = []
+            search_context_parts: list[str] = []
+            for search_args in _tool_search_calls(unique_selected, iteration):
+                try:
+                    search_result = tool_registry.call_ollama_tool(
+                        tool_lookup,
+                        "web_search__web_search",
+                        search_args,
+                        context=tool_context,
+                    )
+                    search_structured = _structured_result(search_result)
+                except Exception as exc:
+                    search_structured = {
+                        "model_context": f"Search failed without ending the session: {type(exc).__name__}: {exc}",
+                        "sources": [],
+                    }
+                # Citation handles restart at the same IDs in every worker call,
+                # so each call is normalized to session handles before merging.
+                call_sources, call_handle_map = citation_registry.normalize_sources(
+                    [
+                        dict(source)
+                        for source in search_structured.get("sources", [])
+                        if isinstance(source, dict)
+                    ]
                 )
-                search_structured = _structured_result(search_result)
-            except Exception as exc:
-                search_structured = {
-                    "model_context": f"Search failed without ending the session: {type(exc).__name__}: {exc}",
-                    "sources": [],
-                }
-            if _cancel_requested(session_id):
-                raise ResearchCancelled()
-            raw_search_sources = [
-                dict(source)
-                for source in search_structured.get("sources", [])
-                if isinstance(source, dict)
-            ]
-            search_sources, search_handle_map = citation_registry.normalize_sources(
-                raw_search_sources
-            )
+                search_sources.extend(call_sources)
+                call_context = _remap_citation_handles(
+                    str(search_structured.get("model_context") or "").strip(),
+                    call_handle_map,
+                )
+                if call_context:
+                    search_context_parts.append(call_context)
+                if _cancel_requested(session_id):
+                    raise ResearchCancelled()
             added_sources = _merge_sources(sources_by_key, search_sources)
-            search_context = _remap_citation_handles(
-                str(search_structured.get("model_context") or "").strip(),
-                search_handle_map,
-            )
+            search_context = "\n\n".join(search_context_parts)
             if search_context:
                 evidence_entries.append(
                     {

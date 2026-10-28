@@ -3360,6 +3360,12 @@ def image_search_api(request):
     else:
         ui = payload.get("ui") if isinstance(payload, dict) else None
     images = (ui or {}).get("images") if isinstance(ui, dict) else None
+    logger.info(
+        "Inline image token resolved: query=%r status=%s count=%d",
+        query[:120],
+        (ui or {}).get("status") if isinstance(ui, dict) else "unparsed",
+        len(images or []),
+    )
     return JsonResponse({
         "ok": True,
         "query": query,
