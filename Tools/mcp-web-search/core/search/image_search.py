@@ -113,6 +113,10 @@ class ImageSearchService:
                 region=resolved_region,
                 safesearch=safesearch,
                 timelimit=timelimit,
+                # One cookieless re-roll per engine: image engines soft-block a
+                # flagged session (Bing's empty shell, DDG's JSON challenge) and a
+                # fresh cookie jar usually recovers it.
+                engine_blocked_retries={parser.name: 1 for parser in selected},
                 deadline_seconds=timeout_seconds,
             ):
                 if event["type"] == "engine":

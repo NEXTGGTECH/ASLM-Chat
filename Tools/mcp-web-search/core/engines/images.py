@@ -5,8 +5,8 @@
 Ported from ASLM-Search (four of its seven engines): qwant/dogpile/google-wml
 stay unported — all three are hard-blocked by DataDome/CloudFront/403 on most
 residential networks today and would only rot here.
-Live-checked defaults: bing + brave + openverse; duckduckgo ships config-off
-because its anti-bot (botnet_challenge) blocks most networks.
+Live-checked defaults (2026-10-28): bing + brave + duckduckgo; openverse ships
+config-off because it times out on every request.
 """
 
 from __future__ import annotations
@@ -129,6 +129,15 @@ def _parse_result(
     )
 
 
+# Headers a browser sends only on top-level navigations, never on XHR/fetch.
+_NAVIGATION_ONLY_HEADERS = frozenset(
+    {"Sec-Fetch-User", "Upgrade-Insecure-Requests", "Cache-Control"}
+)
+
+# A real Bing async results page is hundreds of KB; the soft-block shell is ~1 KB.
+_BING_SHELL_MAX_BYTES = 8_000
+
+
 class BingImagesParser:
     name = "bing_images"
     provider_family = "bing"
@@ -205,17 +214,22 @@ class BingImagesParser:
             else:
                 images.append(image)
         lowered = document.casefold()
+        # Bing soft-blocks a flagged session silently: HTTP 200 with a script-only
+        # shell and no result cards. A fresh cookie jar recovers it (verified live),
+        # so report it as BLOCKED to trigger the cookieless retry.
+        soft_blocked = not cards and 0 < len(document) < _BING_SHELL_MAX_BYTES
         return _parse_result(
             self.name,
             images,
             cards_seen=len(cards),
             malformed=malformed,
             variant="metadata_cards",
-            blocked=any(
+            blocked=soft_blocked or any(
                 marker in lowered
                 for marker in ("challenge-platform", "verify you are human", "/captcha/")
             ),
             changed=not cards and bool(document.strip()),
+            diagnostics=["empty result shell (soft block)"] if soft_blocked else None,
         )
 
 
@@ -342,16 +356,24 @@ class DuckDuckGoImagesParser:
         accept_language = accept_language_for(language, country)
         if accept_language:
             extra["Accept-Language"] = accept_language
-        return EngineRequest(
-            method="GET",
-            url=DuckDuckGoImagesParser.search_url,
-            params=params,
-            headers=build_nav_headers(
+        # i.js is an XHR, not a navigation. A real browser never sends the
+        # navigation-only headers on it, and DDG's anti-bot answers any request
+        # carrying Sec-Fetch-User with a 202 JSON challenge (verified live).
+        headers = {
+            name: value
+            for name, value in build_nav_headers(
                 profile,
                 referer=DuckDuckGoImagesParser.home_url,
                 sec_fetch_site="same-origin",
                 extra=extra,
-            ),
+            ).items()
+            if name not in _NAVIGATION_ONLY_HEADERS
+        }
+        return EngineRequest(
+            method="GET",
+            url=DuckDuckGoImagesParser.search_url,
+            params=params,
+            headers=headers,
             cookies=cookies,
             primp_target=profile.primp_target,
             primp_os=profile.primp_os,
@@ -381,6 +403,17 @@ class DuckDuckGoImagesParser:
                 ),
                 changed=True,
                 diagnostics=[f"Invalid JSON response: {exc}"],
+            )
+        if isinstance(payload, dict) and isinstance(payload.get("challenge"), dict):
+            # HTTP 202 + {"challenge": {...}}: DDG's JSON anti-bot answer.
+            return _parse_result(
+                self.name,
+                [],
+                cards_seen=0,
+                malformed=0,
+                variant="json",
+                blocked=True,
+                diagnostics=["DuckDuckGo JSON challenge"],
             )
         rows = payload.get("results") if isinstance(payload, dict) else []
         rows = rows if isinstance(rows, list) else []

@@ -179,12 +179,13 @@ class RichCardsSection:
 @dataclass
 class ImageEnginesSection:
     """Kill switches for the image vertical (engines/images.py). Defaults follow the
-    2026-10 live check: bing/brave/openverse answer from residential networks,
-    duckduckgo's i.js sits behind the botnet_challenge wall."""
+    2026-10-28 live check: bing/brave/duckduckgo answer from residential networks
+    (DDG once i.js stopped sending navigation-only headers); openverse times out
+    on every request and would hold each image search until the deadline."""
     bing: bool = True
     brave: bool = True
-    duckduckgo: bool = False
-    openverse: bool = True
+    duckduckgo: bool = True
+    openverse: bool = False
 
     def as_map(self) -> dict[str, bool]:
         return {"bing": self.bing, "brave": self.brave,
@@ -459,8 +460,8 @@ def load_search_config(path: Path | None = None) -> SearchConfig:
         image_engines=ImageEnginesSection(
             bing=bool(im.get("bing", True)),
             brave=bool(im.get("brave", True)),
-            duckduckgo=bool(im.get("duckduckgo", False)),
-            openverse=bool(im.get("openverse", True)),
+            duckduckgo=bool(im.get("duckduckgo", True)),
+            openverse=bool(im.get("openverse", False)),
         ),
         rich_cards=RichCardsSection(
             enabled=bool(rc.get("enabled", False)),

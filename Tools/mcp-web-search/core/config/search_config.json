@@ -84,8 +84,8 @@
     "image_engines": {
         "bing": true,
         "brave": true,
-        "duckduckgo": false,
-        "openverse": true
+        "duckduckgo": true,
+        "openverse": false
     },
     "rich_cards": {
         "enabled": false,
