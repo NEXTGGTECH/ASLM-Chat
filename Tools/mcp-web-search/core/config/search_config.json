@@ -88,11 +88,14 @@
         "openverse": false
     },
     "rich_cards": {
-        "enabled": false,
+        "enabled": true,
         "wikipedia": true,
         "stackexchange": true,
-        "reddit": true,
+        "wiki": true,
+        "github": true,
+        "package": true,
         "max_cards": 3,
+        "scan_results": 8,
         "timeout_seconds": 2.0,
         "ttl_seconds": 86400.0,
         "negative_ttl_seconds": 900.0

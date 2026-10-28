@@ -151,7 +151,7 @@ async def _attach_rich_cards(result: dict[str, Any], queries: list[str]) -> dict
         config = load_search_config().rich_cards
         if not config.enabled:
             return result
-        from core.cards import RichCardService
+        from core.cards import RichCardService, insert_cards_context
 
         sources = result.get("sources") or []
         language = ""
@@ -161,16 +161,20 @@ async def _attach_rich_cards(result: dict[str, Any], queries: list[str]) -> dict
                 language = analyze_query(query).language
                 break
         service = RichCardService()
+        started = time.perf_counter()
         cards = await service.build(sources, config, language=language or "en")
-        discussions = service.build_discussions(sources, config)
-        ui = result.setdefault("ui", {})
-        if cards:
-            ui["rich_cards"] = cards
-        if discussions:
-            ui["discussions"] = discussions
+        cards_text = service.render(cards)
+        if cards_text:
+            # Model-facing only: the cards join the text the model reads, right
+            # before the source list, and cite the handles of those sources.
+            result["model_context"] = insert_cards_context(
+                str(result.get("model_context") or ""), cards_text
+            )
+            result["answer_cards"] = cards
         logger.info(
-            "mcp.web_search.rich_cards cards=%d discussions=%d",
-            len(cards), len(discussions.get("items", [])),
+            "mcp.web_search.answer_cards cards=%d kinds=%s took=%.0fms",
+            len(cards), ",".join(str(card.get("kind")) for card in cards) or "-",
+            (time.perf_counter() - started) * 1000,
         )
     except Exception as exc:  # noqa: BLE001 — enrichment must never fail a search
         logger.warning("rich cards skipped: %s", exc)

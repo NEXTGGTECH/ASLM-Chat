@@ -164,13 +164,17 @@ class HostedApiSection:
 # warm-browser fallback) and the legacy widget is Yandex's retired search product.
 @dataclass
 class RichCardsSection:
-    """Fail-open rich cards for top SERP results (core/cards). DEFAULT OFF: each
-    wikipedia card costs one extra API roundtrip per query; enable deliberately."""
-    enabled: bool = False
+    """Model-facing answer cards for top SERP results (core/cards): Wikidata facts,
+    accepted StackExchange answers, Fandom/MediaWiki infoboxes, GitHub repo status, PyPI/npm versions. Each
+    card adds at most `timeout_seconds` (cached afterwards) and fails open."""
+    enabled: bool = True
     wikipedia: bool = True
     stackexchange: bool = True
-    reddit: bool = True
+    wiki: bool = True
+    github: bool = True
+    package: bool = True
     max_cards: int = 3
+    scan_results: int = 8
     timeout_seconds: float = 2.0
     ttl_seconds: float = 86400.0
     negative_ttl_seconds: float = 900.0
@@ -464,11 +468,14 @@ def load_search_config(path: Path | None = None) -> SearchConfig:
             openverse=bool(im.get("openverse", False)),
         ),
         rich_cards=RichCardsSection(
-            enabled=bool(rc.get("enabled", False)),
+            enabled=bool(rc.get("enabled", True)),
             wikipedia=bool(rc.get("wikipedia", True)),
             stackexchange=bool(rc.get("stackexchange", True)),
-            reddit=bool(rc.get("reddit", True)),
+            wiki=bool(rc.get("wiki", True)),
+            github=bool(rc.get("github", True)),
+            package=bool(rc.get("package", True)),
             max_cards=int(rc.get("max_cards", 3)),
+            scan_results=int(rc.get("scan_results", 8)),
             timeout_seconds=float(rc.get("timeout_seconds", 2.0)),
             ttl_seconds=float(rc.get("ttl_seconds", 86400.0)),
             negative_ttl_seconds=float(rc.get("negative_ttl_seconds", 900.0)),
