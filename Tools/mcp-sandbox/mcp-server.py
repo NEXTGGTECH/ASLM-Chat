@@ -15,6 +15,7 @@ for _p in (_ROOT / "supervisor", _ROOT / "src"):
 # and API.mcp read them as module attributes from this entry module.
 from sandbox.api import MCP_SERVER, TOOL_HANDLERS, TOOLS, handle_tool  # noqa: F401
 from sandbox.config import IN_CONTAINER
+from sandbox.model_context import get_model_context  # noqa: F401
 from sandbox.temporal import run_temporal_bash
 
 # When imported host-side (e.g. by ASLM's tool_worker), wire bash execution

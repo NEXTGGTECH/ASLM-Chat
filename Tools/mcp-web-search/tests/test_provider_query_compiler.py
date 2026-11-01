@@ -76,7 +76,7 @@ def test_yandex_translates_structural_operators_and_exact_date():
 
 
 def test_conservative_providers_do_not_receive_unknown_title_url_or_date_syntax():
-    for provider in ("qwant", "yep", "tavily", "firecrawl"):
+    for provider in ("qwant", "legacy_yandex", "tavily", "firecrawl"):
         compiled = compile_provider_query(
             "OpenAI Codex features",
             _OPERATORS,

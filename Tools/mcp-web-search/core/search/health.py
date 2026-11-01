@@ -28,7 +28,7 @@ ERROR_COOLDOWN = 300.0
 # Stage C — polite per-engine min-interval between fires (seconds), applied on top of the
 # breaker. Even a healthy engine is not hit faster than this, with jitter so the cadence is
 # not a detectable metronome. Brave is the most rate-sensitive (429-prone, §1); tolerant
-# engines (DDG/Yep) pace at 0. The gate is cross-search: it skips an engine that fired too
+# engines (DDG) pace at 0. The gate is cross-search: it skips an engine that fired too
 # recently in a prior search, and a substitute of the same tier is used instead.
 _ENGINE_MIN_INTERVAL = {
     "brave": 6.0,
@@ -37,7 +37,7 @@ _ENGINE_MIN_INTERVAL = {
     "yandex": 1.5,
     "startpage": 1.5,
     "duckduckgo": 0.0,
-    "yep": 0.0,
+    "legacy_yandex": 1.5,
 }
 # Jitter band multiplied into the base interval, so two fires are never exactly N seconds apart.
 _PACE_JITTER = (0.8, 1.25)

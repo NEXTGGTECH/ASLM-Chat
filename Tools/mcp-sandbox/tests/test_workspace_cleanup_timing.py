@@ -106,7 +106,6 @@ class WorkspaceCleanupTimingTests(unittest.TestCase):
                     "root_entries": sorted(path.name for path in task_root.iterdir()),
                     "tmp_entries": tmp_entries,
                 }
-                print(json.dumps(summary, ensure_ascii=False), flush=True)
 
                 self.assertGreaterEqual(len(ticks), 2, summary)
                 self.assertTrue(intervals, summary)
@@ -119,5 +118,3 @@ class WorkspaceCleanupTimingTests(unittest.TestCase):
                 self.assertFalse((task_root / "timing-marker.txt").exists(), summary)
 
 
-if __name__ == "__main__":
-    unittest.main()

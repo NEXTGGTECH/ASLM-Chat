@@ -61,7 +61,7 @@ class BrowserClient:
     # Cached readiness: a raw /health probe, plus a lazy autostart on the first miss.
     async def _daemon_ready(self) -> bool:
         now = time.monotonic()
-        if now - self._health_checked_at < _HEALTH_TTL:
+        if self._health_checked_at and now - self._health_checked_at < _HEALTH_TTL:
             return self._health_ok
         self._health_checked_at = now
         ok = await self._probe()
@@ -85,7 +85,8 @@ class BrowserClient:
             if await self._probe():            # another caller won the race
                 return True
             now = time.monotonic()
-            if now - self._spawn_attempted_at < _SPAWN_THROTTLE:
+            # Zero means no previous attempt, including just after an OS/WSL startup.
+            if self._spawn_attempted_at and now - self._spawn_attempted_at < _SPAWN_THROTTLE:
                 return False
             self._spawn_attempted_at = now
             self._spawn_process()

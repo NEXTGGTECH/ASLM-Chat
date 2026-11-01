@@ -37,11 +37,12 @@ from ..engines import (
     QwantParser,
     StartpageParser,
     YandexParser,
-    YepParser,
 )
+from core.engines.yandex import LegacyYandexParser
 from core.cache.source_cache import canonicalize_url
 from .health import EngineHealthTracker, get_health_tracker
-from .quality import infer_query_language, markdown_meta_date
+from .quality import markdown_meta_date
+from .query_locales import analyze_query
 from .serp_api import SerpApi, _get_transport
 from .triage import TriageAction, TriageSession
 
@@ -380,24 +381,33 @@ def _build_ui(sources: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 # Pick engines for a tier, honoring the per-engine config switch and the circuit breaker.
-# Config is policy (an engine the user turned off never enters a tier — Yandex/Yep default
+# Config is policy (an engine the user turned off never enters a tier — Yandex engines default
 # off, one flip re-enables them); the breaker is health. Never returns an empty list: low's
-# leads fall back to Startpage, and as a last resort the first ENABLED lead is forced even
-# through an open breaker. `enabled` overrides the config map (tests).
+# leads fall back to Startpage, then to the emergency buffer (the legacy Yandex widget,
+# buffer_engine.enabled), and as a last resort the first ENABLED lead is forced even
+# through an open breaker. `enabled`/`buffer` override the config maps (tests).
 def select_engines(
-    effort: str, tracker: EngineHealthTracker, *, enabled: dict[str, bool] | None = None
+    effort: str,
+    tracker: EngineHealthTracker,
+    *,
+    enabled: dict[str, bool] | None = None,
+    buffer: bool | None = None,
 ) -> list[type]:
-    if enabled is None:
-        from core.config import load_search_config
+    from core.config import load_search_config
 
-        enabled = load_search_config().engines.as_map()
+    cfg = load_search_config()
+    if enabled is None:
+        enabled = cfg.engines.as_map()
+    if buffer is None:
+        buffer = cfg.buffer_engine.enabled
 
     def on(parser: type) -> bool:
         return bool(enabled.get(parser.name, True))
 
     selected: list[type] = []
 
-    # low core: DDG (lead) + Yandex (opt-in), breaker-gated.
+    # low core: DDG (lead) + native Yandex (opt-in), breaker-gated. The legacy
+    # Yandex widget is NOT part of rotation — it is the emergency buffer below.
     if on(YandexParser) and tracker.allow(YandexParser.name):
         selected.append(YandexParser)
     if on(DuckDuckGoParser) and tracker.allow(DuckDuckGoParser.name):
@@ -406,6 +416,11 @@ def select_engines(
         # Leads are cooling down or switched off — pull the reserve.
         if on(StartpageParser) and tracker.allow(StartpageParser.name):
             selected.append(StartpageParser)
+        elif buffer and tracker.allow(LegacyYandexParser.name):
+            # Emergency buffer: every regular engine is off in config or blocked by
+            # its breaker — the legacy Yandex widget takes the load so the search
+            # still returns results instead of none.
+            selected.append(LegacyYandexParser)
         else:
             # Forced: low must never be empty. First enabled lead wins; an all-off
             # config is a misconfiguration and still gets DDG rather than nothing.
@@ -446,11 +461,9 @@ def select_engines(
     if effort == "medium":
         return selected
 
-    # high: Brave (rate-governed by its breaker) and Yep (max recall, opt-in).
+    # high: Brave (rate-governed by its breaker).
     if on(BraveParser) and tracker.allow(BraveParser.name):
         selected.append(BraveParser)
-    if on(YepParser) and tracker.allow(YepParser.name):
-        selected.append(YepParser)
     return selected
 
 
@@ -585,11 +598,14 @@ class WebSearchService:
         if not dates_resolved:
             query, timelimit = resolve_query_dates(query, load_search_config().query, timelimit)
 
-        # Region routing (§3.2): explicit region wins; otherwise Cyrillic and
-        # friends route to their home region instead of us-en.
-        language = infer_query_language(query)
+        # Region routing (§3.2): explicit region wins; otherwise the query's own
+        # script/stop-word locale (query_locales, 20 profiles) picks the home region —
+        # Latin queries also resolve via distinctive diacritics and stop-word hints,
+        # so French/Spanish/Turkish/... search their home region instead of us-en.
+        analysis = analyze_query(query)
+        language = analysis.language
         if not region:
-            region = {"ru": "ru-ru", "de": "de-de"}.get(language, "us-en")
+            region = analysis.region
 
         # Advanced vertical fields are routes, not boolean supplements. A dedicated
         # shopping query must return products with prices instead of spending the
@@ -706,6 +722,14 @@ class WebSearchService:
             engine_omitted_operators={
                 name: item.omitted_operators for name, item in provider_queries.items()
             },
+            # Captcha-retry budget (native Yandex): only the high tier pays for identity
+            # re-rolls — a BLOCKED SERP is usually a sticky cookie branch, and a
+            # cookieless retry recovers it cheaply (SerpApi._run_engine).
+            engine_blocked_retries=(
+                {YandexParser.name: 3}
+                if profile.name == "high" and YandexParser in engines
+                else None
+            ),
             deadline_seconds=profile.deadline * 0.8,
         )
         if profile.parse_budget:

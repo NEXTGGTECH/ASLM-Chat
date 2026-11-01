@@ -37,13 +37,9 @@ def test_large_file_auto_preview():
     result = handle_tool("bash", {"command": "cat big.py"})
 
     stdout = result["result"]["stdout"]
-    print("Output preview:")
-    print(stdout[:600])
-    print("...")
     assert result["ok"], f"Expected ok=True, got error: {result.get('error')}"
     assert "-- big.py" in stdout, "Missing preview header"
     assert "[next]" in stdout, "Missing next suggestions"
-    print("PASS: large file auto-preview")
 
 
 def test_small_file_metadata_header():
@@ -53,8 +49,6 @@ def test_small_file_metadata_header():
     assert result["ok"]
     stdout = result["result"]["stdout"]
     assert stdout == "hello\nworld\n"
-    print("PASS: small file cat")
-    print(stdout)
 
 
 def test_head_metadata():
@@ -79,8 +73,6 @@ def test_head_metadata():
     assert "line1" in stdout
     assert "line10" not in stdout
     assert not result["result"].get("routed", False)
-    print("PASS: head falls through to real bash")
-    print(stdout)
 
 
 def test_grep_with_few_results():
@@ -104,8 +96,6 @@ def test_grep_with_few_results():
     stdout = result["result"]["stdout"]
     assert "hello" in stdout.lower()
     assert not result["result"].get("routed", False)
-    print("PASS: grep falls through to real bash")
-    print(stdout)
 
 
 def test_grep_falls_through_to_real_bash_with_many_files():
@@ -133,30 +123,5 @@ def test_grep_falls_through_to_real_bash_with_many_files():
     stdout = result["result"]["stdout"]
     assert "foo" in stdout
     assert not result["result"].get("routed", False)
-    print("PASS: grep falls through to real bash")
-    print(stdout[:500])
-    print("...")
 
 
-if __name__ == "__main__":
-    setup()
-    tests = [
-        test_large_file_auto_preview,
-        test_small_file_metadata_header,
-        test_head_metadata,
-        test_grep_with_few_results,
-        test_grep_falls_through_to_real_bash_with_many_files,
-    ]
-    passed = 0
-    failed = 0
-    for t in tests:
-        try:
-            t()
-            passed += 1
-        except Exception as e:
-            print(f"FAIL: {t.__name__}: {e}")
-            failed += 1
-        print()
-
-    print(f"\n{'='*60}")
-    print(f"Results: {passed} passed, {failed} failed")

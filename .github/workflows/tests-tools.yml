@@ -52,6 +52,44 @@ jobs:
         run: |
           "$VENV_PYTHON" -m pytest -q -m "not integration"
 
+  deep-research:
+    name: deep_research
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Cache server venv
+        uses: actions/cache@v6
+        with:
+          path: Data/venvs/server
+          key: aslm-chat-venv-server-${{ runner.os }}-${{ hashFiles('Settings/venv_requirements.json') }}
+          restore-keys: |
+            aslm-chat-venv-server-${{ runner.os }}-
+
+      - name: Prepare venv
+        run: |
+          python -c "from Services import venv_manager; import sys; sys.exit(0 if venv_manager.ensure_venv('server', log=True) else 1)"
+          VENV_PYTHON=$(python -c "from Services import venv_manager; print(venv_manager.get_venv_python('server'))")
+          echo "VENV_PYTHON=${VENV_PYTHON}" >> "$GITHUB_ENV"
+          test -x "$VENV_PYTHON"
+
+      - name: Install pytest
+        run: |
+          "$VENV_PYTHON" -m pip install pytest
+
+      - name: Run pytest
+        working-directory: Tools/deep_research
+        run: |
+          "$VENV_PYTHON" -m pytest -q
+
   mcp-sandbox:
     name: mcp-sandbox
     runs-on: ubuntu-latest
@@ -126,7 +164,7 @@ jobs:
       - name: Run pytest
         working-directory: Tools/mcp-web-search
         run: |
-          "$VENV_PYTHON" -m pytest -q -m "not gliner and not integration and not live"
+          "$VENV_PYTHON" -m pytest -q
 
   mcp-browser-agent:
     name: mcp-browser-agent

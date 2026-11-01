@@ -5,9 +5,13 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 from django.test import SimpleTestCase
 
 from Services import github_html_fallback, user_mcp_client
+
+
+pytestmark = [pytest.mark.unit]
 
 
 class GitHubHtmlFallbackTests(SimpleTestCase):

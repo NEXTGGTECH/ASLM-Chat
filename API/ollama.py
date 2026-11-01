@@ -551,6 +551,7 @@ def _run_tool_loop(
             _print_runtime_event(f"Tool loop base options: {_preview_jsonish(base_kwargs, limit=320)}")
 
     conversation = [dict(message) for message in messages]
+    conversation = tool_registry.with_available_tools_prompt(conversation, tool_lookup)
     tool_quota_counters: dict[str, int] = {}
     seen_tool_signatures: set[str] = set()
     consecutive_blocked_tool_results = 0

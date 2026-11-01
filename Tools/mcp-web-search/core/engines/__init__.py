@@ -7,8 +7,7 @@ from .google_cse import GoogleParser
 from .models import EngineParseResult, EngineRequest, ParseStatus, SearchResult
 from .qwant import QwantParser
 from .startpage import StartpageParser
-from .yandex import YandexParser
-from .yep import YepParser
+from .yandex import LegacyYandexParser, YandexParser
 
 __all__ = [
     "BraveParser",
@@ -21,6 +20,6 @@ __all__ = [
     "QwantParser",
     "SearchResult",
     "StartpageParser",
+    "LegacyYandexParser",
     "YandexParser",
-    "YepParser",
 ]

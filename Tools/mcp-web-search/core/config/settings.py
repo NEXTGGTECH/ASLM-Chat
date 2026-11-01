@@ -159,9 +159,73 @@ class HostedApiSection:
 
 # Per-engine kill switches for web_search's tiered selection (TODO §D). An engine set to
 # False never enters a tier — the user opts weak engines in, they are not opted out by
-# health at runtime (that's the breaker's job, this is policy). Yandex and Yep default OFF:
-# Yandex drags ad-redirects/mirrors on download-intent queries and Yep only ever added
-# high-tier recall. Turning either back on is one config flip, no code.
+# health at runtime (that's the breaker's job, this is policy). Both Yandex engines default
+# OFF: the native ya.ru SERP is captcha-gated for scripted clients (it relies on the
+# warm-browser fallback) and the legacy widget is Yandex's retired search product.
+@dataclass
+class RichCardsSection:
+    """Model-facing answer cards for top SERP results (core/cards): Wikidata facts,
+    accepted StackExchange answers, Fandom/MediaWiki infoboxes, GitHub repo status, PyPI/npm versions. Each
+    card adds at most `timeout_seconds` (cached afterwards) and fails open."""
+    enabled: bool = True
+    wikipedia: bool = True
+    stackexchange: bool = True
+    wiki: bool = True
+    github: bool = True
+    package: bool = True
+    max_cards: int = 3
+    scan_results: int = 8
+    timeout_seconds: float = 2.0
+    ttl_seconds: float = 86400.0
+    negative_ttl_seconds: float = 900.0
+
+
+@dataclass
+class ImageEnginesSection:
+    """Kill switches for the image vertical (engines/images.py). Defaults follow the
+    2026-10-28 live check: bing/brave/duckduckgo answer from residential networks
+    (DDG once i.js stopped sending navigation-only headers); openverse times out
+    on every request and would hold each image search until the deadline."""
+    bing: bool = True
+    brave: bool = True
+    duckduckgo: bool = True
+    openverse: bool = False
+
+    def as_map(self) -> dict[str, bool]:
+        return {"bing": self.bing, "brave": self.brave,
+                "duckduckgo": self.duckduckgo, "openverse": self.openverse}
+
+
+@dataclass
+class QueryRewriterSection:
+    """LLM subagent that judges and rewrites search queries.
+    Disabled by default: each evaluated query pays one model call (tens of seconds
+    on a 27B). In "always" mode (default) the model judges every query — an already
+    clean query is approved unchanged, a conversational thought gets rewritten. In
+    "heuristic" mode a local word-stem gate skips the model call for obviously clean
+    queries. Always uses the active chat engine and model from
+    Tools/model_runtime_metadata.json + Settings/settings.json."""
+    enabled: bool = False
+    timeout_seconds: float = 75.0
+    max_queries: int = 3
+    mode: str = "always"  # always (model judges) | heuristic (cheap gate first)
+    # Word-stem overrides for the conversational heuristic (rewriter.looks_conversational).
+    # NO built-in lists: empty (the default) disables the local gate entirely, so
+    # heuristic mode behaves like always. A deployment that wants a cheap local gate
+    # writes its own stems here (matched per word: equality, or prefix for stems
+    # of 4+ chars).
+    conversational_markers: tuple[str, ...] = ()
+
+
+@dataclass
+class LocalizationSection:
+    """Language-aware region routing and result-language scoring (query_locales)."""
+    enabled: bool = True
+    # Triage toll for a result written in a language the query did not use. Capped at
+    # 0.3 in code; 0.12 keeps one consensus vote (0.2+) above two foreign mismatches.
+    language_penalty: float = 0.12
+
+
 @dataclass
 class EnginesSection:
     google: bool = True
@@ -170,7 +234,6 @@ class EnginesSection:
     qwant: bool = True
     brave: bool = True
     yandex: bool = False
-    yep: bool = False
 
     # {engine name: enabled} view for selection code.
     def as_map(self) -> dict[str, bool]:
@@ -181,8 +244,17 @@ class EnginesSection:
             "qwant": self.qwant,
             "brave": self.brave,
             "yandex": self.yandex,
-            "yep": self.yep,
         }
+
+
+@dataclass
+class BufferEngineSection:
+    """Emergency reserve engine (the legacy Yandex site-search widget).
+
+    The buffer never participates in normal tier rotation: select_engines fires it
+    only when every regular engine is switched off in config or blocked by its
+    circuit breaker, so a search still returns some results instead of none."""
+    enabled: bool = True
 
 
 @dataclass
@@ -195,7 +267,12 @@ class SearchConfig:
     tor: TorSection = field(default_factory=TorSection)
     hosted_api: HostedApiSection = field(default_factory=HostedApiSection)
     profile_import: ProfileImportSection = field(default_factory=ProfileImportSection)
+    query_rewriter: QueryRewriterSection = field(default_factory=QueryRewriterSection)
+    image_engines: ImageEnginesSection = field(default_factory=ImageEnginesSection)
+    rich_cards: RichCardsSection = field(default_factory=RichCardsSection)
+    localization: LocalizationSection = field(default_factory=LocalizationSection)
     engines: EnginesSection = field(default_factory=EnginesSection)
+    buffer_engine: BufferEngineSection = field(default_factory=BufferEngineSection)
 
 
 _cached_config: SearchConfig | None = None
@@ -286,7 +363,12 @@ def load_search_config(path: Path | None = None) -> SearchConfig:
     t = raw.get("tor", {})
     h = raw.get("hosted_api", {})
     p = raw.get("profile_import", {})
+    w = raw.get("query_rewriter", {})
+    l = raw.get("localization", {})
+    im = raw.get("image_engines", {})
+    rc = raw.get("rich_cards", {})
     g = raw.get("engines", {})
+    buf = raw.get("buffer_engine", {})
     _hosted_modes = {"content", "serp", "off"}
     _known_browsers = {"chrome", "edge", "brave", "firefox"}
     if isinstance(g, dict):
@@ -370,6 +452,38 @@ def load_search_config(path: Path | None = None) -> SearchConfig:
             refresh_hours=float(p.get("refresh_hours", 12.0)),
             purge_on_disable=bool(p.get("purge_on_disable", True)),
         ),
+        query_rewriter=QueryRewriterSection(
+            enabled=bool(w.get("enabled", False)),
+            timeout_seconds=float(w.get("timeout_seconds", 75.0)),
+            max_queries=int(w.get("max_queries", 3)),
+            mode=_one_of(w.get("mode", "always"), {"heuristic", "always"}, "always"),
+            conversational_markers=tuple(
+                _string_list(w.get("conversational_markers"), None, [])
+            ),
+        ),
+        image_engines=ImageEnginesSection(
+            bing=bool(im.get("bing", True)),
+            brave=bool(im.get("brave", True)),
+            duckduckgo=bool(im.get("duckduckgo", True)),
+            openverse=bool(im.get("openverse", False)),
+        ),
+        rich_cards=RichCardsSection(
+            enabled=bool(rc.get("enabled", True)),
+            wikipedia=bool(rc.get("wikipedia", True)),
+            stackexchange=bool(rc.get("stackexchange", True)),
+            wiki=bool(rc.get("wiki", True)),
+            github=bool(rc.get("github", True)),
+            package=bool(rc.get("package", True)),
+            max_cards=int(rc.get("max_cards", 3)),
+            scan_results=int(rc.get("scan_results", 8)),
+            timeout_seconds=float(rc.get("timeout_seconds", 2.0)),
+            ttl_seconds=float(rc.get("ttl_seconds", 86400.0)),
+            negative_ttl_seconds=float(rc.get("negative_ttl_seconds", 900.0)),
+        ),
+        localization=LocalizationSection(
+            enabled=bool(l.get("enabled", True)),
+            language_penalty=float(l.get("language_penalty", 0.12)),
+        ),
         engines=EnginesSection(
             google=bool(g.get("google", True)),
             duckduckgo=bool(g.get("duckduckgo", True)),
@@ -377,7 +491,9 @@ def load_search_config(path: Path | None = None) -> SearchConfig:
             qwant=bool(g.get("qwant", True)),
             brave=bool(g.get("brave", True)),
             yandex=bool(g.get("yandex", False)),
-            yep=bool(g.get("yep", False)),
+        ),
+        buffer_engine=BufferEngineSection(
+            enabled=bool(buf.get("enabled", True)),
         ),
     )
 

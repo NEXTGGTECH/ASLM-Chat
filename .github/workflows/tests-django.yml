@@ -1,6 +1,6 @@
 # Copyright NEXTGGTECH. Elastic License 2.0.
 
-name: Tests - Django
+name: Tests - Backend
 
 on:
   push:
@@ -10,12 +10,12 @@ on:
   pull_request:
 
 concurrency:
-  group: tests-django-${{ github.ref }}
+  group: tests-backend-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  django-data:
-    name: Apps.Data
+  backend-unit:
+    name: Apps.Tests (unit)
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -43,16 +43,18 @@ jobs:
           echo "VENV_PYTHON=${VENV_PYTHON}" >> "$GITHUB_ENV"
           test -x "$VENV_PYTHON"
 
-      - name: Run Django tests
-        env:
-          DJANGO_SETTINGS_MODULE: ASLM.settings
+      - name: Install pytest
         run: |
-          "$VENV_PYTHON" manage.py test Apps.Data.tests --verbosity=1
+          "$VENV_PYTHON" -m pip install pytest pytest-django
 
-  django-ui:
-    name: Apps.UI
+      - name: Run unit tests
+        run: |
+          "$VENV_PYTHON" -m pytest Apps/Tests -q -m unit
+
+  backend-component:
+    name: Apps.Tests (component)
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
@@ -78,8 +80,47 @@ jobs:
           echo "VENV_PYTHON=${VENV_PYTHON}" >> "$GITHUB_ENV"
           test -x "$VENV_PYTHON"
 
-      - name: Run Django tests
-        env:
-          DJANGO_SETTINGS_MODULE: ASLM.settings
+      - name: Install pytest
         run: |
-          "$VENV_PYTHON" manage.py test Apps.UI.tests --verbosity=1
+          "$VENV_PYTHON" -m pip install pytest pytest-django
+
+      - name: Run component tests
+        run: |
+          "$VENV_PYTHON" -m pytest Apps/Tests -q -m component
+
+  backend-integration:
+    name: Apps.Tests (integration + e2e)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Cache server venv
+        uses: actions/cache@v6
+        with:
+          path: Data/venvs/server
+          key: aslm-chat-venv-server-${{ runner.os }}-${{ hashFiles('Settings/venv_requirements.json') }}
+          restore-keys: |
+            aslm-chat-venv-server-${{ runner.os }}-
+
+      - name: Prepare server venv
+        run: |
+          python -c "from Services import venv_manager; import sys; sys.exit(0 if venv_manager.ensure_venv('server', log=True) else 1)"
+          VENV_PYTHON=$(python -c "from Services import venv_manager; print(venv_manager.get_venv_python('server'))")
+          echo "VENV_PYTHON=${VENV_PYTHON}" >> "$GITHUB_ENV"
+          test -x "$VENV_PYTHON"
+
+      - name: Install pytest
+        run: |
+          "$VENV_PYTHON" -m pip install pytest pytest-django
+
+      - name: Run integration and e2e tests
+        run: |
+          "$VENV_PYTHON" -m pytest Apps/Tests -q -m "integration or e2e"

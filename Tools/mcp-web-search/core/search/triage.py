@@ -21,6 +21,8 @@ from enum import StrEnum
 from core.profiles import ReputationSnapshot, domain_of
 
 from core.extract.scoring import query_terms
+from core.config import load_search_config
+from .query_locales import analyze_query, detect_result_language, language_mismatch_penalty
 
 from .quality import (
     emd_penalty,
@@ -71,8 +73,8 @@ _ENGINE_POSITION_WEIGHT = {
     "duckduckgo": 0.85,
     "brave": 0.70,
     "qwant": 0.60,
-    "yep": 0.50,
     "yandex": 0.35,
+    "legacy_yandex": 0.35,
 }
 _DEFAULT_POSITION_WEIGHT = 0.60
 
@@ -99,8 +101,8 @@ _FAMILY_VOTE_WEIGHT = {
     "duckduckgo": 0.80,
     "brave": 0.85,
     "qwant": 0.65,
-    "yep": 0.50,
     "yandex": 0.35,
+    "legacy_yandex": 0.35,
 }
 _DEFAULT_VOTE_WEIGHT = 0.70
 
@@ -156,6 +158,9 @@ class TriageSession:
         self.query = query
         self._years = query_years(query)
         self._terms = tuple(query_terms(query))  # once per session, for the EMD tell
+        self._query_language = analyze_query(query).language
+        localization = load_search_config().localization
+        self._language_weight = localization.language_penalty if localization.enabled else 0.0
         self._states: dict[str, _SourceState] = {}
         self._penalties = reputation.penalties if reputation else {}
         self._proven = reputation.proven if reputation else frozenset()
@@ -196,6 +201,14 @@ class TriageSession:
         # gTLD costumes, hyphen/year-stamped names, exact-match-domain squatting).
         score += suspicious_url_penalty(url)
         score += emd_penalty(url, self._terms)
+        # Language-of-result scoring (query_locales): a page written in a script the
+        # query did not use pays a small, capped toll — never a ban, consensus can
+        # always outvote it, and English results never pay at all.
+        if self._language_weight:
+            result_language = detect_result_language(title, snippet, url)
+            score -= language_mismatch_penalty(
+                self._query_language, result_language, self._language_weight
+            )
         # Earned negative reputation (TLS failures, systematic empty parses). Magnitude
         # is capped at write-out; consensus votes can still outvote it — two independent
         # families saying "this page answers the query" beat an old grudge.
@@ -262,7 +275,7 @@ class TriageSession:
 
     # Re-ingest an already-seen URL surfacing as a full SERP entry from another stream.
     # Two effects: the base becomes the BEST single-engine view of the page (a rank-1
-    # Google listing must not stay priced at the yep-rank-9 view that arrived first —
+    # Google listing must not stay priced at the low-trust-rank-9 view that arrived first —
     # essential now that position dominates the score), and the new family votes.
     def ingest_revisit(
         self,

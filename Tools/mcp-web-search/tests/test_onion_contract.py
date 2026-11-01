@@ -20,13 +20,13 @@ def _tor(monkeypatch, enabled: bool, *, mode: str = "advanced"):
 
 def test_schema_hides_onion_when_disabled(monkeypatch):
     _tor(monkeypatch, False)
-    assert "onion" not in build_search_schema()["properties"]
+    assert "onion" not in build_search_schema()["properties"]["vertical"]["enum"]
     assert coerce_search_onion({"onion": True}) is False   # AND-gate: capability off
 
 
 def test_schema_shows_onion_when_enabled(monkeypatch):
     _tor(monkeypatch, True)
-    assert "onion" in build_search_schema()["properties"]
+    assert "onion" in build_search_schema()["properties"]["vertical"]["enum"]
     assert coerce_search_onion({"onion": True}) is True
     assert coerce_search_onion({"onion": False}) is False
 

@@ -68,7 +68,8 @@ def test_skipped_code_does_not_discard_following_prose():
     output = _truncate_markdown_to_budget(markdown, small_threshold - 1)
 
     assert "SYNTH_SMALL_BEGIN" not in output
-    assert "SYNTH_AFTER_SMALL" in output
+    # Extractors may escape underscores in prose without changing the visible text.
+    assert "SYNTH_AFTER_SMALL" in output.replace("\\_", "_")
     assert _fences_balanced(output)
 
 

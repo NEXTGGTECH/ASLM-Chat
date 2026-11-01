@@ -19,10 +19,10 @@ from core.search.query_dates import resolve_query_dates
 
 
 VERTICAL_QUERY_LIMITS = {
-    "web": 2,
-    "shopping": 2,
-    "academic": 2,
-    "onion": 2,
+    "web": 3,
+    "shopping": 3,
+    "academic": 3,
+    "onion": 3,
 }
 VERTICAL_WORD_LIMITS = {
     "web": 10,
@@ -30,7 +30,7 @@ VERTICAL_WORD_LIMITS = {
     "academic": 8,
     "onion": 7,
 }
-ADVANCED_BATCH_LIMIT = 2
+ADVANCED_BATCH_LIMIT = 3
 COMPILED_QUERY_LIMIT = 512
 DESCRIPTION_LIMIT = 80
 _EFFORTS = ("low", "medium", "high")
@@ -420,8 +420,6 @@ def prepare_advanced_search(
         raw_queries = raw_queries[:1]
     elif len(raw_queries) > max(1, int(max_queries)):
         batch_message = f"batch permits at most {max(1, int(max_queries))} queries total"
-        if max(1, int(max_queries)) == ADVANCED_BATCH_LIMIT:
-            batch_message += ": either two in one vertical or one in each of two verticals"
         _issue(
             issues,
             "$",

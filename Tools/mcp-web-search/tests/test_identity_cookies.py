@@ -39,18 +39,18 @@ def test_cookie_domain_scoping(tmp_path):
 
 def test_expired_and_deleted_cookies_are_dropped(tmp_path):
     store = _store(tmp_path)
-    store.merge_set_cookie("yep", "api.yep.com", ["a=1; Max-Age=1000", "b=2; Max-Age=1000"])
+    store.merge_set_cookie("qwant", "api.qwant.com", ["a=1; Max-Age=1000", "b=2; Max-Age=1000"])
     # Max-Age=0 deletes an existing cookie.
-    store.merge_set_cookie("yep", "api.yep.com", ["a=1; Max-Age=0"])
-    header = store.http_cookie_header("yep", "api.yep.com")
+    store.merge_set_cookie("qwant", "api.qwant.com", ["a=1; Max-Age=0"])
+    header = store.http_cookie_header("qwant", "api.qwant.com")
     assert "a=1" not in header and "b=2" in header
     # An already-expired cookie is never returned.
-    store.merge_set_cookie("yep", "api.yep.com", ["c=3; Max-Age=1000"])
+    store.merge_set_cookie("qwant", "api.qwant.com", ["c=3; Max-Age=1000"])
     store._get_conn().execute(
-        "UPDATE http_cookies SET expires = ? WHERE owner='yep' AND name='c'", (time.time() - 5,)
+        "UPDATE http_cookies SET expires = ? WHERE owner='qwant' AND name='c'", (time.time() - 5,)
     )
     store._get_conn().commit()
-    assert "c=3" not in store.http_cookie_header("yep", "api.yep.com")
+    assert "c=3" not in store.http_cookie_header("qwant", "api.qwant.com")
 
 
 def test_session_cookies_age_out(tmp_path):

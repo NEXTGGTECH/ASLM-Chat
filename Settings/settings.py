@@ -86,7 +86,19 @@ WEB_SEARCH_CONFIG_SETTINGS = {
     "web-search-engine-qwant": ("engines", "qwant"),
     "web-search-engine-brave": ("engines", "brave"),
     "web-search-engine-yandex": ("engines", "yandex"),
-    "web-search-engine-yep": ("engines", "yep"),
+    "web-search-buffer-engine": ("buffer_engine", "enabled"),
+    "web-search-image-engine-bing": ("image_engines", "bing"),
+    "web-search-image-engine-brave": ("image_engines", "brave"),
+    "web-search-image-engine-duckduckgo": ("image_engines", "duckduckgo"),
+    "web-search-image-engine-openverse": ("image_engines", "openverse"),
+    "web-search-query-rewriter-enabled": ("query_rewriter", "enabled"),
+    "web-search-query-rewriter-mode": ("query_rewriter", "mode"),
+    "web-search-localization-enabled": ("localization", "enabled"),
+    "web-search-localization-penalty": ("localization", "language_penalty"),
+    "web-search-rich-cards-enabled": ("rich_cards", "enabled"),
+    "web-search-rich-cards-wikipedia": ("rich_cards", "wikipedia"),
+    "web-search-rich-cards-stackexchange": ("rich_cards", "stackexchange"),
+    "web-search-rich-cards-reddit": ("rich_cards", "reddit"),
     "web-search-profile-import-enabled": ("profile_import", "enabled"),
     "web-search-profile-import-all-profiles": ("profile_import", "all_profiles"),
     "web-search-profile-import-refresh-hours": ("profile_import", "refresh_hours"),
@@ -129,6 +141,7 @@ SANDBOX_CONFIG_SETTINGS = {
     "sandbox-memory-swap-limit": "SANDBOX_MEMORY_SWAP_LIMIT",
     "sandbox-pids-limit": "SANDBOX_PIDS_LIMIT",
     "sandbox-storage-limit": "SANDBOX_STORAGE_LIMIT",
+    "sandbox-network-enabled": "SANDBOX_NETWORK_ENABLED",
     "sandbox-network-limit-mbit": "SANDBOX_NETWORK_LIMIT_MBIT",
     "sandbox-default-timeout": "SANDBOX_DEFAULT_TIMEOUT",
     "sandbox-max-output-bytes": "SANDBOX_MAX_OUTPUT_BYTES",
@@ -176,8 +189,11 @@ DECIMAL_SETTING_KEYS = frozenset(
 
 REMOVED_TOOL_SETTING_KEYS = frozenset(
     {
+        "web-search-query-rewriter-endpoint",
+        "web-search-query-rewriter-model",
         "web-search-profile-import-browsers",
         "web-search-profile-import-domains",
+        "web-search-engine-legacy-yandex",
         "sandbox-image-source",
         "sandbox-auto-start-docker",
     }
@@ -219,8 +235,8 @@ DEFAULTS: dict[str, Any] = {
     "web-search-max-page-chars": 20000,
     "web-search-min-content-length": 800,
     "web-search-compress-read-pages": True,
-    "web-search-compress-threshold": 10000,
-    "web-search-compress-target": 10000,
+    "web-search-compress-threshold": 40000,
+    "web-search-compress-target": 35000,
     "web-search-cache-ttl": 21600,
     "web-search-negative-cache-ttl": 300,
     "web-search-page-cache-ttl": 86400,
@@ -234,7 +250,19 @@ DEFAULTS: dict[str, Any] = {
     "web-search-engine-qwant": True,
     "web-search-engine-brave": True,
     "web-search-engine-yandex": False,
-    "web-search-engine-yep": False,
+    "web-search-buffer-engine": True,
+    "web-search-image-engine-bing": True,
+    "web-search-image-engine-brave": True,
+    "web-search-image-engine-duckduckgo": False,
+    "web-search-image-engine-openverse": True,
+    "web-search-query-rewriter-enabled": False,
+    "web-search-query-rewriter-mode": "always",
+    "web-search-localization-enabled": True,
+    "web-search-localization-penalty": 0.12,
+    "web-search-rich-cards-enabled": False,
+    "web-search-rich-cards-wikipedia": True,
+    "web-search-rich-cards-stackexchange": True,
+    "web-search-rich-cards-reddit": True,
     "web-search-profile-import-enabled": False,
     "web-search-profile-import-all-profiles": False,
     "web-search-profile-import-refresh-hours": 12.0,
@@ -248,11 +276,12 @@ DEFAULTS: dict[str, Any] = {
     "browser-agent-auto-text-preview-length": 1500,
     "sandbox-container-name": "aslm-chat-sandbox",
     "sandbox-image": "nggtlightkeeper/aslm-chat-sandbox:latest",
-    "sandbox-cpu-limit": 4,
-    "sandbox-memory-limit": 3,
-    "sandbox-memory-swap-limit": 4,
-    "sandbox-pids-limit": 256,
+    "sandbox-cpu-limit": 8,
+    "sandbox-memory-limit": 6,
+    "sandbox-memory-swap-limit": 8,
+    "sandbox-pids-limit": 1024,
     "sandbox-storage-limit": 12,
+    "sandbox-network-enabled": True,
     "sandbox-network-limit-mbit": 0,
     "sandbox-default-timeout": 60,
     "sandbox-max-output-bytes": 60000,
@@ -265,7 +294,7 @@ DEFAULTS: dict[str, Any] = {
     "sandbox-max-find-results": 200,
     "sandbox-max-grep-results": 200,
     "sandbox-background-timeout-threshold": 10,
-    "sandbox-thread-limit": 4,
+    "sandbox-thread-limit": 8,
     "sandbox-default-task-dir": "_sandbox",
     "sandbox-workspace-cleanup-enabled": True,
     "sandbox-workspace-cleanup-idle-seconds": 5400,
@@ -619,6 +648,11 @@ def _load_web_search_config_payload() -> dict[str, Any]:
 # Generate managed search_config.json values without replacing JSON-only sections.
 def _write_web_search_config(settings_data: dict[str, Any]) -> None:
     payload = _load_web_search_config_payload()
+    for key in ("endpoint", "model"):
+        payload.get("query_rewriter", {}).pop(key, None)
+    # The legacy Yandex widget left the engines rotation for the buffer_engine
+    # section; prune the stale key so old installs stop carrying it.
+    payload.get("engines", {}).pop("legacy_yandex", None)
     for section_name, section_values in WEB_SEARCH_STATIC_CONFIG.items():
         payload.setdefault(section_name, {}).update(section_values)
 

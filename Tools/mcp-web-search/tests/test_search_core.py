@@ -160,10 +160,10 @@ def test_triage_skip_title_is_skipped():
 def test_triage_revisit_takes_best_positional_view_and_upgrades():
     session = TriageSession("python asyncio tutorial")
     # Weak engine, mid rank → lands in queue.
-    decision = _ingest(session, engine="yep", family="yep", rank=5)
+    decision = _ingest(session, engine="qwant", family="qwant", rank=5)
     assert decision.action == TriageAction.QUEUE
     # The same page then surfaces at Google rank 1: the base must be re-priced to the
-    # strongest single-engine view (not stay at the yep-rank-9 view) and the second
+    # strongest single-engine view instead of the initial Qwant rank 5; the second
     # family's vote lands on top → PARSE upgrade.
     upgraded = session.ingest_revisit(
         engine="google", provider_family="google", rank=1,
@@ -177,7 +177,7 @@ def test_triage_revisit_takes_best_positional_view_and_upgrades():
 def test_triage_vote_weight_follows_family_class():
     def bump_from(family: str) -> float:
         session = TriageSession("python asyncio tutorial")
-        _ingest(session, engine="yep", family="yep", rank=5)
+        _ingest(session, engine="qwant", family="qwant", rank=5)
         before = session.score_of("https://ex.com/a")
         session.ingest_vote(provider_family=family, url="https://ex.com/a")
         return session.score_of("https://ex.com/a") - before
@@ -188,7 +188,7 @@ def test_triage_vote_weight_follows_family_class():
 
 def test_triage_google_startpage_one_family_vote():
     session = TriageSession("python asyncio tutorial")
-    decision = _ingest(session, engine="yep", family="yep", rank=5)
+    decision = _ingest(session, engine="qwant", family="qwant", rank=5)
     assert decision.action == TriageAction.QUEUE
     score_before = session.score_of("https://ex.com/a")
     session.ingest_vote(provider_family="google", url="https://ex.com/a")
@@ -277,19 +277,19 @@ def test_pacing_holds_engine_within_min_interval():
 def test_pacing_skipped_for_tolerant_engines():
     clock = _Clock()
     tracker = EngineHealthTracker(clock=clock)
-    assert tracker.allow("yep")          # yep min-interval is 0
-    assert tracker.allow("yep")          # so an immediate re-fire is allowed
+    assert tracker.allow("duckduckgo")          # duckduckgo min-interval is 0
+    assert tracker.allow("duckduckgo")          # so an immediate re-fire is allowed
 
 
 # --- engine selection ------------------------------------------------------------
 
 # All engines enabled — isolates breaker behaviour from the config layer.
-_ALL_ON = {n: True for n in ("google", "duckduckgo", "startpage", "qwant", "brave", "yandex", "yep")}
+_ALL_ON = {n: True for n in ("google", "duckduckgo", "startpage", "qwant", "brave", "yandex")}
 
 
 def test_select_engines_low_default_pair():
     tracker = EngineHealthTracker(clock=_Clock())
-    names = [e.name for e in select_engines("low", tracker, enabled=_ALL_ON)]
+    names = [e.name for e in select_engines("low", tracker, enabled=_ALL_ON, buffer=False)]
     assert names == ["yandex", "duckduckgo"]
 
 
@@ -298,7 +298,7 @@ def test_select_engines_low_falls_back_to_startpage():
     tracker = EngineHealthTracker(clock=clock)
     tracker.record("yandex", status="blocked", fetch_ms=100, results=0)
     tracker.record("duckduckgo", status="blocked", fetch_ms=100, results=0)
-    names = [e.name for e in select_engines("low", tracker, enabled=_ALL_ON)]
+    names = [e.name for e in select_engines("low", tracker, enabled=_ALL_ON, buffer=False)]
     assert names == ["startpage"]
 
 
@@ -307,7 +307,44 @@ def test_select_engines_low_never_empty():
     tracker = EngineHealthTracker(clock=clock)
     for engine in ("yandex", "duckduckgo", "startpage"):
         tracker.record(engine, status="blocked", fetch_ms=100, results=0)
-    names = [e.name for e in select_engines("low", tracker, enabled=_ALL_ON)]
+    names = [e.name for e in select_engines("low", tracker, enabled=_ALL_ON, buffer=False)]
+    assert names == ["duckduckgo"]  # first enabled lead, forced through an open breaker
+
+
+def test_select_engines_buffer_not_in_normal_rotation():
+    # The legacy Yandex widget is the emergency buffer: with regular engines alive
+    # it must never appear in any tier, even when the buffer switch is on.
+    tracker = EngineHealthTracker(clock=_Clock())
+    names = [e.name for e in select_engines("high", tracker, enabled=_ALL_ON, buffer=True)]
+    assert "legacy_yandex" not in names
+    assert "duckduckgo" in names
+
+
+def test_select_engines_buffer_fires_when_all_regular_dead():
+    # Every regular engine breaker-blocked → the buffer takes the load.
+    clock = _Clock()
+    tracker = EngineHealthTracker(clock=clock)
+    for engine in ("yandex", "duckduckgo", "startpage", "google", "qwant", "brave"):
+        tracker.record(engine, status="blocked", fetch_ms=100, results=0)
+    names = [e.name for e in select_engines("high", tracker, enabled=_ALL_ON, buffer=True)]
+    assert names == ["legacy_yandex"]
+
+
+def test_select_engines_buffer_fires_when_all_disabled():
+    # Every regular engine switched off in config → the buffer takes the load.
+    tracker = EngineHealthTracker(clock=_Clock())
+    all_off = {n: False for n in _ALL_ON}
+    names = [e.name for e in select_engines("low", tracker, enabled=all_off, buffer=True)]
+    assert names == ["legacy_yandex"]
+
+
+def test_select_engines_buffer_respects_own_breaker():
+    # The buffer itself blocked → selection falls through to the forced lead.
+    clock = _Clock()
+    tracker = EngineHealthTracker(clock=clock)
+    for engine in ("yandex", "duckduckgo", "startpage", "legacy_yandex"):
+        tracker.record(engine, status="blocked", fetch_ms=100, results=0)
+    names = [e.name for e in select_engines("low", tracker, enabled=_ALL_ON, buffer=True)]
     assert names == ["duckduckgo"]  # first enabled lead, forced through an open breaker
 
 
@@ -357,25 +394,25 @@ def test_is_healthy_pure_read_no_side_effects():
 
 # --- per-engine config switches (TODO §D) -----------------------------------------
 
-def test_select_engines_default_config_excludes_yandex_and_yep():
-    # Shipped defaults: yandex/yep off. High tier is the widest fan-out — neither may appear.
+def test_select_engines_default_config_excludes_yandex_engines():
+    # Shipped defaults: both Yandex engines off. High tier is the widest fan-out — neither may appear.
     from core.config.settings import EnginesSection
 
     tracker = EngineHealthTracker(clock=_Clock())
     names = [e.name for e in select_engines("high", tracker, enabled=EnginesSection().as_map())]
     assert "yandex" not in names
-    assert "yep" not in names
+    assert "legacy_yandex" not in names
     assert "duckduckgo" in names  # the lead survives
 
 
-def test_select_engines_user_opts_yandex_and_yep_back_in():
+def test_select_engines_user_opts_native_yandex_back_in():
     from core.config.settings import EnginesSection
 
-    enabled = EnginesSection(yandex=True, yep=True).as_map()
+    enabled = EnginesSection(yandex=True).as_map()
     tracker = EngineHealthTracker(clock=_Clock())
-    names = [e.name for e in select_engines("high", tracker, enabled=enabled)]
+    names = [e.name for e in select_engines("high", tracker, enabled=enabled, buffer=False)]
     assert "yandex" in names
-    assert "yep" in names
+    assert "legacy_yandex" not in names  # buffer role only, never rotation
 
 
 def test_select_engines_disabled_engine_never_forced():
@@ -387,14 +424,14 @@ def test_select_engines_disabled_engine_never_forced():
     tracker = EngineHealthTracker(clock=clock)
     for engine in ("duckduckgo", "startpage"):
         tracker.record(engine, status="blocked", fetch_ms=100, results=0)
-    names = [e.name for e in select_engines("low", tracker, enabled=EnginesSection().as_map())]
+    names = [e.name for e in select_engines("low", tracker, enabled=EnginesSection().as_map(), buffer=False)]
     assert names == ["duckduckgo"]
 
 
 def test_select_engines_all_disabled_still_returns_lead():
     tracker = EngineHealthTracker(clock=_Clock())
     all_off = {n: False for n in _ALL_ON}
-    names = [e.name for e in select_engines("low", tracker, enabled=all_off)]
+    names = [e.name for e in select_engines("low", tracker, enabled=all_off, buffer=False)]
     assert names == ["duckduckgo"]  # misconfiguration guard: never return zero engines
 
 
@@ -404,12 +441,20 @@ def test_engines_config_section_loads(tmp_path):
     from core.config.settings import load_search_config
 
     cfg_path = tmp_path / "search_config.json"
-    cfg_path.write_text(_json.dumps({"engines": {"yandex": True, "brave": False}}), encoding="utf-8")
+    cfg_path.write_text(
+        _json.dumps({"engines": {"yandex": True, "brave": False}}), encoding="utf-8"
+    )
     cfg = load_search_config(cfg_path)
     assert cfg.engines.yandex is True      # user opt-in honoured
     assert cfg.engines.brave is False      # explicit off honoured
     assert cfg.engines.duckduckgo is True  # absent → default on
-    assert cfg.engines.yep is False        # absent → default off
+    assert cfg.buffer_engine.enabled is True  # absent → buffer defaults on
+
+    cfg_path.write_text(
+        _json.dumps({"buffer_engine": {"enabled": False}}), encoding="utf-8"
+    )
+    cfg = load_search_config(cfg_path)
+    assert cfg.buffer_engine.enabled is False  # explicit off honoured
 
 
 # --- inline-parse policy (custom-domain scope + learned-slow) --------------------
@@ -502,8 +547,8 @@ def test_web_search_medium_parses_winners_and_ranks(monkeypatch):
         },
         {
             "type": "source",
-            "engine": "yep",
-            "provider_family": "yep",
+            "engine": "qwant",
+            "provider_family": "qwant",
             "rank": 9,
             "url": {"url": "https://meh.com/page", "host": "meh.com"},
             "serp": {"title": "asyncio", "snippet": "asyncio tutorial", "fetch_ms": 900, "parse_ms": 2},
@@ -690,3 +735,171 @@ def test_had_productive_engine_distinguishes_empty_from_outage():
         {"engines": {"yandex": {"status": "timeout"}, "brave": {"status": "blocked"}}}
     ) is False
     assert _had_productive_engine({"engines": {}}) is False
+
+
+# --- captcha-burn retry (SerpApi blocked_retries) ----------------------------------
+
+from core.engines.models import EngineParseResult, EngineRequest, ParseStatus, SearchResult
+from core.fetch._base import TransportResponse
+
+
+class _RetryFakeParser:
+    """Blocked on the first two touches, full SERP on the third."""
+
+    name = "retry_fake"
+    provider_family = "retry_fake"
+    calls = 0
+
+    @staticmethod
+    def build_request(query, *, region="us-en", safesearch="moderate", timelimit=None, page=1):
+        return EngineRequest(
+            method="GET", url="https://retry.test/search", identity_key="retry_fake"
+        )
+
+    def parse(self, document):
+        type(self).calls += 1
+        if type(self).calls < 3:
+            return EngineParseResult(engine=self.name, status=ParseStatus.BLOCKED)
+        return EngineParseResult(
+            engine=self.name,
+            status=ParseStatus.SUCCESS,
+            results=[SearchResult(title="ok", url="https://ok.test/a", snippet="s")],
+        )
+
+
+class _AlwaysBlockedParser(_RetryFakeParser):
+    name = "retry_blocked"
+    provider_family = "retry_blocked"
+
+    def parse(self, document):
+        type(self).calls += 1
+        return EngineParseResult(engine=self.name, status=ParseStatus.BLOCKED)
+
+
+class _FakeTransport:
+    def __init__(self):
+        self.fetches = 0
+        self.drops = 0
+        self.client_drops = 0
+        self.naked_fetches = 0
+
+    async def fetch(self, request):
+        self.fetches += 1
+        if not request.identity_key:
+            self.naked_fetches += 1
+        return TransportResponse(status=200, body=b"<html></html>", transport="fake")
+
+    def drop_identity_clients(self, host):
+        self.client_drops += 1
+        return 1
+
+    async def close(self):
+        return None
+
+
+def _run_retry_case(monkeypatch, parser_type, blocked_retries):
+    from core.search import serp_api
+
+    transport = _FakeTransport()
+
+    def fake_drop(request):
+        transport.drops += 1
+        return 0
+
+    monkeypatch.setattr(serp_api, "_drop_identity_cookies", fake_drop)
+    api = serp_api.SerpApi(transport=transport, engines=(parser_type,))
+    payload = asyncio.run(
+        api._run_engine(
+            parser_type, "q", region="us-en", safesearch="moderate",
+            timelimit=None, blocked_retries=blocked_retries,
+        )
+    )
+    return payload, transport
+
+
+def test_blocked_retry_recovers_after_identity_reset(monkeypatch):
+    _RetryFakeParser.calls = 0
+    payload, transport = _run_retry_case(monkeypatch, _RetryFakeParser, blocked_retries=3)
+    assert payload["status"] == "success"
+    assert payload["sources"][0]["url"] == "https://ok.test/a"
+    assert transport.fetches == 3      # first attempt + 2 retries
+    assert transport.drops == 2        # cookie branch dropped before each retry
+    assert transport.client_drops == 2  # pooled primp client dropped per retry
+    assert transport.naked_fetches == 2  # retries fetch with identity_key cleared
+    assert "captcha retry 2/3" in payload["diagnostics"]
+
+
+def test_blocked_retry_exhausts_and_stays_blocked(monkeypatch):
+    _AlwaysBlockedParser.calls = 0
+    payload, transport = _run_retry_case(monkeypatch, _AlwaysBlockedParser, blocked_retries=3)
+    assert payload["status"] == "blocked"
+    assert transport.fetches == 4      # first attempt + 3 retries
+    assert transport.drops == 3
+    assert transport.client_drops == 3
+    assert transport.naked_fetches == 3
+    assert "captcha retry 3/3" in payload["diagnostics"]
+
+
+def test_blocked_retry_off_by_default(monkeypatch):
+    _AlwaysBlockedParser.calls = 0
+    payload, transport = _run_retry_case(monkeypatch, _AlwaysBlockedParser, blocked_retries=0)
+    assert payload["status"] == "blocked"
+    assert transport.fetches == 1
+    assert transport.drops == 0
+
+
+# --- adaptive Yandex UA mode -------------------------------------------------------
+
+_GOOD_YANDEX_HTML = (
+    '<html><body><div class="Organic"><h2><a class="OrganicTitle-Link" '
+    'href="https://ok.test/x"><span class="OrganicTitle-LinkText">Title</span></a></h2>'
+    '<div class="OrganicTextContentSpan">text</div></div></body></html>'
+)
+
+
+def _reset_yandex_ua_state():
+    from core.engines import yandex as yz
+
+    yz._ua_mode = "yabrowser"
+    yz._plain_until = 0.0
+    yz._blocked_streak = 0
+
+
+def test_yandex_default_leg_sends_yabrowser_ua():
+    _reset_yandex_ua_state()
+    from core.engines.yandex import YandexParser
+
+    req = YandexParser.build_request("q", region="us-en")
+    assert "YaBrowser" in req.headers.get("User-Agent", "")
+    assert req.primp_target == "chrome"  # pinned chromium TLS
+
+
+def test_yandex_blocked_streak_flips_to_plain_then_recovers():
+    _reset_yandex_ua_state()
+    from core.engines import yandex as yz
+    from core.engines.yandex import YandexParser
+
+    parser = YandexParser()
+    parser.parse("<html>smartcaptcha</html>")
+    req = YandexParser.build_request("q", region="us-en")
+    assert "YaBrowser" in req.headers.get("User-Agent", "")  # one strike is not enough
+
+    parser.parse("<html>smartcaptcha</html>")  # second consecutive block flips
+    req = YandexParser.build_request("q", region="us-en")
+    assert "User-Agent" not in req.headers  # plain leg: the proven no-UA recipe
+
+    yz._plain_until = 0.0  # cooldown elapsed
+    req = YandexParser.build_request("q", region="us-en")
+    assert "YaBrowser" in req.headers.get("User-Agent", "")
+
+
+def test_yandex_success_resets_blocked_streak():
+    _reset_yandex_ua_state()
+    from core.engines.yandex import YandexParser
+
+    parser = YandexParser()
+    parser.parse("<html>smartcaptcha</html>")   # streak 1
+    assert parser.parse(_GOOD_YANDEX_HTML).status.value == "success"  # streak reset
+    parser.parse("<html>smartcaptcha</html>")   # streak 1 again — no flip
+    req = YandexParser.build_request("q", region="us-en")
+    assert "YaBrowser" in req.headers.get("User-Agent", "")

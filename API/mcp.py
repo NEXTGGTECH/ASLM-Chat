@@ -321,7 +321,13 @@ def _get_async_callable_runner() -> AsyncCallableRunner:
 def _venv_subprocess_env(python_path: Path) -> dict[str, str]:
     """Return subprocess environment aligned with the selected venv."""
 
-    env = os.environ.copy()
+    from Services import venv_manager
+
+    # Partial module updates can pair this file with an older venv_manager that
+    # lacks the helper; a plain environment keeps tool workers spawning instead
+    # of dropping every module tool from the registry.
+    build_environment = getattr(venv_manager, "get_subprocess_environment", None)
+    env = build_environment(python_path) if callable(build_environment) else os.environ.copy()
     apply_loopback_proxy_bypass(env)
     venv_path = python_path.parent.parent
     env["VIRTUAL_ENV"] = str(venv_path)
@@ -1060,6 +1066,59 @@ def tool_server_id_for_alias(tool_lookup: dict[str, dict[str, Any]] | None, alia
     return str(server.get("id") or "")
 
 
+def available_tools_prompt(tool_lookup: dict[str, dict[str, Any]]) -> str:
+    """Describe only tools actually exposed for this generation, including alias filters."""
+    if not tool_lookup:
+        return ""
+    lines = [
+        "Available tools for this request (use their supplied parameter schemas):",
+        "For tasks beyond basic conversation, you MUST call the relevant tools before answering. "
+        "Inspect this list before claiming a capability is unavailable. "
+        "Do not call unrelated tools just to satisfy the requirement.",
+    ]
+    for alias, entry in tool_lookup.items():
+        tool = entry.get("tool") or {}
+        description = str(tool.get("description") or tool.get("name") or "").strip()
+        summary = description.splitlines()[0][:200] if description else ""
+        lines.append(f"- {alias}: {summary}")
+    seen_servers: set[str] = set()
+    for entry in tool_lookup.values():
+        server = entry.get("server") or {}
+        server_id = str(server.get("server_file") or server.get("id") or "")
+        if server_id in seen_servers or not server.get("has_model_context"):
+            continue
+        seen_servers.add(server_id)
+        try:
+            if server.get("external"):
+                # A fresh process reads current sandbox.env values, independent of discovery caches.
+                context = _run_worker(server["server_file"], "model_context", {})
+            else:
+                provider = getattr(server.get("module"), "get_model_context", None)
+                context = provider() if callable(provider) else ""
+            if isinstance(context, str) and context.strip():
+                lines.append(context.strip()[:8000])
+        except Exception:
+            logger.warning("Could not read model context for tool server %s", server.get("id"))
+            lines.append("Tool environment details unavailable; inspect the environment before heavy work.")
+    return "\n".join(lines)
+
+
+def with_available_tools_prompt(
+    conversation: list[dict[str, Any]], tool_lookup: dict[str, dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Add live capability context without mutating the caller's history."""
+    prompt = available_tools_prompt(tool_lookup)
+    if not prompt:
+        return conversation
+    messages = [dict(message) for message in conversation]
+    # Merge into the existing system message for backends with one system slot.
+    if messages and messages[0].get("role") == "system" and isinstance(messages[0].get("content"), str):
+        messages[0]["content"] = messages[0]["content"] + "\n\n" + prompt
+    else:
+        messages.insert(0, {"role": "system", "content": prompt})
+    return messages
+
+
 # Read user-required tool servers from the generation context.
 def required_tool_server_ids_from_context(
     tool_context: dict[str, Any] | None,
@@ -1643,6 +1702,7 @@ def _load_external_server(server_file: Path) -> dict[str, Any]:
         "description": str(description.get("description") or "").strip(),
         "requires_docker": bool(description.get("requires_docker")),
         "fresh_process_per_call": bool(description.get("fresh_process_per_call")),
+        "has_model_context": bool(description.get("has_model_context")),
         "tools": tools,
         "module": None,
         "supports": None,
@@ -1844,6 +1904,7 @@ def _extract_server_definition(module: ModuleType, folder_name: str, server_file
         "name": server_name,
         "description": description,
         "requires_docker": bool(raw_server.get("requires_docker")),
+        "has_model_context": callable(getattr(module, "get_model_context", None)),
         "tools": tools,
         "module": module,
         "supports": supports_fn if callable(supports_fn) else None,
@@ -2035,6 +2096,33 @@ def _serialize_server(server_definition: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 # Build Ollama-compatible tool definitions.
+# Tools offered only to multimodal (vision-capable) models. The image vertical is
+# useless to a text-only model — it cannot look at what it found — so it stays out
+# of the tool list entirely instead of wasting a call round.
+VISION_ONLY_TOOL_IDS = frozenset({"image_search"})
+
+
+def model_supports_vision(engine: str | None, model_name: str | None) -> bool:
+    """Read normalized vision support from the shared runtime metadata."""
+    try:
+        payload = json.loads((TOOLS_DIR / "model_runtime_metadata.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    active = payload.get("active")
+    active = active if isinstance(active, dict) else {}
+    engine = str(engine or active.get("engine") or "").strip()
+    model_name = str(model_name or active.get("model") or "").strip()
+    models = payload.get("models")
+    if not engine or not model_name or not isinstance(models, dict):
+        return False
+    # An explicit model must never inherit capabilities from a different active model.
+    record = models.get(f"{engine}:{model_name}")
+    capabilities = record.get("capabilities") if isinstance(record, dict) else None
+    return isinstance(capabilities, dict) and capabilities.get("vision") is True
+
+
 def build_ollama_tools(
     server_ids: str | list[str] | None,
     engine: str | None = None,
@@ -2044,6 +2132,7 @@ def build_ollama_tools(
     allowed_tool_aliases: list[str] | set[str] | tuple[str, ...] | None = None,
     instant_mode: bool = False,
     instant_search_batch_size: int | None = None,
+    model_vision: bool | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
     """Return Ollama-compatible tool payloads for one or more selected servers."""
 
@@ -2051,6 +2140,9 @@ def build_ollama_tools(
         server_ids = [server_ids] if server_ids else []
     elif not server_ids:
         server_ids = []
+
+    if model_vision is None:
+        model_vision = model_supports_vision(engine, model_name)
 
     tools: list[dict[str, Any]] = []
     tool_lookup: dict[str, dict[str, Any]] = {}
@@ -2073,6 +2165,10 @@ def build_ollama_tools(
         for tool_definition in server_definition["tools"]:
             alias = tool_definition["alias"]
             if allowed_aliases and alias not in allowed_aliases:
+                continue
+            # Vision gate: unknown capabilities (None) fail CLOSED — a text-only
+            # model must never see the image tools by accident.
+            if tool_definition.get("id") in VISION_ONLY_TOOL_IDS and model_vision is not True:
                 continue
             # Tool aliases are global in the conversation, so skip duplicates
             # when multiple selected servers resolve to the same public alias.
@@ -2674,6 +2770,16 @@ def _merge_parallel_web_search_calls(tool_calls: list[dict[str, Any]]) -> dict[s
             else:
                 merged_arguments[vertical] = merged_values
     else:
+        verticals = {arguments.get("vertical", "web") for arguments in raw_arguments
+                     if isinstance(arguments.get("vertical", "web"), str)}
+        if len(verticals) != 1 or any(
+            not isinstance(arguments.get("vertical", "web"), str) for arguments in raw_arguments
+        ):
+            return _rejected_parallel_search_call(
+                first,
+                message="parallel searches must use the same vertical; call different verticals separately",
+                call_count=len(tool_calls),
+            )
         routing_keys = ("shopping", "academic", "onion")
         for key in routing_keys:
             values = {_normalized_batch_bool(arguments, key) for arguments in raw_arguments}

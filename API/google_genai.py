@@ -2052,6 +2052,8 @@ def _run_tool_loop(
 
     tools, tool_lookup = _build_google_tools(tool_server_ids, model_name, tool_context)
     system_instruction, conversation = _build_google_contents(messages)
+    capability_prompt = tool_registry.available_tools_prompt(tool_lookup)
+    system_instruction = "\n\n".join(part for part in (system_instruction, capability_prompt) if part)
     request_config = _build_google_request_config(
         options,
         system_instruction=system_instruction,

@@ -1754,6 +1754,7 @@ def _run_tool_loop(
         return
 
     conversation = conversation if conversation is not None else _build_openai_messages(messages)
+    conversation = tool_registry.with_available_tools_prompt(conversation, tool_lookup)
     tool_quota_counters: dict[str, int] = {}
     seen_tool_signatures: set[str] = set()
     consecutive_blocked_tool_results = 0
