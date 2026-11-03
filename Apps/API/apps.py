@@ -14,9 +14,8 @@ class ApiConfig(AppConfig):
     default_auto_field = "django.db.models.BigAutoField"
     name = "Apps.API"
 
+    # Prepare enabled engine runtimes in a background thread without blocking Django startup.
     def ready(self) -> None:
-        """Prepare enabled engine runtimes without blocking Django startup."""
-
         # ASLM owns long-running engine processes through dedicated manifest
         # run commands. Starting the standalone reconciliation path here would
         # only import every enabled adapter in parallel with the first UI page,
@@ -25,6 +24,7 @@ class ApiConfig(AppConfig):
             logger.debug("ASLM owns engine runtime startup; skipping Django runtime sync.")
             return
 
+        # Run the runtime reconciliation; a failure is logged and never aborts startup.
         def _sync_enabled_engine_runtimes() -> None:
             try:
                 from API import llm_api

@@ -50,6 +50,7 @@ from Tools.system_prompts import get_system_prompt, is_instant_generation
 logger = logging.getLogger(__name__)
 
 
+# Make the Tools directory importable so the context_compression package below resolves.
 TOOLS_PATH = settings.BASE_DIR / "Tools"
 if str(TOOLS_PATH) not in sys.path:
     sys.path.insert(0, str(TOOLS_PATH))
@@ -62,6 +63,8 @@ from context_compression.history_compressor import (  # noqa: E402
     resolve_context_window_tokens,
 )
 
+# Option and capability names that engines use for thinking, thinking level and tool calling,
+# plus the chat-template substrings that reveal tool support of an Ollama model.
 THINK_PARAM_NAMES = {"think", "thinking", "reasoning"}
 THINK_LEVEL_PARAM_NAMES = {"think_level", "thinking_level", "reasoning_effort"}
 TOOL_CAPABILITY_NAMES = {"tools", "tool", "tool-calling", "tool_calling"}
@@ -75,6 +78,8 @@ OLLAMA_TOOL_TEMPLATE_MARKERS = (
     "available_tools",
     "function_call",
 )
+
+# File extensions of attachments that are treated as readable text and inlined into the prompt.
 TEXT_ATTACHMENT_EXTENSIONS = {
     ".adoc", ".ahk", ".asm", ".asciidoc", ".bash", ".bat", ".bib", ".c", ".cc", ".cfg",
     ".clj", ".cljc", ".cljs", ".cmd", ".cmake", ".conf", ".config", ".cpp", ".cs",
@@ -95,6 +100,8 @@ TEXT_ATTACHMENT_EXTENSIONS = {
 }
 
 
+# System prompt
+
 # Build dynamic runtime context injected into every system prompt.
 def _build_runtime_context() -> str:
     from datetime import datetime
@@ -110,6 +117,8 @@ def _chat_is_first_user_turn(chat: Chat | None) -> bool:
 
 
 # Merge the project prompt with per-request user instructions.
+# The parts are joined in a fixed order: project prompt, runtime context, skills delta, forced
+# skills, then the user's additional instructions.
 def _compose_system_prompt(
     user_system_prompt: str,
     *,
@@ -120,6 +129,7 @@ def _compose_system_prompt(
 ) -> str:
     parts: list[str] = []
 
+    # Project-wide base prompt and the current date.
     default_prompt = get_system_prompt(instant_mode=instant_mode)
     if default_prompt:
         parts.append(default_prompt)
@@ -128,6 +138,7 @@ def _compose_system_prompt(
     if runtime_context:
         parts.append(runtime_context)
 
+    # Skills section; a failure here must not break generation, so it is logged and skipped.
     try:
         skill_delta = skills_config.build_system_prompt_skills_section(
             consume=consume_skill_notifications,
@@ -139,6 +150,7 @@ def _compose_system_prompt(
     if skill_delta:
         parts.append(skill_delta)
 
+    # Skills the user forced with a slash command, then the user's own instructions.
     forced_skill_section = _build_forced_skill_prompt_section(forced_skill_names or [])
     if forced_skill_section:
         parts.append(forced_skill_section)
@@ -152,6 +164,7 @@ def _compose_system_prompt(
 
 # Build a deterministic system prompt block for skills explicitly selected by a slash command.
 def _build_forced_skill_prompt_section(skill_names: list[str]) -> str:
+    # Deduplicate the requested names case-insensitively, keeping the first spelling and order.
     unique_names: list[str] = []
     seen: set[str] = set()
     for raw_name in skill_names or []:
@@ -163,6 +176,7 @@ def _build_forced_skill_prompt_section(skill_names: list[str]) -> str:
     if not unique_names:
         return ""
 
+    # Load the installed skills and index their folders by case-folded name.
     try:
         payload = skills_config.list_skills()
     except Exception:
@@ -181,6 +195,7 @@ def _build_forced_skill_prompt_section(skill_names: list[str]) -> str:
         "The user explicitly selected these skill(s) for this request. Follow the included instructions.",
     ]
 
+    # Append each skill's primary file; missing or disabled skills get a short note instead.
     for name in unique_names:
         folder = folder_by_key.get(name.casefold())
         if not folder:
@@ -194,6 +209,8 @@ def _build_forced_skill_prompt_section(skill_names: list[str]) -> str:
         primary = str(folder.get("primary_file") or "SKILL.md").strip() or "SKILL.md"
         skill_root = (root / folder_name).resolve()
         skill_path = (skill_root / primary).resolve()
+
+        # relative_to raises when the primary file escapes the skill folder (path traversal).
         try:
             skill_path.relative_to(skill_root)
             content = skill_path.read_text(encoding="utf-8").strip()
@@ -206,6 +223,7 @@ def _build_forced_skill_prompt_section(skill_names: list[str]) -> str:
     return "\n".join(sections).strip()
 
 
+# Well-known extensionless or dotfile names (compared in lower case) that count as text attachments.
 TEXT_ATTACHMENT_FILENAMES = {
     ".bash_profile",
     ".bashrc",
@@ -243,7 +261,13 @@ TEXT_ATTACHMENT_FILENAMES = {
     "tiltfile",
     "vagrantfile",
 }
+
+# Maximum number of characters of one text attachment that is inlined into the prompt.
 ATTACHMENT_TEXT_CHAR_LIMIT = 24000
+
+# Limits for the chat history sent to the model: the message window, the default character budget
+# and the settings of the history compression (trigger ratio, summary size limits and how many
+# recent user and directive messages are carried into the summary).
 LLM_HISTORY_MAX_MESSAGES = 40
 LLM_HISTORY_MIN_MESSAGES = 8
 LLM_HISTORY_DEFAULT_CHAR_BUDGET = 48000
@@ -253,12 +277,22 @@ LLM_HISTORY_COMPRESSION_MAX_LINES = 120
 LLM_HISTORY_COMPRESSION_MAX_ITEMS = 120
 LLM_HISTORY_COMPRESSION_RECENT_USER_MESSAGES = 5
 LLM_HISTORY_COMPRESSION_DIRECTIVE_MESSAGES = 20
+
+# Throttle for persisting the partial assistant message while a response streams: the minimum
+# interval and the minimum number of new characters between two snapshots.
 STREAMING_ASSISTANT_SNAPSHOT_INTERVAL_SECONDS = 1.0
 STREAMING_ASSISTANT_SNAPSHOT_MIN_CHAR_DELTA = 256
+
+# Model metadata caching: the schema version is part of the cache key so a payload format change
+# invalidates old entries; the TTLs are in seconds. The runtime metadata file is a JSON file that
+# mirrors the active model's capabilities and limits for local tools.
 MODEL_INFO_CACHE_SCHEMA_VERSION = "reasoning-level-options-v2"
 MODEL_INFO_CACHE_TTL_SECONDS = 300
 MODEL_LIST_CACHE_TTL_SECONDS = 45
 MODEL_RUNTIME_METADATA_PATH = settings.BASE_DIR / "Tools" / "model_runtime_metadata.json"
+
+# Patterns for chat-template control tokens (for example <|start|> or <|im_end|>) that must be
+# stripped from model output.
 LLM_CONTROL_TOKEN_PATTERNS = (
     re.compile(
         r"<\|start\|>\s*(?:assistant|user|system)?\s*(?:<\|channel\|>\s*(?:final|analysis|commentary))?\s*(?:<\|message\|>)?",
@@ -272,9 +306,14 @@ LLM_CONTROL_TOKEN_PATTERNS = (
     re.compile(r"<\|im_(?:start|end)\|>", flags=re.IGNORECASE),
     re.compile(r"<\|(?:assistant|user|system|endoftext)\|>", flags=re.IGNORECASE),
 )
+
+# Slash commands recognized anywhere in a message: /search, /tool <id> and /skill <name>.
 SLASH_SEARCH_COMMAND_PATTERN = re.compile(r"(?:(?<=\s)|^)/search(?![\w-])", flags=re.IGNORECASE)
 SLASH_TOOL_COMMAND_PATTERN = re.compile(r"(?:(?<=\s)|^)/tool[ \t]+(?P<id>[\w][\w.-]*)", flags=re.IGNORECASE)
 SLASH_SKILL_COMMAND_PATTERN = re.compile(r"(?:(?<=\s)|^)/skill[ \t]+(?P<name>[\w][\w.-]*)", flags=re.IGNORECASE)
+
+# System prompt directives added when the matching slash command is present: forced web search,
+# the three-query batch rule of instant mode, and the note about inline command markers.
 SLASH_SEARCH_DIRECTIVE = (
     "The user selected web search for this request. Use the web_search tool first, "
     "then answer from the result. If forced tool choice is unavailable, still call web_search when possible."
@@ -290,6 +329,11 @@ SLASH_INLINE_MARKER_DIRECTIVE = (
 )
 
 
+# Slash commands
+
+# Generation controls derived from the slash commands of one message: the rewritten message text,
+# extra prompt directives, the tool servers to enable (and the required subset), the tool the model
+# must call first and the skills to inject.
 @dataclass(frozen=True)
 class ChatCommandPlan:
     message: str
@@ -311,12 +355,17 @@ def _parse_chat_command_plan(
 ) -> ChatCommandPlan:
     text = str(message or "")
     tool_ids = [str(item).strip() for item in existing_tool_ids or [] if str(item).strip()]
+
+    # Plan state collected by the replacement callbacks below; known_tool_id_cache avoids asking
+    # the validator twice about the same tool id.
     directives: list[str] = []
     required_tool_ids: list[str] = []
     forced_tool_name = ""
     forced_skill_names: list[str] = []
     known_tool_id_cache: dict[str, bool] = {}
 
+    # Return whether a tool id exists on the current engine; any id is accepted without a
+    # validator, and a failing validator counts as unknown.
     def _tool_id_known(tool_id: str) -> bool:
         if is_known_tool_id is None:
             return True
@@ -328,14 +377,17 @@ def _parse_chat_command_plan(
                 known_tool_id_cache[tool_id] = False
         return known_tool_id_cache[tool_id]
 
+    # Enable a tool server for the request and mark it as required.
     def _require_tool(tool_id: str) -> None:
         if tool_id not in tool_ids:
             tool_ids.append(tool_id)
         if tool_id not in required_tool_ids:
             required_tool_ids.append(tool_id)
 
+    # Replace a /search command with an inline marker and force the web_search tool.
     def _replace_search(match: re.Match) -> str:
         nonlocal forced_tool_name
+
         # Unknown on this engine: leave the literal text so the request still succeeds.
         if not _tool_id_known("web_search"):
             return match.group(0)
@@ -345,6 +397,7 @@ def _parse_chat_command_plan(
             directives.append(SLASH_SEARCH_DIRECTIVE)
         return "[user command: run a web search (web_search tool) for this part of the request]"
 
+    # Replace a /tool <id> command with an inline marker and require that tool server.
     def _replace_tool(match: re.Match) -> str:
         tool_id = str(match.group("id") or "").strip()
         if not tool_id or not _tool_id_known(tool_id):
@@ -358,6 +411,7 @@ def _parse_chat_command_plan(
             directives.append(directive)
         return f"[user command: use the '{tool_id}' tools for this part of the request]"
 
+    # Replace a /skill <name> command with an inline marker and queue the skill for injection.
     def _replace_skill(match: re.Match) -> str:
         skill_name = str(match.group("name") or "").strip()
         if not skill_name:
@@ -366,10 +420,12 @@ def _parse_chat_command_plan(
             forced_skill_names.append(skill_name)
         return f"[user command: apply the skill '{skill_name}' to this request]"
 
+    # Rewrite every command in place; tool and skill commands run before /search.
     text = SLASH_TOOL_COMMAND_PATTERN.sub(_replace_tool, text)
     text = SLASH_SKILL_COMMAND_PATTERN.sub(_replace_skill, text)
     text = SLASH_SEARCH_COMMAND_PATTERN.sub(_replace_search, text)
 
+    # Explain the inline markers to the model whenever at least one command was applied.
     if directives or forced_skill_names:
         directives.insert(0, SLASH_INLINE_MARKER_DIRECTIVE)
 
@@ -392,23 +448,21 @@ def _append_command_directives_to_system_prompt(system_prompt: str, directives: 
     return "\n\n".join(part for part in [str(system_prompt or "").strip(), directive_block] if part).strip()
 
 
+# Return the plan's directives plus request-scoped mode rules, without changing the baseline prompt.
 def _command_directives_for_mode(command_plan: ChatCommandPlan, *, instant_mode: bool) -> list[str]:
-    """Add request-scoped mode rules without changing the baseline prompt."""
-
     directives = list(command_plan.directives)
     if instant_mode and command_plan.forced_tool_name == "web_search":
         directives.append(INSTANT_SLASH_SEARCH_BATCH_DIRECTIVE)
     return directives
 
 
+# Apply deterministic slash-command controls to one adapter tool context in place.
 def _apply_command_tool_context(
     tool_context: dict[str, Any],
     command_plan: ChatCommandPlan,
     *,
     instant_mode: bool,
 ) -> None:
-    """Apply deterministic slash-command controls to one adapter tool context."""
-
     if command_plan.forced_tool_name:
         tool_context["forced_tool_name"] = command_plan.forced_tool_name
     if command_plan.required_tool_server_ids:
@@ -416,24 +470,39 @@ def _apply_command_tool_context(
     if instant_mode and command_plan.forced_tool_name == "web_search":
         tool_context["instant_search_batch_size"] = tool_registry.INSTANT_SEARCH_BATCH_LIMIT
 
+
+# Caches and runtime state
+
+# Process-wide in-memory metadata caches guarded by one lock. Each entry is a (monotonic timestamp,
+# payload) pair keyed by the engine, the model where relevant, the engine endpoint and a hash of
+# its API key.
 _metadata_cache_lock = threading.RLock()
 _model_info_cache: dict[tuple[str, str, str, str], tuple[float, dict[str, Any]]] = {}
 _model_list_cache: dict[tuple[str, str, str], tuple[float, list[str]]] = {}
 _tool_server_cache: dict[tuple[str, str, str, str], tuple[float, list[dict[str, Any]]]] = {}
+
+# The model most recently used on each engine, guarded by its own lock.
 _active_model_lock = threading.RLock()
 _active_model_by_engine: dict[str, str] = {}
+
+# Last observed token usage per chat id, guarded by its own lock.
 _chat_usage_lock = threading.RLock()
 _chat_usage_by_chat_id: dict[str, dict[str, Any]] = {}
 
 
+# Id of the generation currently running per engine and per chat, used to abort a generation.
 _generation_state_lock = threading.RLock()
 _active_generation_id_by_engine: dict[str, str] = {}
 _active_generation_id_by_chat_id: dict[str, str] = {}
 
 
+# Uploaded file context: the entry type of prompt entries built from uploads and the maximum size
+# of an uploaded JSON file or media file that is read into the context.
 UPLOADED_FILE_CONTEXT_ENTRY_TYPE = "uploaded_file_context"
 UPLOADED_JSON_CONTEXT_MAX_BYTES = 8 * 1024 * 1024
 UPLOADED_MEDIA_CONTEXT_MAX_BYTES = 20 * 1024 * 1024
+
+# MIME types and file suffixes that identify an uploaded JSON document.
 JSON_UPLOAD_MIME_TYPES = {
     "application/geo+json",
     "application/json",
@@ -443,6 +512,7 @@ JSON_UPLOAD_MIME_TYPES = {
 }
 JSON_UPLOAD_SUFFIXES = {".geojson", ".json", ".jsonl", ".ndjson"}
 
+# Alternative key names under which engines report the context window and the output token limit.
 CONTEXT_WINDOW_KEYS = (
     "num_ctx",
     "context_length",
@@ -468,7 +538,10 @@ OUTPUT_TOKEN_KEYS = (
 
 
 # Return a stable runtime scope for model metadata caches.
+# The scope is the engine endpoint plus a short hash of its API key, so cached entries are never
+# shared across different connections and the key itself is never stored.
 def _engine_metadata_scope(engine: str) -> tuple[str, str]:
+    # Unreadable settings fall back to empty values instead of failing the request.
     try:
         endpoint = settings.get_engine_url(engine)
     except Exception:
@@ -629,13 +702,15 @@ def _set_cached_model_list(engine: str, models: list[str]) -> list[str]:
     return list(cached_models)
 
 
-# Return cached tool servers when still fresh.
+# Return the tool servers available to an engine and model, served from a short-lived cache when
+# fresh and loaded from the tool registry otherwise.
 def _list_tool_servers_cached(engine: str, model_name: str | None = None) -> list[dict[str, Any]]:
     endpoint, api_key_hash = _engine_metadata_scope(engine)
     normalized_model = str(model_name or "")
     cache_key = (engine, normalized_model, endpoint, api_key_hash)
     now = time.monotonic()
 
+    # Cache hit: return a copy; an expired entry is dropped and reloaded below.
     with _metadata_cache_lock:
         cached = _tool_server_cache.get(cache_key)
         if cached is not None:
@@ -675,6 +750,8 @@ def _stamp_docker_availability(servers: list[dict[str, Any]]) -> list[dict[str, 
     return servers
 
 
+# Logging and output cleanup
+
 # Emit one concise runtime event for the ASLM console.
 def _print_runtime_event(message: str) -> None:
     print(f"[ASLM-Chat] {message}", flush=True)
@@ -704,6 +781,7 @@ def _format_runtime_error(engine: str, exc: Exception) -> str:
     message = str(exc).strip()
     normalized_message = message.lower()
 
+    # Connectivity failures get one fixed message per engine.
     if settings.is_ollama_engine(engine) and _is_expected_runtime_error(exc):
         return (
             "Failed to connect to Ollama. Please check that Ollama is downloaded, "
@@ -719,6 +797,8 @@ def _format_runtime_error(engine: str, exc: Exception) -> str:
     if engine == "lms" and _is_expected_runtime_error(exc):
         return "Failed to connect to LM Studio."
 
+    # Recognized engine-specific failures are rewritten into actionable hints; anything else is
+    # returned unchanged.
     if engine == "google-genai":
         if any(marker in normalized_message for marker in ("api key", "permission denied", "unauthenticated", "unauthorized")):
             return "Google GenAI authentication failed. Check the configured API key."
@@ -766,6 +846,8 @@ def _count_request_images(messages: list[dict[str, Any]]) -> int:
     return image_count
 
 
+# Attachments
+
 # Return decoded bytes for one base64 payload or data URL.
 def _decode_base64_payload(raw_value: Any) -> bytes:
     if raw_value is None:
@@ -781,6 +863,7 @@ def _decode_base64_payload(raw_value: Any) -> bytes:
     try:
         return base64.b64decode(payload, validate=True)
     except (ValueError, binascii.Error):
+        # Strict decoding rejected the text; retry leniently, which skips stray characters.
         return base64.b64decode(payload)
 
 
@@ -845,6 +928,8 @@ def _guess_attachment_kind(mime_type: str, name: str = "") -> str:
 
 # Normalize one incoming attachment payload into the storage shape.
 def _normalize_attachment_payload(raw_attachment: Any, order: int) -> dict[str, Any] | None:
+    # A bare string is a legacy image payload; a dict is a full attachment description with
+    # several accepted spellings of each key. Any other type is rejected.
     if isinstance(raw_attachment, str):
         mime_type = _detect_image_mime(raw_attachment)
         raw_data = raw_attachment
@@ -889,6 +974,7 @@ def _normalize_attachment_payload(raw_attachment: Any, order: int) -> dict[str, 
             "order": order,
         }
 
+    # Binary attachments: strip a data URL prefix and reject empty or malformed base64.
     encoded = str(raw_data or "").strip()
     if not encoded:
         return None
@@ -903,6 +989,7 @@ def _normalize_attachment_payload(raw_attachment: Any, order: int) -> dict[str, 
     if size_bytes <= 0 or not _is_valid_base64_payload(encoded):
         return None
 
+    # Generate a default file name from the kind, the order and the MIME-derived extension.
     kind = _guess_attachment_kind(mime_type, name)
     if not name:
         extension = mimetypes.guess_extension(mime_type or "") or ""
@@ -938,6 +1025,8 @@ def _attachment_content_url(record_type: str, record_id: int) -> str:
 
 # Convert a persisted attachment-like object into the frontend payload.
 def _serialize_attachment_record(attachment: Any, *, include_data: bool = True) -> dict[str, Any]:
+    # Current attachment model: file, image and URL attachments. A URL attachment keeps its
+    # link in the name field.
     if isinstance(attachment, MessageAttachment):
         payload = {
             "id": attachment.id,
@@ -956,6 +1045,7 @@ def _serialize_attachment_record(attachment: Any, *, include_data: bool = True) 
             payload["extracted_text_ready"] = attachment.extracted_text_ready
         return payload
 
+    # Legacy image model: it has no stored name, so one is derived from the position.
     if isinstance(attachment, MessageImage):
         payload = {
             "id": attachment.id,
@@ -996,6 +1086,8 @@ def _is_text_attachment(mime_type: str, name: str) -> bool:
     normalized_mime = str(mime_type or "").strip().lower()
     normalized_name = Path(name or "").name.lower()
     attachment_path = Path(name or "")
+
+    # Text and source-code MIME types, including SVG, which is XML text.
     if normalized_mime.startswith("text/"):
         return True
     if normalized_mime in {
@@ -1019,6 +1111,8 @@ def _is_text_attachment(mime_type: str, name: str) -> bool:
     }:
         return True
 
+    # Fall back to the file name: well-known names first, then any suffix of the name (so
+    # multi-suffix names such as "config.json.bak"-style files match on any known part).
     if normalized_name in TEXT_ATTACHMENT_FILENAMES:
         return True
 
@@ -1072,6 +1166,7 @@ def _extract_attachment_text(attachment: dict[str, Any]) -> str:
     if not file_bytes:
         return _cache_attachment_text(attachment, "")
 
+    # PDF: extract the text of all pages with PyMuPDF; an unreadable document yields no text.
     suffix = Path(attachment_name).suffix.lower()
     if mime_type == "application/pdf" or suffix == ".pdf":
         try:
@@ -1083,11 +1178,13 @@ def _extract_attachment_text(attachment: dict[str, Any]) -> str:
         except Exception:
             return _cache_attachment_text(attachment, "")
 
+    # Text files: try the likely encodings in order; latin-1 decodes any byte sequence.
     if _is_text_attachment(mime_type, attachment_name):
         for encoding in ("utf-8", "utf-8-sig", "cp1251", "latin-1"):
             try:
                 return _cache_attachment_text(attachment, _truncate_attachment_text(file_bytes.decode(encoding)))
             except UnicodeDecodeError:
+                # This encoding does not fit the bytes; try the next one.
                 continue
 
     return _cache_attachment_text(attachment, "")
@@ -1128,6 +1225,8 @@ def _build_file_attachment_prompt_block(attachment: dict[str, Any]) -> str:
         "[/Attached file]"
     )
 
+
+# Uploaded files
 
 # Return whether the resolved tool selection includes sandbox file access.
 def _selected_tools_include_sandbox(selected_tool_servers: list[dict[str, Any]]) -> bool:
@@ -1211,6 +1310,8 @@ def _extract_uploaded_file_ids_from_message(message: Message) -> list[str]:
     if not isinstance(raw_entries, list):
         return []
 
+    # Walk the transcript entries of the uploaded-file context type and collect their ids,
+    # deduplicated in first-seen order.
     seen: set[str] = set()
     file_ids: list[str] = []
     for raw_entry in raw_entries:
@@ -1251,6 +1352,8 @@ def _build_uploaded_file_prompt_block(manifest: dict[str, Any]) -> str:
     name = str(manifest.get("name") or "file").strip() or "file"
     mime = str(manifest.get("mime") or "application/octet-stream").strip()
     size_bytes = int(manifest.get("size_bytes") or 0)
+
+    # Header lines: identity of the file plus its sandbox path when the sandbox can read it.
     lines = [
         f"[Uploaded file: {name}]",
         f"File ID: {manifest.get('file_id') or ''}",
@@ -1262,6 +1365,7 @@ def _build_uploaded_file_prompt_block(manifest: dict[str, Any]) -> str:
     if sandbox_path:
         lines.append(f"Sandbox path: {sandbox_path}")
 
+    # Content previews: archive listing, table preview and JSON content, each when available.
     archive_tree = manifest.get("archive_tree")
     if isinstance(archive_tree, list) and archive_tree:
         lines.append(
@@ -1280,6 +1384,7 @@ def _build_uploaded_file_prompt_block(manifest: dict[str, Any]) -> str:
         if manifest.get("json_content_truncated"):
             lines.append("JSON content was truncated to the model-context size limit.")
 
+    # Full JSON content replaces the text preview; otherwise say why no readable content follows.
     text_preview = str(manifest.get("text_preview") or "").strip()
     if text_preview and not isinstance(json_content, str):
         lines.append(f"Text preview:\n{text_preview}")
@@ -1344,6 +1449,7 @@ def _uploaded_json_context(manifest: dict[str, Any]) -> tuple[str | None, bool]:
         try:
             return raw_bytes.decode(encoding).strip(), truncated
         except UnicodeDecodeError:
+            # This encoding does not fit the bytes; try the next one.
             continue
     return raw_bytes.decode("utf-8", errors="replace").strip(), truncated
 
@@ -1379,6 +1485,7 @@ def _apply_uploaded_file_manifests_to_llm_entry(
     *,
     supported_media_kinds: set[str] | None = None,
 ) -> dict[str, Any]:
+    # Enrich each manifest with inline JSON content and a media part when the model supports it.
     allowed_media = set(supported_media_kinds or set())
     hydrated_manifests: list[dict[str, Any]] = []
     media_parts: list[dict[str, Any]] = []
@@ -1396,6 +1503,7 @@ def _apply_uploaded_file_manifests_to_llm_entry(
             media_parts.append(media_part)
         hydrated_manifests.append(hydrated)
 
+    # Append the text blocks of all uploads to the message content.
     blocks = [_build_uploaded_file_prompt_block(manifest) for manifest in hydrated_manifests]
     if not blocks:
         return entry
@@ -1404,6 +1512,8 @@ def _apply_uploaded_file_manifests_to_llm_entry(
     upload_context = "\n\n".join(blocks)
     entry["content"] = f"{content}\n\n{upload_context}".strip() if content else upload_context
 
+    # Attach media parts: images go to the images list, other media to the media list, skipping
+    # duplicates.
     for media_part in media_parts:
         if media_part["kind"] == "image":
             images = entry.setdefault("images", [])
@@ -1449,7 +1559,10 @@ def _apply_attachments_to_llm_entry(entry: dict[str, Any], attachments: list[dic
     return entry
 
 
-# Read local GPU devices
+# Engine and model lookup
+
+# Return the local NVIDIA GPUs (id and name) reported by nvidia-smi, or an empty list when the tool
+# is missing or fails.
 def _get_local_gpu_devices() -> list[dict[str, Any]]:
     try:
         result = subprocess.run(
@@ -1465,6 +1578,7 @@ def _get_local_gpu_devices() -> list[dict[str, Any]]:
     if result.returncode != 0:
         return []
 
+    # Parse the "index,name" CSV lines, skipping lines whose index is not a number.
     devices: list[dict[str, Any]] = []
     for line in result.stdout.splitlines():
         parts = [part.strip() for part in line.split(",", 1)]
@@ -1473,15 +1587,17 @@ def _get_local_gpu_devices() -> list[dict[str, Any]]:
         try:
             device_id = int(parts[0])
         except ValueError:
+            # Not a device line (for example a warning printed by nvidia-smi).
             continue
         devices.append({"id": device_id, "name": parts[1] or f"GPU {device_id}"})
 
     return devices
 
 
-# Raised when an explicit request targets a disabled engine.
+# Raised when an explicit request names an unsupported engine or an engine that is not enabled in
+# settings.
 class RequestEngineResolutionError(ValueError):
-    """The requested engine is not enabled in settings."""
+    pass
 
 
 # Resolve the default active engine without request context.
@@ -1491,6 +1607,7 @@ def _get_active_engine(requested_engine: str | None = None) -> str:
 
 # Resolve one engine from an HTTP request body and/or query string.
 def _resolve_request_engine(request, data: dict[str, Any] | None = None) -> str:
+    # The body wins over the query string; without either, the configured default engine is used.
     explicit_engine = None
     if isinstance(data, dict) and data.get("engine"):
         explicit_engine = data.get("engine")
@@ -1520,7 +1637,7 @@ def _resolve_request_engine_or_response(request, data: dict[str, Any] | None = N
         return None, JsonResponse({"error": str(exc)}, status=400)
 
 
-# Extract model name
+# Extract the model name from a string, a dict or an object, trying the common identifier keys.
 def _extract_model_name(model_entry: Any) -> str:
     if isinstance(model_entry, str):
         return model_entry
@@ -1537,12 +1654,14 @@ def _extract_model_name(model_entry: Any) -> str:
     return ""
 
 
-# Load engine models
+# Return the sorted, deduplicated model names of an engine, using the model list cache. A failed
+# or unsupported listing returns an empty list and is not cached.
 def _load_models_for_engine(engine: str) -> list[str]:
     cached_models = _get_cached_model_list(engine)
     if cached_models is not None:
         return cached_models
 
+    # Ask the engine; listing errors degrade to an empty list so the UI keeps working.
     try:
         raw_models = llm_api.get_models(engine)
     except NotImplementedError:
@@ -1560,6 +1679,7 @@ def _load_models_for_engine(engine: str) -> list[str]:
         if model_name:
             model_names.append(model_name)
 
+    # An empty Ollama list is not cached, so a freshly started server is probed again next time.
     sorted_model_names = sorted(set(model_names), key=str.casefold)
     if not sorted_model_names and settings.is_ollama_engine(engine):
         return []
@@ -1567,7 +1687,9 @@ def _load_models_for_engine(engine: str) -> list[str]:
     return _set_cached_model_list(engine, sorted_model_names)
 
 
-# Detect image MIME type
+# Transcripts and history
+
+# Detect the image MIME type from the base64 magic prefix, defaulting to JPEG.
 def _detect_image_mime(base64_data: str) -> str:
     if base64_data.startswith("/9j/"):
         return "image/jpeg"
@@ -1580,7 +1702,7 @@ def _detect_image_mime(base64_data: str) -> str:
     return "image/jpeg"
 
 
-# Strip legacy markup
+# Strip control tokens, <think> blocks and <tool_call> blocks from model output.
 def _strip_llm_markup(content: str) -> str:
     source = _strip_llm_control_tokens(str(content or ""))
     source = re.sub(r"<think>.*?</think>", "", source, flags=re.DOTALL)
@@ -1588,7 +1710,8 @@ def _strip_llm_markup(content: str) -> str:
     return source.strip()
 
 
-# Normalize transcript entries
+# Normalize a stored assistant transcript, keeping only assistant and tool entries and only the
+# fields that are relevant for each role.
 def _normalize_transcript_entries(raw_entries: Any) -> list[dict[str, Any]]:
     if not isinstance(raw_entries, list):
         return []
@@ -1597,6 +1720,8 @@ def _normalize_transcript_entries(raw_entries: Any) -> list[dict[str, Any]]:
     for raw_entry in raw_entries:
         if not isinstance(raw_entry, dict):
             continue
+
+        # Entries without a role that carry tool fields are tool results.
         role = str(raw_entry.get("role", "") or "").strip().lower()
         if not role and (
             raw_entry.get("alias")
@@ -1608,6 +1733,8 @@ def _normalize_transcript_entries(raw_entries: Any) -> list[dict[str, Any]]:
         if role not in {"assistant", "tool"}:
             continue
 
+        # Assistant entries keep reasoning and tool calls; tool entries keep the call identity,
+        # arguments and UI payloads.
         entry: dict[str, Any] = {
             "role": role,
             "content": str(raw_entry.get("content", "") or ""),
@@ -1647,6 +1774,8 @@ def _llm_entries_from_assistant_transcript(
     *,
     content_fallback: str = "",
 ) -> list[dict[str, Any]]:
+    # With a stored transcript, replay it entry by entry; a compression summary becomes a system
+    # message and the other entries keep only the fields the model needs.
     if transcript_entries:
         llm_entries: list[dict[str, Any]] = []
         for entry in transcript_entries:
@@ -1676,6 +1805,7 @@ def _llm_entries_from_assistant_transcript(
             llm_entries.append(payload)
         return llm_entries
 
+    # No transcript (for example a plain message): use the visible text without model markup.
     stripped_content = _strip_llm_markup(content_fallback)
     if not stripped_content:
         return []
@@ -1699,6 +1829,7 @@ def _build_llm_entries_from_request_message(
     sandbox_enabled: bool = False,
     supported_media_kinds: set[str] | None = None,
 ) -> list[dict[str, Any]]:
+    # Assistant messages are replayed from their transcript; unknown roles are dropped.
     role = str(message.get("role") or "").strip().lower()
     if role == "assistant":
         transcript_entries = _normalize_transcript_entries(message.get("llm_transcript"))
@@ -1710,6 +1841,8 @@ def _build_llm_entries_from_request_message(
     if role not in {"user", "system", "tool"}:
         return []
 
+    # User and system messages carry inline attachments and uploaded files; a message that ends up
+    # completely empty is skipped.
     if role in {"user", "system"}:
         payload = {"role": role, "content": str(message.get("content") or "")}
         attachments = _normalize_attachments_from_mapping(message)
@@ -1727,6 +1860,7 @@ def _build_llm_entries_from_request_message(
             return []
         return [payload]
 
+    # Tool messages keep their call identity fields.
     tool_payload: dict[str, Any] = {
         "role": "tool",
         "content": str(message.get("content") or ""),
@@ -1737,7 +1871,8 @@ def _build_llm_entries_from_request_message(
     return [tool_payload]
 
 
-# Build LLM history entries
+# Build LLM history entries for one stored message: user and system messages get their attachments
+# and uploads applied, assistant messages are replayed from their transcript.
 def _build_llm_history_entries(
     message: Message,
     *,
@@ -1772,6 +1907,8 @@ def _message_has_context_compression_summary(message: Message) -> bool:
 
 
 # Build chronological non-compression entries represented by a new boundary.
+# The records are newest first; collection stops at the previous compression summary, and the
+# result is returned oldest first.
 def _build_context_compression_source_entries(
     history_records: list[Message],
     *,
@@ -1789,12 +1926,16 @@ def _build_context_compression_source_entries(
     return entries
 
 
-# Build activity segments
+# Message serialization
+
+# Build the ordered activity segments (thoughts, text and tool calls with their results) that the
+# frontend renders for one assistant message from its stored transcript.
 def _build_activity_segments(message: Message) -> list[dict[str, Any]]:
     transcript_entries = _normalize_transcript_entries(message.llm_transcript)
     if not transcript_entries:
         return []
 
+    # Strip the trailing "__<n>" counter that runtimes append to repeated tool aliases.
     def canonical_alias(value: Any) -> str:
         return re.sub(r"__\d+$", "", str(value or "").strip())
 
@@ -1815,6 +1956,8 @@ def _build_activity_segments(message: Message) -> list[dict[str, Any]]:
                     "entry": entry,
                 })
 
+    # Take the next unused result for an alias, falling back to a result whose alias differs only
+    # by the counter suffix. Return the alias the result was stored under and the result (or None).
     def pop_tool_result(alias: str) -> tuple[str, dict[str, Any] | None]:
         queue = tool_results.get(alias) or []
         if queue:
@@ -1825,16 +1968,22 @@ def _build_activity_segments(message: Message) -> list[dict[str, Any]]:
                 return candidate_alias, candidate_queue.pop(0)
         return alias, None
 
+    # Split a "<server>__<tool>" alias into its server id and tool id; an alias without a server
+    # part yields an empty server id.
     def split_alias(alias: str) -> tuple[str, str]:
         normalized = canonical_alias(alias)
         if "__" not in normalized:
             return "", normalized
         return tuple(normalized.split("__", 1))  # type: ignore[return-value]
 
+    # Build the placeholder UI of a Deep Research call that has no stored result yet, so the card
+    # shows a planning state; return None for every other tool.
     def pending_deep_research_ui(alias: str, arguments: dict[str, Any]) -> dict[str, Any] | None:
         server_id, tool_id = split_alias(alias)
         if server_id != "deep_research" and tool_id != "deep_research":
             return None
+
+        # The query budget is twice the requested rounds, with the rounds clamped to 2..25.
         try:
             rounds = min(25, max(2, int(arguments.get("max_rounds") or 6)))
         except (TypeError, ValueError):
@@ -1853,9 +2002,12 @@ def _build_activity_segments(message: Message) -> list[dict[str, Any]]:
             "can_stop": True,
         }
 
+    # Walk the transcript in order. consumed_result_entries counts tool results already attached
+    # to an assistant tool call, so the matching tool entries are not emitted a second time.
     segments: list[dict[str, Any]] = []
     consumed_result_entries: dict[str, int] = {}
     for entry in transcript_entries:
+        # Assistant entry: thought and text segments first, then one segment per tool call.
         if entry["role"] == "assistant":
             thinking = str(entry.get("thinking", "") or "").strip()
             content = str(entry.get("content", "") or "").strip()
@@ -1872,6 +2024,8 @@ def _build_activity_segments(message: Message) -> list[dict[str, Any]]:
                 alias = str(function_payload.get("name") or "").strip()
                 if not alias:
                     continue
+
+                # Arguments may arrive as a JSON string or as an object; anything else becomes {}.
                 raw_arguments = function_payload.get("arguments")
                 if isinstance(raw_arguments, str):
                     try:
@@ -1881,6 +2035,8 @@ def _build_activity_segments(message: Message) -> list[dict[str, Any]]:
                     arguments = decoded_arguments if isinstance(decoded_arguments, dict) else {}
                 else:
                     arguments = raw_arguments if isinstance(raw_arguments, dict) else {}
+
+                # Pair the call with its stored result; names fall back to the alias parts.
                 result_alias, result_payload = pop_tool_result(alias)
                 server_id, tool_id = split_alias(alias)
                 result_entry = result_payload.get("entry") if isinstance(result_payload, dict) else {}
@@ -1898,6 +2054,8 @@ def _build_activity_segments(message: Message) -> list[dict[str, Any]]:
                     "arguments": arguments,
                     "result": result_payload.get("content") if isinstance(result_payload, dict) else None,
                 }
+
+                # Attach the UI payloads; an unanswered Deep Research call gets the planning card.
                 tool_ui = result_payload.get("toolUi") if isinstance(result_payload, dict) else None
                 if not isinstance(tool_ui, dict):
                     tool_ui = pending_deep_research_ui(alias, arguments)
@@ -1916,11 +2074,14 @@ def _build_activity_segments(message: Message) -> list[dict[str, Any]]:
                     )
             continue
 
+        # Tool entry: skip it when an assistant tool call already consumed its result.
         seg_alias = str(entry.get("alias") or entry.get("tool_id", entry.get("name", "")) or "")
         normalized_seg_alias = canonical_alias(seg_alias)
         if consumed_result_entries.get(normalized_seg_alias, 0) > 0:
             consumed_result_entries[normalized_seg_alias] -= 1
             continue
+
+        # Otherwise it is an orphan result: emit it as its own tool segment.
         payload_queue = tool_results.get(seg_alias) or []
         if payload_queue:
             result_payload = payload_queue.pop(0)
@@ -1958,7 +2119,8 @@ def _message_has_reasoning_segments(message: Message) -> bool:
     )
 
 
-# Serialize message
+# Serialize one stored message into the frontend payload, including its activity segments,
+# attachments and the image list derived from them.
 def _serialize_message(message: Message, *, include_attachment_data: bool = True) -> dict[str, Any]:
     payload = {
         "id": message.id,
@@ -1966,16 +2128,22 @@ def _serialize_message(message: Message, *, include_attachment_data: bool = True
         "content": message.content,
         "created_at": message.created_at.isoformat(),
     }
+
+    # Activity segments are only present for assistant messages with a stored transcript.
     activity_segments = _build_activity_segments(message)
     if activity_segments:
         payload["activity_segments"] = activity_segments
         payload["reasoning_mode"] = _message_has_reasoning_segments(message)
+
+    # User messages also list their uploaded files as file attachments.
     attachments = _get_message_attachments(message, include_data=include_attachment_data)
     if message.role == "user":
         for manifest in _load_message_upload_manifests(message, sandbox_enabled=True):
             try:
                 uploaded_payload = public_upload_payload(manifest)
             except Exception:
+                # An upload whose payload cannot be built (for example a deleted file) is
+                # left out instead of failing the whole message.
                 continue
             if uploaded_payload:
                 uploaded_payload["kind"] = "file"
@@ -1990,7 +2158,7 @@ def _serialize_message(message: Message, *, include_attachment_data: bool = True
     return payload
 
 
-# Extract streamed message parts
+# Extract the (thinking, text) parts of one streamed chunk, with control tokens removed.
 def _extract_stream_message_parts(chunk: Any) -> tuple[str, str]:
     raw_message = chunk.get("message", {}) if isinstance(chunk, dict) else getattr(chunk, "message", {})
     if isinstance(raw_message, dict):
@@ -2018,6 +2186,7 @@ def _build_streaming_assistant_transcript(
     visible_content: str,
     thinking_content: str,
 ) -> list[dict[str, Any]]:
+    # Streamed text is only added when the transcript does not already contain it.
     entries = _copy_transcript_entries_for_storage(transcript_entries)
     has_assistant_content = False
     has_assistant_thinking = False
@@ -2039,7 +2208,7 @@ def _build_streaming_assistant_transcript(
     return entries
 
 
-# Serialize tool marker
+# Serialize a tool call into the <tool_call> marker that is streamed to the frontend.
 def _serialize_tool_call_marker(tool_event: dict[str, Any]) -> str:
     payload = {
         "alias": str(tool_event.get("alias", "") or "").strip(),
@@ -2054,7 +2223,7 @@ def _serialize_tool_call_marker(tool_event: dict[str, Any]) -> str:
     return f'<tool_call>{json.dumps(payload, ensure_ascii=False)}</tool_call>'
 
 
-# Serialize tool result marker
+# Serialize a tool result into the <tool_result> marker that is streamed to the frontend.
 def _serialize_tool_result_marker(
     alias: str,
     content: str,
@@ -2095,7 +2264,10 @@ def _serialize_context_compression_marker(compression_event: dict[str, Any]) -> 
     return f'<context_compression>{json.dumps(payload, ensure_ascii=False)}</context_compression>'
 
 
-# Extract Ollama model info
+# Model info
+
+# Normalize a capability collection (dict of flags, delimited string or list) into a set of
+# lower-case tokens. A dotted capability such as "model.vision" also yields its last part.
 def _normalize_capability_tokens(capabilities: Any) -> set[str]:
     if capabilities is None:
         return set()
@@ -2146,6 +2318,7 @@ def _ollama_metadata_supports_tool_calling(
 
 # Parse Ollama-specific model metadata into a frontend-friendly payload.
 def _extract_ollama_model_info(settings_data: Any) -> dict[str, Any]:
+    # Starting values that the metadata below overrides when it provides them.
     context_length = 8192
     model_layers = 0
     defaults: dict[str, Any] = {}
@@ -2168,11 +2341,13 @@ def _extract_ollama_model_info(settings_data: Any) -> dict[str, Any]:
             try:
                 context_length = int(value)
             except (TypeError, ValueError):
+                # A non-numeric value keeps the default context length.
                 pass
         if key.endswith(".block_count"):
             try:
                 model_layers = int(value)
             except (TypeError, ValueError):
+                # A non-numeric value keeps the layer count at 0 (unknown).
                 pass
 
     # Parse default runtime parameters from the Modelfile-like payload.
@@ -2201,11 +2376,11 @@ def _extract_ollama_model_info(settings_data: Any) -> dict[str, Any]:
             else:
                 defaults[key] = normalized
 
+    # Detect supported features from the template, defaults, and capabilities. A default option
+    # named like a thinking parameter also decides the request field name used for it.
     think_param_name = "think"
     think_level_param_name = "think_level"
     normalized_capabilities = _normalize_capability_tokens(capabilities)
-
-    # Detect supported features from the template, defaults, and capabilities.
     supports_thinking = any(
         marker in template_str
         for marker in (".Think ", ".Think\n", ".ThinkLevel", ".Reasoning", ".Reason ")
@@ -2271,7 +2446,8 @@ def _extract_ollama_model_info(settings_data: Any) -> dict[str, Any]:
     }
 
 
-# Missing layer metadata alone is not evidence that a model runs in the cloud.
+# Return whether an Ollama model runs in the cloud, judged by its name or remote markers in the
+# metadata. Missing layer metadata alone is not evidence that a model runs in the cloud.
 def _ollama_model_is_cloud(model_name: str, settings_data: Any) -> bool:
     name = str(model_name or "").strip().lower()
     if name.endswith("-cloud") or name.endswith(":cloud") or "-cloud:" in name:
@@ -2281,7 +2457,8 @@ def _ollama_model_is_cloud(model_name: str, settings_data: Any) -> bool:
     return bool(getattr(settings_data, "remote_model", None) or getattr(settings_data, "remote_host", None))
 
 
-# Extract generic model info
+# Normalize adapter metadata of a non-Ollama engine into the frontend payload; metadata that is not
+# a dict yields a conservative payload with every capability disabled.
 def _extract_generic_model_info(settings_data: Any) -> dict[str, Any]:
     if not isinstance(settings_data, dict):
         return {
@@ -2302,12 +2479,14 @@ def _extract_generic_model_info(settings_data: Any) -> dict[str, Any]:
             "custom_fields": [],
         }
 
+    # Capabilities and default options, tolerating adapters that name them differently.
     capabilities = settings_data.get("capabilities", []) or []
     normalized_capabilities = {str(item).strip().lower() for item in capabilities}
     defaults = settings_data.get("defaults", settings_data.get("parameters", {})) or {}
     if not isinstance(defaults, dict):
         defaults = {}
 
+    # Thinking-level options: use the adapter's list, or the usual options for the parameter style.
     supports_think_level = bool(settings_data.get("supports_think_level", False))
     think_level_param_name = str(settings_data.get("think_level_param_name", "think_level") or "think_level")
     think_level_options = (
@@ -2323,6 +2502,7 @@ def _extract_generic_model_info(settings_data: Any) -> dict[str, Any]:
         else:
             think_level_options = ["low", "medium", "high"]
 
+    # The context length falls back from the explicit limit to the window and token limits.
     context_length = (
         settings_data.get("context_length")
         or settings_data.get("max_context_window")
@@ -2330,6 +2510,7 @@ def _extract_generic_model_info(settings_data: Any) -> dict[str, Any]:
         or 8192
     )
 
+    # Copy the known fields, coercing each to the type the frontend expects.
     return {
         "context_length": int(context_length),
         "defaults": defaults,
@@ -2358,7 +2539,8 @@ def _extract_generic_model_info(settings_data: Any) -> dict[str, Any]:
     }
 
 
-# Build model info payload
+# Build a minimal model info payload (all capabilities off, flagged as metadata fallback) for a
+# model whose metadata could not be loaded.
 def _build_fallback_model_info_payload(engine: str, model_name: str) -> dict[str, Any]:
     payload = _extract_generic_model_info({})
     payload["available_tool_servers"] = []
@@ -2377,12 +2559,17 @@ def _extract_model_info(engine: str, model_name: str, settings_data: Any) -> dic
     return _extract_generic_model_info(settings_data)
 
 
+# Build the full model info payload for the frontend: adapter metadata plus the active presets
+# and the available tool servers. The result is cached, mirrored into the runtime metadata file and
+# stored in the capability cache. With allow_fallback, a metadata load failure returns a minimal
+# fallback payload instead of raising.
 def _build_model_info_payload(
     engine: str,
     model_name: str,
     *,
     allow_fallback: bool = False,
 ) -> dict[str, Any]:
+    # Serve a fresh cached payload, only refreshing the runtime metadata file.
     cached_payload = _get_cached_model_info(engine, model_name)
     if cached_payload is not None:
         _sync_runtime_model_metadata(
@@ -2394,6 +2581,7 @@ def _build_model_info_payload(
         )
         return cached_payload
 
+    # Load the adapter metadata; the endpoint is remembered so a mid-flight engine switch is detected.
     endpoint = model_capabilities.get_endpoint(engine)
     try:
         settings_data = llm_api.get_model_settings(engine, model_name)
@@ -2402,10 +2590,13 @@ def _build_model_info_payload(
             raise
         return _build_fallback_model_info_payload(engine, model_name)
     payload = _extract_model_info(engine, model_name, settings_data)
+
     # Keep only capability facts on disk, not presets, API keys or runtime settings.
     if endpoint != model_capabilities.get_endpoint(engine):
         raise RuntimeError("Engine endpoint changed while loading model metadata")
     model_capabilities.store(engine, model_name, endpoint, payload)
+
+    # Overlay the active preset of the engine on the model defaults and attach the preset list.
     if settings.is_ollama_engine(engine):
         preset_payload = get_ollama_preset_payload(model_name)
         payload["defaults"] = {**payload.get("defaults", {}), **preset_payload["active_config"]}
@@ -2433,6 +2624,8 @@ def _build_model_info_payload(
         if isinstance(active_config, dict):
             payload["defaults"] = {**payload.get("defaults", {}), **active_config}
         payload["google_genai_presets"] = preset_payload
+
+    # Tool servers are offered only for tool-capable models; then cache and publish the result.
     payload["available_tool_servers"] = (
         _list_tool_servers_cached(engine, model_name) if payload.get("supports_tool_calling") else []
     )
@@ -2463,6 +2656,8 @@ def _build_inference_info_payload(
     model_info_payload: dict[str, Any],
     model_source: str,
 ) -> dict[str, Any]:
+    # Limits: the configured context window and output tokens come from the defaults, the model's
+    # own limits from the metadata and runtime limits.
     defaults = model_info_payload.get("defaults", {})
     if not isinstance(defaults, dict):
         defaults = {}
@@ -2479,6 +2674,7 @@ def _build_inference_info_payload(
         or _coerce_positive_int(model_info_payload.get("output_token_limit"))
     )
 
+    # List fields are replaced by empty lists when the metadata has an unexpected type.
     available_tool_servers = model_info_payload.get("available_tool_servers", [])
     if not isinstance(available_tool_servers, list):
         available_tool_servers = []
@@ -2491,6 +2687,7 @@ def _build_inference_info_payload(
     if not isinstance(supported_parameters, list):
         supported_parameters = []
 
+    # The limits are reported both at the top level and grouped under "limits".
     return {
         "ok": True,
         "engine": engine,
@@ -2530,6 +2727,8 @@ def _build_inference_info_payload(
     }
 
 
+# Runtime metadata file
+
 # Describe one local metadata source without freezing dynamic ports.
 def _runtime_metadata_source(name: str, route: str, port_setting: str) -> dict[str, Any]:
     return {
@@ -2546,7 +2745,7 @@ def _runtime_metadata_source(name: str, route: str, port_setting: str) -> dict[s
     }
 
 
-# Return runtime metadata file.
+# Read the runtime metadata file, returning an empty dict when it is missing or malformed.
 def _read_runtime_metadata_file() -> dict[str, Any]:
     try:
         with MODEL_RUNTIME_METADATA_PATH.open("r", encoding="utf-8") as handle:
@@ -2556,7 +2755,8 @@ def _read_runtime_metadata_file() -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
-# Write runtime metadata file.
+# Write the runtime metadata file through a temporary file and an atomic replace, so readers never
+# see a partial file.
 def _write_runtime_metadata_file(payload: dict[str, Any]) -> None:
     MODEL_RUNTIME_METADATA_PATH.parent.mkdir(parents=True, exist_ok=True)
     temp_path = MODEL_RUNTIME_METADATA_PATH.with_suffix(".json.tmp")
@@ -2575,11 +2775,13 @@ def _sync_runtime_model_metadata(
     source: str,
     route: str,
 ) -> None:
+    # Fallback payloads are not real model metadata, so they are never written.
     if not engine or not model_name or not isinstance(model_info_payload, dict):
         return
     if model_info_payload.get("metadata_fallback"):
         return
 
+    # Compute the same limits as the inference info payload.
     defaults = model_info_payload.get("defaults", {})
     if not isinstance(defaults, dict):
         defaults = {}
@@ -2595,6 +2797,7 @@ def _sync_runtime_model_metadata(
         or _coerce_positive_int(model_info_payload.get("output_token_limit"))
     )
 
+    # Load the existing file so other models' entries and this model's runtime section survive.
     payload = _read_runtime_metadata_file()
     models = payload.get("models", {})
     if not isinstance(models, dict):
@@ -2606,6 +2809,7 @@ def _sync_runtime_model_metadata(
     if not isinstance(runtime, dict):
         runtime = {}
 
+    # Describe where the data came from; Ollama adds its own provider routes.
     sources = [
         {
             **_runtime_metadata_source("ASLM model info", route, "ui-port"),
@@ -2626,6 +2830,7 @@ def _sync_runtime_model_metadata(
             ]
         )
 
+    # Store this model's entry with its capabilities, limits and sources.
     models[model_key] = {
         "engine": engine,
         "model": model_name,
@@ -2645,6 +2850,7 @@ def _sync_runtime_model_metadata(
         "sources": sources,
     }
 
+    # Record which model is currently active and when the file was last written.
     payload.update(
         {
             "schema_version": 1,
@@ -2673,13 +2879,16 @@ def _sync_runtime_model_metadata(
         }
     )
 
+    # Best effort: a metadata file that cannot be written must not break the request.
     try:
         _write_runtime_metadata_file(payload)
     except OSError as exc:
         logger.debug("Failed to write runtime model metadata: %s", exc)
 
 
-# Read JSON body
+# Request parsing and tool servers
+
+# Parse the request body as a JSON object, raising ValueError for invalid JSON or a non-object.
 def _read_json_request_body(request) -> dict[str, Any]:
     try:
         data = json.loads(request.body)
@@ -2691,13 +2900,15 @@ def _read_json_request_body(request) -> dict[str, Any]:
     return data
 
 
-# Resolve selected tool servers
+# Map each tool server id to the module directory and tools directory it is loaded from, using the
+# declared tool sources first and the selected servers' own source fields as a fallback.
 def _build_tool_source_map(
     tool_sources: list[dict[str, Any]] | None,
     selected_tool_servers: list[dict[str, Any]] | None = None,
 ) -> dict[str, dict[str, str]]:
     tool_source_map: dict[str, dict[str, str]] = {}
 
+    # Declared external tool sources; the tools directory defaults to <module_dir>/Tools.
     for source in tool_sources or []:
         if not isinstance(source, dict):
             continue
@@ -2716,6 +2927,7 @@ def _build_tool_source_map(
                     "tools_dir": tools_dir,
                 }
 
+    # Selected servers that were not declared explicitly may carry their own source directories.
     for server in selected_tool_servers or []:
         if not isinstance(server, dict):
             continue
@@ -2761,7 +2973,8 @@ def _parse_tool_sources(data: dict[str, Any]) -> list[dict[str, Any]]:
     return parsed
 
 
-# Resolve selected tool servers
+# Resolve the selected tool server ids into server definitions, raising ValueError for an unknown
+# or unsupported server. Servers from external tool sources are resolved first.
 def _resolve_tool_servers(
     engine: str,
     model_name: str,
@@ -2772,6 +2985,7 @@ def _resolve_tool_servers(
     resolved: list[dict[str, Any]] = []
     seen: set[str] = set()
 
+    # Servers declared by external tool sources, loaded from their own directories.
     for source in tool_sources or []:
         module_dir = str(source.get("module_dir") or "").strip()
         tools_dir = source.get("tools_dir") or (Path(module_dir) / "Tools")
@@ -2791,6 +3005,7 @@ def _resolve_tool_servers(
             resolved.append(server)
             seen.add(normalized)
 
+    # Remaining ids come from the built-in tool registry.
     for raw_id in tool_server_ids:
         normalized = str(raw_id or "").strip()
         if not normalized or normalized in seen:
@@ -2819,7 +3034,8 @@ def _validate_tool_server_support(
 
     raise ValueError(f"Model does not support tool calling: {model_name}")
 
-# Parse stored tool slugs
+
+# Parse the stored active tool slugs: a JSON list of ids, or a legacy single plain string.
 def _parse_active_tool_slugs(slug: str) -> list[str]:
     import json as _json
     if not slug:
@@ -2829,10 +3045,14 @@ def _parse_active_tool_slugs(slug: str) -> list[str]:
         if isinstance(parsed, list):
             return [str(s) for s in parsed if str(s).strip()]
     except (ValueError, TypeError):
+        # Not valid JSON: the value is a legacy plain string, handled below.
         pass
-    # Legacy: single plain string
+
+    # Legacy: single plain string.
     return [slug] if slug.strip() else []
 
+
+# Context budget and compression
 
 # Resolve a bounded history budget from model metadata.
 def _resolve_history_char_budget(
@@ -2883,6 +3103,7 @@ def _estimate_tokens_from_chars(char_count: int) -> int:
         chars = 0
     if chars <= 0:
         return 0
+
     # Backward-compatible fallback for legacy call sites.
     return max(1, int(round(chars / 2.4)))
 
@@ -2988,11 +3209,14 @@ def _estimate_tokens_adaptive(
     return max(1, int(round(chars / base_ratio)))
 
 
-# Context window tokens from model info.
+# Return the context window in tokens from a model info payload, or 0 when it is unknown.
+# The configured defaults win over the reported limits, then the direct keys and finally the
+# model's maximum context length.
 def _context_window_tokens_from_model_info(model_info_payload: dict[str, Any] | None) -> int:
     if not isinstance(model_info_payload, dict):
         return 0
 
+    # Configured defaults first, then the reported limits, then the direct keys.
     defaults = model_info_payload.get("defaults", {})
     if isinstance(defaults, dict):
         from_defaults = _first_positive_int(defaults, CONTEXT_WINDOW_KEYS)
@@ -3012,6 +3236,7 @@ def _context_window_tokens_from_model_info(model_info_payload: dict[str, Any] | 
     if direct_current:
         return direct_current
 
+    # Last resort: the model's maximum context length.
     direct_max = _coerce_positive_int(model_info_payload.get("context_length"))
     if direct_max:
         return direct_max
@@ -3028,6 +3253,7 @@ def _estimate_context_usage(
     active_engine: str = "",
     active_model: str = "",
 ) -> dict[str, Any]:
+    # Context window: runtime metadata first, then the model info, finally a 32768 token default.
     context_window_tokens = resolve_context_window_tokens(
         model_info_payload,
         runtime_metadata_path=MODEL_RUNTIME_METADATA_PATH,
@@ -3039,6 +3265,8 @@ def _estimate_context_usage(
     if context_window_tokens <= 0:
         context_window_tokens = 32768
 
+    # Count the characters of the system prompt and of the stored history, newest first, stopping
+    # at the latest compression summary because older messages are no longer sent.
     used_chars = len(str(system_prompt or ""))
     compressed_context_active = False
     observed_chars_per_token: float | None = None
@@ -3054,6 +3282,8 @@ def _estimate_context_usage(
             if _message_has_context_compression_summary(historical_message):
                 compressed_context_active = True
                 break
+
+        # Prefer the chars-per-token ratio measured on the last real generation of this chat.
         with _chat_usage_lock:
             observed = dict(_chat_usage_by_chat_id.get(str(chat.id), {}))
         raw_ratio = observed.get("observed_chars_per_token")
@@ -3063,6 +3293,7 @@ def _estimate_context_usage(
     if draft_text:
         used_chars += len(str(draft_text))
 
+    # Convert characters to tokens with the model-based ratio blended with the observed one.
     base_chars_per_token = _model_chars_per_token_hint(
         model_info_payload=model_info_payload,
         active_engine=active_engine,
@@ -3108,6 +3339,7 @@ def _build_manual_compression_event(
     exclude_message_ids: set[int | str] | None = None,
     summarize_with_model_enabled: bool = True,
 ) -> dict[str, Any] | None:
+    # Ratio measured on the last generation of this chat, used to refine the token estimates.
     observed_chars_per_token: float | None = None
     with _chat_usage_lock:
         observed = dict(_chat_usage_by_chat_id.get(str(chat.id), {}))
@@ -3115,6 +3347,8 @@ def _build_manual_compression_event(
     if isinstance(raw_observed_chars_per_token, (int, float)) and raw_observed_chars_per_token > 0:
         observed_chars_per_token = float(raw_observed_chars_per_token)
 
+    # History budget in characters: the model-info based budget, capped by the budget derived
+    # from the runtime context window when that is known.
     history_budget = _resolve_history_char_budget(
         model_info_payload,
         active_engine=engine,
@@ -3139,6 +3373,9 @@ def _build_manual_compression_event(
         )
         history_budget = min(history_budget, runtime_budget)
 
+    # Walk the stored messages newest first and keep them while they fit the budget (at least
+    # LLM_HISTORY_MIN_MESSAGES are always kept). The first message that does not fit, and every
+    # older one up to the previous summary, becomes overflow that is summarized.
     used_history_chars = len(str(system_prompt or "")) + len(str(draft_text or ""))
     selected_history: list[list[dict[str, Any]]] = []
     overflow_entries: list[dict[str, Any]] = []
@@ -3173,6 +3410,8 @@ def _build_manual_compression_event(
         if _message_has_context_compression_summary(historical_message):
             break
 
+    # A forced compression with no overflow still summarizes everything except the most recent
+    # messages.
     if force and not overflow_entries and len(history_records) > 1:
         keep_recent_count = min(LLM_HISTORY_MIN_MESSAGES, max(1, len(history_records) - 1))
         for older_message in history_records[keep_recent_count:]:
@@ -3182,6 +3421,8 @@ def _build_manual_compression_event(
             if _message_has_context_compression_summary(older_message):
                 break
 
+    # Ask the compressor whether the context is full enough; an enabled decision applies the same
+    # "summarize all but the most recent messages" rule as a forced one.
     compression = decide_compression(
         used_history_chars=used_history_chars,
         history_budget_chars=history_budget,
@@ -3202,6 +3443,7 @@ def _build_manual_compression_event(
                 break
 
     summary_entries = _build_context_compression_source_entries(history_records)
+
     # This event always compresses summary_entries (the span up to the previous
     # summary boundary); without them there is nothing to compress and emitting
     # an event would replace history with an empty summary.
@@ -3213,6 +3455,8 @@ def _build_manual_compression_event(
     if not should_compress:
         return None
 
+    # Build the summary from the compressed span plus the most recent user messages, optionally
+    # asking the active model to write it.
     recent_user_messages = [
         _strip_llm_control_tokens(str(message.content or "")).strip()[:1200]
         for message in chat.messages.filter(role="user").order_by("-created_at", "-id")[:LLM_HISTORY_COMPRESSION_RECENT_USER_MESSAGES]
@@ -3237,6 +3481,7 @@ def _build_manual_compression_event(
             max_overflow_entries=LLM_HISTORY_COMPRESSION_MAX_ITEMS,
         )
     except Exception as exc:
+        # The model-written summary failed; fall back to the deterministic summary without a model.
         logger.warning("History compression summary failed: %s", exc)
         summary_text, summary_payload = build_structured_history_summary(
             overflow_entries=summary_entries,
@@ -3246,6 +3491,7 @@ def _build_manual_compression_event(
             max_overflow_entries=LLM_HISTORY_COMPRESSION_MAX_ITEMS,
         )
 
+    # Shrink the summary to the size limit and wrap it as a synthetic tool entry for the timeline.
     summary_text, summary_payload = fit_summary_text(summary_payload, LLM_HISTORY_COMPRESSION_MAX_CHARS)
     return {
         "role": "tool",
@@ -3294,6 +3540,7 @@ def _build_stateless_compression_event(
     trigger_ratio: float = LLM_HISTORY_COMPRESSION_TRIGGER_RATIO,
     compression_mode: str = "manual",
 ) -> dict[str, Any] | None:
+    # The caller supplies the overflow measurements, so the decision needs no database access.
     compression = decide_compression(
         used_history_chars=used_history_chars,
         history_budget_chars=history_budget_chars,
@@ -3305,6 +3552,9 @@ def _build_stateless_compression_event(
         trigger_ratio=trigger_ratio,
     )
 
+    # Choose which entries to summarize. In auto mode compression only happens when the compressor
+    # enables it; in manual mode a forced request compresses even when it is not needed, and a
+    # forced request without any source entries has nothing to compress.
     entries_to_summarize = list(overflow_entries)
     summary_entries = list(summary_source_entries)
     normalized_mode = str(compression_mode or "manual").strip().lower()
@@ -3330,10 +3580,12 @@ def _build_stateless_compression_event(
     if not should_compress:
         return None
 
+    # Manual mode summarizes the whole source span, auto mode only the selected entries.
     summarize_entries = list(summary_entries) if normalized_mode != "auto" else list(entries_to_summarize)
     if not summarize_entries:
         return None
 
+    # Build the summary, optionally asking the active model to write it.
     summarize_with_model_callback = None
     if summarize_with_model_enabled:
         summarize_with_model_callback = lambda prompt_messages: _generate_history_summary_with_model(
@@ -3352,6 +3604,7 @@ def _build_stateless_compression_event(
             max_overflow_entries=LLM_HISTORY_COMPRESSION_MAX_ITEMS,
         )
     except Exception as exc:
+        # The model-written summary failed; fall back to the deterministic summary without a model.
         logger.warning("History compression summary failed: %s", exc)
         summary_text, summary_payload = build_structured_history_summary(
             overflow_entries=summarize_entries,
@@ -3361,6 +3614,8 @@ def _build_stateless_compression_event(
             max_overflow_entries=LLM_HISTORY_COMPRESSION_MAX_ITEMS,
         )
 
+    # Auto mode drops an empty summary; the text is then shrunk to the limit and wrapped as a
+    # synthetic tool entry for the timeline.
     if not summary_text and normalized_mode == "auto":
         return None
 
@@ -3394,7 +3649,8 @@ def _build_stateless_compression_event(
     }
 
 
-# Collect recent user messages.
+# Collect the most recent user messages of a chat (newest first, excluding one message id), each
+# truncated to 1200 characters.
 def _collect_recent_user_messages(chat: Chat, exclude_message_id: int) -> list[str]:
     messages = (
         chat.messages
@@ -3410,7 +3666,8 @@ def _collect_recent_user_messages(chat: Chat, exclude_message_id: int) -> list[s
     return result
 
 
-# Collect direct user directives.
+# Collect the direct user directives to carry into a compression summary; no directives are
+# collected, so this returns an empty list.
 def _collect_direct_user_directives(chat: Chat, exclude_message_id: int) -> list[str]:
     return []
 
@@ -3423,6 +3680,8 @@ def _generate_history_summary_with_model(
     prompt_messages: list[dict[str, str]],
     model_info_payload: dict[str, Any] | None = None,
 ) -> str:
+    # Deterministic, non-streamed generation with thinking disabled; the thinking option names
+    # come from the model info so each engine receives the parameter it understands.
     options = {
         "temperature": 0.0,
         "max_tokens": 8192,
@@ -3437,6 +3696,8 @@ def _generate_history_summary_with_model(
         think_param_name=str((model_info_payload or {}).get("think_param_name", "think") or "think"),
         think_level_param_name=str((model_info_payload or {}).get("think_level_param_name", "reasoning_effort") or "reasoning_effort"),
     )
+
+    # Join the visible text of all chunks; an empty result makes the caller fall back to raw harvest.
     parts: list[str] = []
     for chunk in chunks:
         thinking_part, text_part = _extract_stream_message_parts(chunk)
@@ -3455,7 +3716,9 @@ def _generate_history_summary_with_model(
     return summary
 
 
-# Build LLM message history
+# Build the message list sent to the model for one chat turn: the system prompt, as much stored
+# history as fits the budget, an optional compression summary and the current user message.
+# Return the messages together with the compression event (or None) that was applied.
 def _build_chat_history(
     chat: Chat,
     user_message_record: Message,
@@ -3472,6 +3735,7 @@ def _build_chat_history(
     if system_prompt:
         llm_messages.append({"role": "system", "content": system_prompt})
 
+    # Ratio measured on the last generation of this chat, used to refine the token estimates.
     observed_chars_per_token: float | None = None
     with _chat_usage_lock:
         observed = dict(_chat_usage_by_chat_id.get(str(chat.id), {}))
@@ -3479,6 +3743,8 @@ def _build_chat_history(
     if isinstance(raw_observed_chars_per_token, (int, float)) and raw_observed_chars_per_token > 0:
         observed_chars_per_token = float(raw_observed_chars_per_token)
 
+    # History budget in characters, capped by the runtime context window; the debug environment
+    # variable pretends the window is 4096 tokens to exercise compression.
     history_budget = _resolve_history_char_budget(
         model_info_payload,
         active_engine=engine,
@@ -3505,6 +3771,8 @@ def _build_chat_history(
             fallback_chars=history_budget,
         )
         history_budget = min(history_budget, runtime_budget)
+
+    # Current user entry with its attachments and uploaded files.
     current_entry: dict[str, Any] = {"role": "user", "content": user_message}
     current_attachments = _get_message_attachments(user_message_record)
     current_entry = _apply_attachments_to_llm_entry(current_entry, current_attachments)
@@ -3519,6 +3787,8 @@ def _build_chat_history(
         supported_media_kinds=supported_media_kinds,
     )
 
+    # Walk the stored messages newest first and keep them while they fit the budget (at least
+    # LLM_HISTORY_MIN_MESSAGES are always kept), stopping at the previous compression summary.
     used_history_chars = len(str(system_prompt or "")) + _estimate_llm_entry_chars(current_entry)
     selected_history: list[list[dict[str, Any]]] = []
     overflow_entries: list[dict[str, Any]] = []
@@ -3567,6 +3837,9 @@ def _build_chat_history(
         debug_force_4k=debug_force_4k,
         trigger_ratio=LLM_HISTORY_COMPRESSION_TRIGGER_RATIO,
     )
+
+    # Pick the span to summarize: when compression is enabled, the whole span back to the previous
+    # summary boundary is summarized instead of only the overflow.
     compression_event: dict[str, Any] | None = None
     summary_entries = _build_context_compression_source_entries(
         history_records,
@@ -3580,6 +3853,9 @@ def _build_chat_history(
     if compression.enabled and not overflow_entries and summary_entries:
         overflow_entries = list(summary_entries)
         selected_history = []
+
+    # Summarize the overflow (with the model when possible), inject the summary as a system
+    # message and report it as a compression event.
     if overflow_entries and compression.enabled:
         recent_user_messages = _collect_recent_user_messages(chat, user_message_record.id)
         direct_user_directives = _collect_direct_user_directives(chat, user_message_record.id)
@@ -3597,6 +3873,7 @@ def _build_chat_history(
                 max_overflow_entries=LLM_HISTORY_COMPRESSION_MAX_ITEMS,
             )
         except Exception as exc:
+            # The model-written summary failed; fall back to the deterministic summary.
             logger.warning("History compression summary failed: %s", exc)
             summary_text, _summary_payload = build_structured_history_summary(
                 overflow_entries=overflow_entries,
@@ -3643,6 +3920,7 @@ def _build_chat_history(
                 debug_force_4k,
             )
 
+    # Selected history was collected newest first; restore chronological order, then the new message.
     for entries in reversed(selected_history):
         llm_messages.extend(entries)
 
@@ -3650,7 +3928,12 @@ def _build_chat_history(
 
     return llm_messages, compression_event
 
-# Split generation options
+
+# Generation requests
+
+# Separate the thinking switch and thinking level from the other generation options. Return the
+# think value, the think level value and the remaining options; the engine's own parameter names
+# are recognized in addition to the common ones.
 def _split_generation_options(
     options: dict[str, Any],
     think_param_name: str = "think",
@@ -3677,6 +3960,8 @@ def _split_generation_options(
     return think_value, think_level_value, clean_options
 
 
+# Validated generation request: the resolved engine and model, selected tool servers, model
+# metadata, attachments and uploads, the split thinking options and the LM Studio sync defaults.
 @dataclass(frozen=True)
 class PreparedGenerationRequest:
     engine: str
@@ -3707,6 +3992,8 @@ def _build_lms_sync_operation_defaults(
     if engine != "lms":
         return None
 
+    # Start from the model defaults and add the thinking values only for LM Studio extension
+    # parameters (names starting with "ext.").
     payload: dict[str, Any] = {}
     defaults = model_info_payload.get("defaults")
     if isinstance(defaults, dict):
@@ -3732,6 +4019,7 @@ def _prepare_generation_request(
     attachments: list[dict[str, Any]] | None = None,
     uploaded_file_ids: list[str] | None = None,
 ) -> PreparedGenerationRequest | JsonResponse:
+    # Read the request fields; attachments and uploads passed by the caller win over the payload.
     model_name = str(data.get("model", "") or "").strip()
     options = data.get("options", {}) or {}
     resolved_attachments = attachments if attachments is not None else _normalize_request_attachments(data)
@@ -3741,6 +4029,7 @@ def _prepare_generation_request(
     if engine_error is not None:
         return engine_error
 
+    # Tool selection: a list or a single id under any of the accepted keys, plus external sources.
     raw_tool_ids = data.get("tool_server_ids") or data.get("tool_server_id") or data.get("tool_id") or []
     if isinstance(raw_tool_ids, str):
         raw_tool_ids = [raw_tool_ids] if raw_tool_ids.strip() else []
@@ -3748,11 +4037,13 @@ def _prepare_generation_request(
     tool_sources = _parse_tool_sources(data)
     external_tool_context = data.get("tool_context") if isinstance(data.get("tool_context"), dict) else {}
 
+    # Reject requests without a model or, when input is required, without any message content.
     if not model_name:
         return JsonResponse({"error": "Missing model parameter"}, status=400)
     if require_user_input and not str(user_message or "").strip() and not resolved_attachments and not resolved_upload_ids:
         return JsonResponse({"error": "Missing message or attachments"}, status=400)
 
+    # Resolve the tool servers and the model metadata (a fallback payload is acceptable here).
     _remember_active_model(engine, model_name)
     selected_tool_servers = _resolve_tool_servers(
         engine,
@@ -3769,6 +4060,7 @@ def _prepare_generation_request(
         route=route,
     )
 
+    # Images are rejected only when the model is explicitly known not to support vision.
     has_image_attachments = any(
         attachment.get("kind") == MessageAttachmentKind.IMAGE
         for attachment in resolved_attachments
@@ -3793,6 +4085,7 @@ def _prepare_generation_request(
         payload=model_info_payload,
     )
 
+    # Uploaded files depend on sandbox access; the thinking options are separated from the rest.
     sandbox_enabled = _selected_tools_include_sandbox(selected_tool_servers)
     upload_manifests = _load_model_upload_manifests(resolved_upload_ids, sandbox_enabled=sandbox_enabled)
     think_value, think_level_value, clean_options = _split_generation_options(
@@ -3944,7 +4237,9 @@ def _build_current_user_llm_entry(
     return current_entry
 
 
-# Build LLM messages for stateless generation from request payload.
+# Build the LLM messages for stateless generation from the request payload. It mirrors
+# _build_chat_history, but the history comes from the request instead of the database and the
+# chat usage is keyed by session_id. Return the messages with the compression event (or None).
 def _build_generate_llm_messages(
     history_messages: list[dict[str, Any]],
     current_entry: dict[str, Any],
@@ -3961,6 +4256,7 @@ def _build_generate_llm_messages(
     if system_prompt:
         llm_messages.append({"role": "system", "content": system_prompt})
 
+    # Ratio measured on the last generation of this session, used to refine the token estimates.
     observed_chars_per_token: float | None = None
     with _chat_usage_lock:
         observed = dict(_chat_usage_by_chat_id.get(str(session_id), {}))
@@ -3968,6 +4264,8 @@ def _build_generate_llm_messages(
     if isinstance(raw_observed_chars_per_token, (int, float)) and raw_observed_chars_per_token > 0:
         observed_chars_per_token = float(raw_observed_chars_per_token)
 
+    # History budget in characters, capped by the runtime context window; the debug environment
+    # variable pretends the window is 4096 tokens to exercise compression.
     history_budget = _resolve_history_char_budget(
         model_info_payload,
         active_engine=engine,
@@ -3995,6 +4293,8 @@ def _build_generate_llm_messages(
         )
         history_budget = min(history_budget, runtime_budget)
 
+    # Walk the request history newest first and keep messages while they fit the budget (at least
+    # LLM_HISTORY_MIN_MESSAGES are always kept), stopping at the previous compression summary.
     used_history_chars = len(str(system_prompt or "")) + _estimate_llm_entry_chars(current_entry)
     selected_history: list[list[dict[str, Any]]] = []
     overflow_entries: list[dict[str, Any]] = []
@@ -4043,6 +4343,9 @@ def _build_generate_llm_messages(
         debug_force_4k=debug_force_4k,
         trigger_ratio=LLM_HISTORY_COMPRESSION_TRIGGER_RATIO,
     )
+
+    # Pick the span to summarize: when compression is enabled, the whole span back to the previous
+    # summary boundary is summarized instead of only the overflow.
     compression_event: dict[str, Any] | None = None
     summary_entries = _build_context_compression_source_entries_from_request(
         history_newest_first,
@@ -4056,6 +4359,9 @@ def _build_generate_llm_messages(
     if compression.enabled and not overflow_entries and summary_entries:
         overflow_entries = list(summary_entries)
         selected_history = []
+
+    # Summarize the overflow (with the model when possible), inject the summary as a system
+    # message and report it as a compression event.
     if overflow_entries and compression.enabled:
         recent_user_messages = _collect_recent_user_messages_from_history(
             history_messages,
@@ -4076,6 +4382,7 @@ def _build_generate_llm_messages(
                 max_overflow_entries=LLM_HISTORY_COMPRESSION_MAX_ITEMS,
             )
         except Exception as exc:
+            # The model-written summary failed; fall back to the deterministic summary.
             logger.warning("History compression summary failed: %s", exc)
             summary_text, summary_payload = build_structured_history_summary(
                 overflow_entries=overflow_entries,
@@ -4122,6 +4429,7 @@ def _build_generate_llm_messages(
                 debug_force_4k,
             )
 
+    # Selected history was collected newest first; restore chronological order, then the new message.
     for entries in reversed(selected_history):
         llm_messages.extend(entries)
 
@@ -4141,7 +4449,9 @@ def _inject_ephemeral_system_notice(llm_messages: list[dict[str, Any]], notice: 
     llm_messages.insert(0, entry)
 
 
-# Build generation kwargs
+# Build the keyword arguments for llm_api.generate. Thinking parameters are added only when
+# set, and the tool context (chat, engine, sandbox and tool sources) only when tool servers are
+# selected; non-empty external context values override the generated ones.
 def _build_generate_kwargs(
     engine: str,
     model_name: str,
@@ -4202,7 +4512,11 @@ def _build_generate_kwargs(
 
     return generate_kwargs
 
-# Stream and save assistant response
+
+# Stream the assistant response as text chunks while it is generated and, unless persist_messages
+# is off, save the final message and transcript to the database and record the token usage.
+# Reasoning is wrapped in <think> tags, tool activity and context compression are emitted as inline
+# markers, and a compression triggered mid-stream aborts the generation so the caller can restart.
 def _stream_chat_response(
     engine: str,
     generate_kwargs: dict[str, Any],
@@ -4217,6 +4531,8 @@ def _stream_chat_response(
     current_user_message_id: int | str | None = None,
     persist_messages: bool = True,
 ):
+    # Output buffers and flags of the running stream: visible text, reasoning, the structured
+    # transcript, the last reported token usage, and whether a <think> block is currently open.
     visible_parts: list[str] = []
     thinking_parts: list[str] = []
     transcript_entries: list[dict[str, Any]] = []
@@ -4225,6 +4541,9 @@ def _stream_chat_response(
     failed = False
     restart_after_stream_compression = False
     started_at = time.perf_counter()
+
+    # Request facts used for logging, usage statistics and the thinking switch. Thinking output is
+    # suppressed when the request turned thinking off.
     model_name = str(generate_kwargs.get("model_name", "") or "")
     llm_messages = generate_kwargs.get("messages", [])
     prompt_chars_estimate = sum(
@@ -4237,12 +4556,17 @@ def _stream_chat_response(
     raw_options = generate_kwargs.get("options", {})
     raw_think_value = generate_kwargs.get("think")
     emit_thinking = raw_think_value is not False and str(raw_think_value).strip().lower() not in {"false", "0", "off", "no"}
+
+    # Throttle state of the in-flight snapshots, and whether a compression already happened for
+    # this request (a compression event passed in counts as applied).
     last_snapshot_at = 0.0
     last_snapshot_chars = 0
     stream_compression_applied = isinstance(compression_event, dict)
 
     # Return current in-flight assistant text for compression estimates.
     def current_stream_context_text() -> str:
+        # Reasoning, visible text and the content of the transcript entries collected so far,
+        # without the compression summary entries.
         parts = [
             _strip_llm_control_tokens("".join(thinking_parts)).strip(),
             _strip_llm_control_tokens("".join(visible_parts)).strip(),
@@ -4258,13 +4582,15 @@ def _stream_chat_response(
                 parts.append(_strip_llm_control_tokens(str(entry.get("content") or "")).strip())
         return "\n".join(part for part in parts if part)
 
-    # Persist the in-flight assistant buffer so reloads/compression see it.
+    # Persist the in-flight assistant buffer so reloads/compression see it. Unless forced, saves
+    # are throttled by time and by the amount of new text.
     def persist_stream_snapshot(*, force: bool = False) -> None:
         nonlocal last_snapshot_at, last_snapshot_chars
 
         if not persist_messages or assistant_message_record is None or chat is None:
             return
 
+        # Build the transcript as it would be stored now and measure its text size.
         visible_content = _strip_llm_control_tokens("".join(visible_parts)).strip()
         thinking_content = _strip_llm_control_tokens("".join(thinking_parts)).strip()
         transcript_snapshot = _build_streaming_assistant_transcript(
@@ -4280,6 +4606,7 @@ def _stream_chat_response(
         if not snapshot_chars:
             return
 
+        # Skip the save when the previous one is recent and little text was added since.
         now = time.perf_counter()
         if (
             not force
@@ -4289,6 +4616,7 @@ def _stream_chat_response(
         ):
             return
 
+        # A failed snapshot must not interrupt the stream; the final save happens at the end.
         try:
             assistant_message_record.content = visible_content
             assistant_message_record.llm_transcript = transcript_snapshot
@@ -4299,13 +4627,17 @@ def _stream_chat_response(
         except Exception:
             logger.exception("Failed to persist streaming assistant snapshot")
 
-    # Build and persist one automatic compression marker at safe stream points.
+    # Build and persist one automatic compression marker at safe stream points. At most one
+    # compression happens per request. Return the marker to emit, or an empty string when nothing
+    # was compressed; after a compression the running generation is aborted so it can restart.
     def maybe_apply_stream_context_compression(trigger: str, extra_context_text: str = "") -> str:
         nonlocal restart_after_stream_compression, stream_compression_applied
 
         if not persist_messages or stream_compression_applied:
             return ""
 
+        # The text produced so far counts as draft context; the in-flight assistant message and
+        # the current user message are excluded from the stored history.
         draft_text = "\n".join(
             part
             for part in (
@@ -4334,6 +4666,7 @@ def _stream_chat_response(
         if not event:
             return ""
 
+        # Store the summary as its own assistant message and stop the current generation.
         arguments = event.get("arguments")
         if isinstance(arguments, dict):
             arguments["auto_trigger"] = trigger
@@ -4353,6 +4686,7 @@ def _stream_chat_response(
         restart_after_stream_compression = True
         return _serialize_context_compression_marker(event)
 
+    # Log the start of the request; the extra trace line is printed only when console tracing is on.
     _print_runtime_event(
         "Chat started: "
         f"engine={engine}, "
@@ -4369,6 +4703,7 @@ def _stream_chat_response(
             f"options_payload={json.dumps(raw_options, ensure_ascii=False, sort_keys=True) if isinstance(raw_options, dict) else raw_options}"
         )
 
+    # Register this generation as the active one (for abort requests) and hand its id to the tools.
     tracking_id = str(session_id or (chat.id if chat is not None else "") or "")
     try:
         with _generation_state_lock:
@@ -4383,6 +4718,8 @@ def _stream_chat_response(
             persist_stream_snapshot(force=True)
             yield _serialize_context_compression_marker(compression_event)
 
+        # Consume the adapter's chunks. Dict chunks carry tool progress, transcript entries, tool
+        # results or tool calls; every other chunk carries reasoning and visible text.
         llm_api.prepare_runtime(engine)
         response_iterator = llm_api.generate(**generate_kwargs)
         for chunk in response_iterator:
@@ -4421,6 +4758,7 @@ def _stream_chat_response(
                             break
                 continue
 
+            # A finished tool call: store its result and emit the result marker.
             if isinstance(chunk, dict) and chunk.get("tool_result"):
                 tool_message = chunk["tool_result"]
                 if isinstance(tool_message, dict):
@@ -4446,6 +4784,7 @@ def _stream_chat_response(
                         break
                 continue
 
+            # A batch of tool calls: close an open <think> block and emit one marker per call.
             if isinstance(chunk, dict) and isinstance(chunk.get("tool_events"), list):
                 if is_thinking:
                     is_thinking = False
@@ -4481,6 +4820,8 @@ def _stream_chat_response(
                     break
                 continue
 
+            # Remember token counts reported by the engine, which use different key names; the
+            # last reported values are used for usage statistics.
             if isinstance(chunk, dict):
                 prompt_tokens = _coerce_positive_int(
                     chunk.get("prompt_eval_count")
@@ -4545,6 +4886,7 @@ def _stream_chat_response(
                 persist_stream_snapshot()
                 yield text_part
     except Exception as exc:
+        # Report the failure to the client as an inline error message instead of raising.
         failed = True
         formatted_error = _format_runtime_error(engine, exc)
         if _is_expected_runtime_error(exc):
@@ -4555,6 +4897,7 @@ def _stream_chat_response(
             yield "\n</think>\n"
         yield f"\n[Error during generation: {formatted_error}]"
     finally:
+        # Unregister this generation, unless a newer one has already replaced it.
         with _generation_state_lock:
             active_id = str(_active_generation_id_by_engine.get(str(engine)) or "")
             if active_id == str(generation_id or ""):
@@ -4566,6 +4909,8 @@ def _stream_chat_response(
         if is_thinking:
             yield "\n</think>\n"
 
+        # Inspect the transcript to decide whether the reply contains anything worth saving, and
+        # reuse its assistant text when no text was streamed directly.
         visible_content = _strip_llm_control_tokens("".join(visible_parts)).strip()
         thinking_content = _strip_llm_control_tokens("".join(thinking_parts)).strip()
         transcript_assistant_visible_parts: list[str] = []
@@ -4584,6 +4929,7 @@ def _stream_chat_response(
                     transcript_has_renderable_payload = True
             elif role == "tool":
                 alias = str(entry.get("alias") or entry.get("tool_id") or "").strip().lower()
+
                 # Compression markers alone should not become an "empty model reply".
                 if alias and alias != "context_compression_summary":
                     transcript_has_renderable_payload = True
@@ -4599,18 +4945,22 @@ def _stream_chat_response(
             thinking_content=thinking_content,
         )
 
+        # Final save of the assistant message, or removal of the placeholder when nothing was produced.
         should_persist_message = bool(visible_content or thinking_content or transcript_has_renderable_payload)
         if persist_messages and assistant_message_record is not None and chat is not None:
             if should_persist_message:
                 assistant_message_record.content = visible_content
                 assistant_message_record.llm_transcript = transcript_entries
                 assistant_message_record.save(update_fields=["content", "llm_transcript"])
+
                 # Bump chat ordering so sidebar reflects the latest activity.
                 Chat.objects.filter(pk=chat.pk).update(updated_at=timezone.now())
             else:
                 # Nothing was generated; drop the empty placeholder we pre-created.
                 assistant_message_record.delete()
 
+        # Record the reported token usage of this chat together with the measured chars-per-token
+        # ratio, then log the completion.
         duration_seconds = time.perf_counter() - started_at
         if usage_snapshot and tracking_id:
             prompt_tokens_observed = _coerce_positive_int(usage_snapshot.get("prompt_tokens"))
@@ -4635,12 +4985,16 @@ def _stream_chat_response(
         )
 
 
+# API views
+
 # Handle a stateless generation request for external modules.
 def generate_api(request):
     if request.method != "POST":
         return JsonResponse({"error": "Invalid request method"}, status=405)
 
     try:
+        # Parse the body and validate the request; the current user turn is taken from the
+        # message field or promoted from the last history message.
         data = _read_json_request_body(request)
         history_messages = _normalize_request_history_messages(data.get("messages") or [])
         history_messages, user_message, attachments, uploaded_file_ids = _split_request_conversation(
@@ -4659,6 +5013,8 @@ def generate_api(request):
         if isinstance(prepared, JsonResponse):
             return prepared
 
+        # Apply slash commands from the message; tools they add are resolved and validated like the
+        # explicitly selected ones. Ids from external tool sources count as known.
         source_tool_ids = {
             str(raw_id or "").strip()
             for source in prepared.tool_sources or []
@@ -4687,6 +5043,8 @@ def generate_api(request):
                 payload=prepared.model_info_payload,
             )
 
+        # System prompt: project prompt, skills and the request's command directives; a missing
+        # session id is generated so the response can be correlated.
         session_id = str(data.get("session_id") or "").strip() or str(uuid.uuid4())
         consume_skill_notifications = data.get("consume_skill_notifications", True)
         if not isinstance(consume_skill_notifications, bool):
@@ -4702,6 +5060,9 @@ def generate_api(request):
             system_prompt,
             _command_directives_for_mode(command_plan, instant_mode=prepared.instant_mode),
         )
+
+        # Assemble the model messages (with history compression when needed) and the engine
+        # arguments, including the tool context.
         current_entry = _build_current_user_llm_entry(
             command_plan.message,
             prepared.attachments,
@@ -4745,6 +5106,7 @@ def generate_api(request):
             instant_mode=prepared.instant_mode,
         )
 
+        # Stream the answer as plain text; stateless requests are not stored in the database.
         generation_id = uuid.uuid4().hex
         response = StreamingHttpResponse(
             _stream_chat_response(
@@ -4771,7 +5133,8 @@ def generate_api(request):
         return JsonResponse({"error": str(exc)}, status=500)
 
 
-# Abort active generation.
+# Abort the active generation of the selected engine. When a generation id is given, a request for
+# a generation that is no longer the active one is ignored.
 def abort_generation_api(request):
     if request.method != "POST":
         return JsonResponse({"error": "Invalid request method"}, status=405)
@@ -4794,18 +5157,21 @@ def abort_generation_api(request):
         return JsonResponse({"error": str(exc)}, status=500)
 
 
-# Return persistent capability markers independently of model presets.
+# Return persistent capability markers independently of model presets. Cached markers are served
+# as they are, and only the requested model is resolved on demand when it is uncached or stale.
 def get_model_capabilities_api(request):
-    """Serve cached markers, resolving only visible uncached/stale models on demand."""
     if request.method != "GET":
         return JsonResponse({"error": "Invalid request method"}, status=405)
     engine, engine_error = _resolve_request_engine_or_response(request)
     if engine_error is not None:
         return engine_error
+
+    # A client that knows the endpoint it targeted must be told when the engine endpoint changed.
     endpoint = model_capabilities.get_endpoint(engine)
     if "endpoint" in request.GET and str(request.GET["endpoint"]).strip().rstrip("/") != endpoint:
         return JsonResponse({"error": "Engine endpoint changed"}, status=409)
 
+    # Without a model, list every cached record; with one, serve a fresh cached record directly.
     records = model_capabilities.list_cached(engine, endpoint)
     model_name = str(request.GET.get("model", "")).strip()
     if not model_name:
@@ -4813,6 +5179,9 @@ def get_model_capabilities_api(request):
     cached = next((row for row in records if row["model"] == model_name), None)
     if cached and model_capabilities.is_fresh(cached):
         return JsonResponse(cached)
+
+    # Refresh the record from the metadata cache or the engine; if that fails, a stale cached
+    # record is still returned (marked stale) rather than an error.
     try:
         payload = _get_cached_model_info(engine, model_name)
         if payload is None:
@@ -4845,6 +5214,8 @@ def get_model_info_api(request):
         return engine_error
     started_at = time.perf_counter()
 
+    # Loading the model also makes it the remembered active model; engines that cannot report
+    # metadata answer 501 and expected connectivity failures are only logged as warnings.
     try:
         payload = _build_model_info_payload(engine, model_name)
         _remember_active_model(engine, model_name)
@@ -4879,6 +5250,9 @@ def get_inference_info_api(request):
     engine, engine_error = _resolve_request_engine_or_response(request)
     if engine_error is not None:
         return engine_error
+
+    # The model comes from the request, the remembered selection or the model list; without any
+    # model, answer 404 with an empty payload of the usual shape.
     model_name, model_source = _resolve_inference_model(engine, request.GET.get("model"))
     if not model_name:
         return JsonResponse(
@@ -4917,6 +5291,8 @@ def get_inference_info_api(request):
             status=404,
         )
 
+    # Only an explicitly requested model becomes the remembered active model; the runtime metadata
+    # file is refreshed with the data that was just loaded.
     started_at = time.perf_counter()
 
     try:
@@ -4982,6 +5358,7 @@ def get_context_usage_api(request):
         return JsonResponse({"error": "Invalid request method"}, status=405)
 
     try:
+        # Resolve the engine, model (falling back to the remembered one) and the chat, if any.
         engine, engine_error = _resolve_request_engine_or_response(request)
         if engine_error is not None:
             return engine_error
@@ -4997,6 +5374,8 @@ def get_context_usage_api(request):
             except Chat.DoesNotExist:
                 chat = None
 
+        # Estimate with the same system prompt a generation would use, without consuming skill
+        # notifications.
         system_prompt = _compose_system_prompt(
             str(request.GET.get("system_prompt") or ""),
             consume_skill_notifications=False,
@@ -5012,6 +5391,8 @@ def get_context_usage_api(request):
             active_engine=engine,
             active_model=model_name,
         )
+
+        # Combine the estimate with the usage observed on the chat's last generation.
         with _chat_usage_lock:
             observed = dict(_chat_usage_by_chat_id.get(chat_id, {})) if chat_id else {}
 
@@ -5047,6 +5428,7 @@ def context_compression_decide_api(request):
         return JsonResponse({"error": "Invalid request method"}, status=405)
 
     try:
+        # Resolve the engine and model; model metadata supplied by the caller replaces the lookup.
         data = _read_json_request_body(request)
         engine, engine_error = _resolve_request_engine_or_response(request, data)
         if engine_error is not None:
@@ -5057,12 +5439,14 @@ def context_compression_decide_api(request):
         if not isinstance(model_info_payload, dict):
             model_info_payload = _build_model_info_payload(engine, model_name, allow_fallback=True)
 
+        # An invalid trigger ratio falls back to the default one.
         trigger_ratio = data.get("trigger_ratio")
         try:
             parsed_trigger_ratio = float(trigger_ratio) if trigger_ratio is not None else LLM_HISTORY_COMPRESSION_TRIGGER_RATIO
         except (TypeError, ValueError):
             parsed_trigger_ratio = LLM_HISTORY_COMPRESSION_TRIGGER_RATIO
 
+        # The caller reports its own history size; only the decision is made here.
         compression = decide_compression(
             used_history_chars=int(data.get("used_history_chars") or 0),
             history_budget_chars=int(data.get("history_budget_chars") or 0),
@@ -5091,6 +5475,7 @@ def context_compression_build_event_api(request):
         return JsonResponse({"error": "Invalid request method"}, status=405)
 
     try:
+        # Resolve the engine and model; model metadata supplied by the caller replaces the lookup.
         data = _read_json_request_body(request)
         engine, engine_error = _resolve_request_engine_or_response(request, data)
         if engine_error is not None:
@@ -5102,6 +5487,7 @@ def context_compression_build_event_api(request):
         if not isinstance(model_info_payload, dict):
             model_info_payload = _build_model_info_payload(engine, model_name, allow_fallback=True)
 
+        # The history is supplied by the caller; list fields of the wrong type are treated as empty.
         overflow_entries = data.get("overflow_entries") or []
         summary_source_entries = data.get("summary_source_entries") or []
         if not isinstance(overflow_entries, list):
@@ -5116,12 +5502,14 @@ def context_compression_build_event_api(request):
         if not isinstance(direct_user_directives, list):
             direct_user_directives = []
 
+        # An invalid trigger ratio falls back to the default one.
         trigger_ratio = data.get("trigger_ratio")
         try:
             parsed_trigger_ratio = float(trigger_ratio) if trigger_ratio is not None else LLM_HISTORY_COMPRESSION_TRIGGER_RATIO
         except (TypeError, ValueError):
             parsed_trigger_ratio = LLM_HISTORY_COMPRESSION_TRIGGER_RATIO
 
+        # No event means the context is below the compression threshold.
         event = _build_stateless_compression_event(
             engine=engine,
             model_name=model_name,
@@ -5152,6 +5540,7 @@ def context_compress_api(request):
         return JsonResponse({"error": "Invalid request method"}, status=405)
 
     try:
+        # Resolve the engine, model and chat; a missing or unknown chat is reported as not applied.
         data = _read_json_request_body(request)
         engine, engine_error = _resolve_request_engine_or_response(request, data)
         if engine_error is not None:
@@ -5174,6 +5563,7 @@ def context_compress_api(request):
             include_skills_baseline=False,
         )
 
+        # A chat that is still generating must not be compressed (409).
         with _generation_state_lock:
             active_generation_id = str(_active_generation_id_by_chat_id.get(str(chat.id)) or "")
         if active_generation_id:
@@ -5183,6 +5573,7 @@ def context_compress_api(request):
                 "reason": "generation_active",
             }, status=409)
 
+        # Build the summary event and store it as an assistant message that acts as a timeline marker.
         model_info_payload = _build_model_info_payload(engine, model_name, allow_fallback=True)
         event = _build_manual_compression_event(
             chat=chat,
