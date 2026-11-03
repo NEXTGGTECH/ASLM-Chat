@@ -1,25 +1,20 @@
 # Copyright NEXTGGTECH. Elastic License 2.0.
 
-"""Model-free SERP quality signals.
-
-Everything here is deterministic, allocation-light, and budgeted for sub-millisecond
-per-source evaluation so triage can run inline with the live result stream.
-"""
-
 from __future__ import annotations
 
 import datetime as _dt
 import re
 from urllib.parse import urlparse
 
-# NOTE: there is deliberately NO lexical term-matching scorer here. The ranking is
-# consensus + position + earned signals only — flat term matching paid SEO titles for
-# filler words and was removed after a measured ablation (2026-07-05) showed removal
-# beat every weighting tried. Chunk selection still matches terms, but that lives in
-# core.extract.scoring and shapes model_context, never source order.
-
-# --- hub / garbage detection ---------------------------------------------------
-
+# Model-free SERP quality signals: everything in this module is deterministic, allocation-light and
+# budgeted for sub-millisecond per-source evaluation, so triage can run inline with the live result
+# stream. There is deliberately NO lexical term-matching scorer here. The ranking is consensus +
+# position + earned signals only: flat term matching paid SEO titles for filler words and was
+# removed after a measured ablation (2026-07-05) showed removal beat every weighting tried. Chunk
+# selection still matches terms, but that lives in core.extract.scoring and shapes model_context,
+# never source order.
+# The three sets below mark hub/garbage pages: URL path segments and title phrases of listing pages,
+# and title patterns of non-content pages (login walls, error pages).
 _HUB_URL_SEGMENTS = frozenset({
     "category", "categories", "tag", "tags", "topic", "topics",
     "theme", "themes", "rubric", "rubrics", "section", "sections",
@@ -38,7 +33,9 @@ _SKIP_TITLE_PATTERNS = frozenset({
 })
 
 
-# Penalty in [0,1] for hub/listing pages that parse into link soup, not content.
+# Hub and garbage detection
+
+# Return a penalty in [0,1] for hub/listing pages that parse into link soup, not content.
 def hub_penalty(url: str, title: str, snippet: str) -> float:
     penalty = 0.0
     path = (urlparse(url).path or "").lower().strip("/")
@@ -55,13 +52,13 @@ def hub_penalty(url: str, title: str, snippet: str) -> float:
     return min(penalty, 1.0)
 
 
-# True for titles that scream non-content (login walls, error pages).
+# Return True for titles that scream non-content (login walls, error pages).
 def is_skip_title(title: str) -> bool:
     title_l = (title or "").lower()
     return any(pattern in title_l for pattern in _SKIP_TITLE_PATTERNS)
 
 
-# --- SEO-slug penalty (identity-blind) -----------------------------------------
+# SEO-slug penalty (identity-blind)
 
 # No domain favouritism: the ranker must not carry a list of "good" hosts — that would
 # reintroduce the curated trust registry consensus was built to replace, and bias the
@@ -70,11 +67,11 @@ def is_skip_title(title: str) -> bool:
 # heavily hyphenated slugs are a reliable SEO-content-farm tell regardless of who owns
 # the domain. Authority itself comes from cross-engine consensus (see triage), which is
 # earned from the live result stream, not declared here.
-
+# _SEO_SLUG_RE finds a standalone four-digit year (1900-2099) inside a slug.
 _SEO_SLUG_RE = re.compile(r"\b(19|20)\d{2}\b")
 
 
-# Non-positive penalty for SEO-farm-shaped slugs. Identity-blind: keys only off the URL
+# Return a non-positive penalty for SEO-farm-shaped slugs. Identity-blind: keys only off the URL
 # slug's shape (hyphen density + a year), so it generalises to any host and plays no
 # favourites. Deliberately gentle — it nudges, never filters.
 def seo_slug_penalty(url: str) -> float:
@@ -84,7 +81,7 @@ def seo_slug_penalty(url: str) -> float:
     return 0.0
 
 
-# --- TLD tiers & transport security (identity-blind, structural) ----------------
+# TLD tiers and transport security (identity-blind, structural)
 
 # IMPORTANT DISTINGUISHING SIGNAL — the TLD tier.
 # The TLD a domain sits under is a cheap, identity-blind proxy for one hard-to-fake fact:
@@ -116,7 +113,7 @@ _LEGACY_GTLDS = frozenset({
 })
 
 
-# True when a host sits under an established TLD (legacy gTLD or any ccTLD). ccTLDs pass
+# Return True when a host sits under an established TLD (legacy gTLD or any ccTLD). ccTLDs pass
 # on the two-letter rule, so multi-label suffixes (.co.uk, .com.br) qualify via their
 # real TLD (.uk/.br) with no separate suffix list to maintain.
 def is_established_tld(host_or_domain: str) -> bool:
@@ -124,31 +121,34 @@ def is_established_tld(host_or_domain: str) -> bool:
     return len(tld) == 2 or tld.startswith("xn--") or tld in _LEGACY_GTLDS
 
 
-# Non-positive penalty for plain-http SERP URLs — the only transport-security signal
+# Return a non-positive penalty for plain-http SERP URLs — the only transport-security signal
 # available with zero I/O at triage time. Gentle: legitimate old mirrors still exist.
 def insecure_scheme_penalty(url: str) -> float:
     return -0.08 if (url or "").lower().startswith("http://") else 0.0
 
 
-# --- bad-site tells (identity-blind, zero-I/O) -----------------------------------
+# Bad-site tells (identity-blind, zero-I/O)
+
 # Structural marks that phishing/farm sites wear and legitimate sites rarely do. Same
 # contract as seo_slug_penalty: shape only, never names; each tell is gentle and the
 # pack is capped so stacked tells demote a source, never execute it — SKIP still comes
 # only from irrelevance, and consensus votes can outweigh the whole pack.
-
+# The cap is the largest total penalty of the pack; the patterns match an IPv4 literal host and a
+# four-digit year (1900-2099) inside a domain label.
 _SUSPICIOUS_PACK_CAP = 0.20
 _IP_HOST_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
 _DOMAIN_YEAR_RE = re.compile(r"(?:19|20)\d{2}")
 
 
-# Combined non-positive penalty for structural unsafe-site tells in a SERP URL.
+# Return the combined non-positive penalty for structural unsafe-site tells in a SERP URL.
 def suspicious_url_penalty(url: str) -> float:
     try:
         parsed = urlparse(url)
         host = (parsed.hostname or "").lower().rstrip(".")
         port = parsed.port
     except ValueError:
-        return -_SUSPICIOUS_PACK_CAP  # unparseable URL is its own tell
+        # An unparseable URL is its own tell.
+        return -_SUSPICIOUS_PACK_CAP
     if not host:
         return 0.0
     penalty = 0.0
@@ -156,16 +156,19 @@ def suspicious_url_penalty(url: str) -> float:
     # IP-literal host: organic results virtually never point at bare addresses.
     if _IP_HOST_RE.fullmatch(host) or host.startswith("["):
         penalty += 0.15
+
     # Explicit non-default port — SERP-worthy content does not live on :8080.
     if port not in (None, 80, 443):
         penalty += 0.12
 
     labels = host.split(".")
+
     # A gTLD-shaped label buried in the subdomain chain ("github.com.evil.xyz") is a
     # phishing costume. labels[:-2] keeps ccTLD second-level registries (example.com.br,
     # example.co.uk) out of the blast radius.
     if any(label in _LEGACY_GTLDS for label in labels[:-2]):
         penalty += 0.15
+
     # Hyphen-dense or year-stamped domain labels: the registered-name cousins of the
     # SEO slug tell ("best-ai-coding-tools-2026.com", "top10vpn2024.net"). Deliberately
     # feather-light: name shape correlates with farms but convicts nobody, and stacking
@@ -180,9 +183,9 @@ def suspicious_url_penalty(url: str) -> float:
     return -min(penalty, _SUSPICIOUS_PACK_CAP)
 
 
-# Exact-match-domain tell (Google EMD-update heritage): a registered name that IS the
-# query ("claudecode.pro" for "claude code") is usually a squatter riding the phrase,
-# not the subject itself. Deliberately the gentlest tell — legitimate exact-match
+# Return a non-positive penalty for the exact-match-domain tell (Google EMD-update heritage): a
+# registered name that IS the query ("claudecode.pro" for "claude code") is usually a squatter
+# riding the phrase, not the subject itself. Deliberately the gentlest tell — legitimate exact-match
 # domains exist, and they can win the margin back with one consensus vote. Kept at a
 # whisper (-0.03) by explicit policy: name-shape penalties must nudge the margin, not
 # gate the market for established domains.
@@ -199,6 +202,7 @@ def emd_penalty(url: str, terms: tuple[str, ...] | list[str]) -> float:
     name = labels[0].replace("-", "")
     if len(name) < 6:
         return 0.0
+
     # The registered name must be fully spelled by ≥2 consecutive query terms.
     for start in range(len(terms) - 1):
         candidate = terms[start]
@@ -211,15 +215,15 @@ def emd_penalty(url: str, terms: tuple[str, ...] | list[str]) -> float:
     return 0.0
 
 
-# --- dates (policy: soft signal only, never a hard filter) ---------------------
-#
+# Dates (policy: soft signal only, never a hard filter)
+
 # The date signal keys off an ACTUAL date the page carries — an engine-emitted snippet
 # date ("Jul 3, 2026 —", "3 июл. 2026 г. —", "03.07.2026", "2 days ago") or, post-parse,
 # the page's own published_time. A bare year token in a title never counts: rewarding
 # "…Pricing 2026 - Costs & Providers" for containing "2026" is exactly the SEO-farm
 # title-stuffing move, and paying for it is how farms outranked primary sources. A real
 # date needs a month or a day next to the year, which titles do not stuff.
-
+# _YEAR_RE finds a standalone four-digit year (1900-2099), used for years written in a query.
 _YEAR_RE = re.compile(r"\b(19\d{2}|20\d{2})\b")
 
 # Month-name prefixes across the languages the engines actually localise snippets
@@ -336,46 +340,63 @@ _REL_CJK_DAYS = {
 _FRESHNESS_HALFLIFE_DAYS = 270.0
 
 
-# Years the caller explicitly wrote into the query. Only these may influence
+# Return the years the caller explicitly wrote into the query. Only these may influence
 # scoring — hard date limits are forbidden by policy (they cut good content).
 def query_years(query: str) -> list[str]:
     return _YEAR_RE.findall(query or "")
 
 
-# First real date found in free text → (year, month, day) with day defaulting to 1;
-# None when the text carries no date-shaped marker (a bare year is NOT a date).
+# Return the first real date found in free text as (year, month, day) with day defaulting to 1;
+# None when the text carries no date-shaped marker (a bare year is NOT a date). Absolute formats
+# are tried first (ISO, numeric, slash, CJK, month names), then relative ones ("2 days ago"),
+# which are resolved against `now` (today by default).
 def extract_date(text: str, *, now: _dt.date | None = None) -> tuple[int, int, int] | None:
     text = text or ""
+
+    # ISO form: 2026-07-03 or 2026-07.
     if m := _ISO_DATE_RE.search(text):
         year, month = int(m.group(1)), int(m.group(2))
         day = int(m.group(3) or 1)
         if 1 <= month <= 12 and 1 <= day <= 31:
             return (year, month, day)
+
+    # Numeric day-first form: 03.07.2026.
     if m := _NUMERIC_DATE_RE.search(text):
         day, month, year = int(m.group(1)), int(m.group(2)), int(m.group(3))
         if 1 <= month <= 12 and 1 <= day <= 31:
             return (year, month, day)
+
+    # Slash form: 03/07/2026 or 7/3/2026.
     if m := _SLASH_DATE_RE.search(text):
         first, second, year = int(m.group(1)), int(m.group(2)), int(m.group(3))
+
         # >12 disambiguates; otherwise assume day-first (most of the world writes it so).
         day, month = (first, second) if first > 12 or second <= 12 else (second, first)
         if 1 <= month <= 12 and 1 <= day <= 31:
             return (year, month, day)
+
+    # CJK form: 2026年7月3日 (ja/zh) or 2026년 7월 3일 (ko).
     if m := _CJK_DATE_RE.search(text):
         year, month = int(m.group(1)), int(m.group(2))
         day = int(m.group(3) or 1)
         if 1 <= month <= 12 and 1 <= day <= 31:
             return (year, month, day)
+
+    # Month-name forms in many languages ("Jul 3, 2026", "3 июл. 2026"); needs a day or a bare
+    # month-year with a complete month word.
     if m := _TEXT_DATE_RE.search(text):
         month = _MONTH_BY_PREFIX.get(m.group(2).lower(), 0)
         day_str = m.group(1) or m.group(4)
         year = int(m.group(5))
+
         # Bare month-year: only a complete en/ru month word qualifies (see above).
         bare_ok = f"{m.group(2)}{m.group(3)}".lower() in _BARE_MONTH_WORDS
         if month and (day_str or bare_ok):
             day = int(day_str or 1)
             if 1 <= day <= 31:
                 return (year, month, day)
+
+    # Relative forms ("2 days ago", "vor 3 Tagen", "3天前"): subtract the age from today.
     rel_days: float | None = None
     if m := _REL_SUFFIX_RE.search(text) or _REL_PREFIX_RE.search(text):
         unit = m.group(2).lower()
@@ -390,7 +411,7 @@ def extract_date(text: str, *, now: _dt.date | None = None) -> tuple[int, int, i
     return None
 
 
-# Date reward in [-0.3, 1.0] for an extracted page date.
+# Return the date reward in [-0.3, 1.0] for an extracted page date.
 # Query anchors a year → alignment: the page's real date in a queried year is a full
 # match, a different year a small negative (old year_match_score policy, now applied
 # to an actual date instead of any year token in title/snippet). No year in the query →
@@ -414,9 +435,13 @@ def page_date_score(
     return 0.5 ** (age_days / _FRESHNESS_HALFLIFE_DAYS)
 
 
-# The parsed page's own date from a normalized markdown head (page_normalizer emits a
-# "**Date:** …" line when the page declares published_time). This is the strongest date
-# evidence available — it replaces the snippet-derived estimate after a parse.
+# Matches the "**Date:** …" line that page_normalizer emits in the markdown head when the page
+# declares published_time.
+_MD_DATE_LINE_RE = re.compile(r"^\*\*Date:\*\*\s*(.+)$", re.MULTILINE)
+
+
+# Return the parsed page's own date from a normalized markdown head, or None. This is the
+# strongest date evidence available — it replaces the snippet-derived estimate after a parse.
 #
 # Dates on or after the fetch day are discarded: sites whose templates render the
 # CURRENT date into a <time>/meta tag (fossil, dashboards, some CMS footers) would
@@ -424,9 +449,6 @@ def page_date_score(
 # search. A genuinely just-published page loses at most one day of bonus — engine
 # snippet dates still cover breaking news — while the dynamic-date noise is cut
 # entirely. Future dates are junk by definition.
-_MD_DATE_LINE_RE = re.compile(r"^\*\*Date:\*\*\s*(.+)$", re.MULTILINE)
-
-
 def markdown_meta_date(markdown: str, *, now: _dt.date | None = None) -> tuple[int, int, int] | None:
     m = _MD_DATE_LINE_RE.search((markdown or "")[:600])
     if not m:
@@ -442,29 +464,35 @@ def markdown_meta_date(markdown: str, *, now: _dt.date | None = None) -> tuple[i
     return date
 
 
-# --- query language (legacy port: services/web_search.py::infer_query_language) -
+# Query language
 
-# Unicode-block counters; ≥15% of characters in-script qualifies the language.
+# Unicode script ranges as (language code, first code point, last code point): ru = Cyrillic,
+# ar = Arabic, he = Hebrew, ja = Hiragana/Katakana (unambiguous Japanese), zh = CJK Unified (zh
+# unless Japanese kana is present), ko = Hangul, th = Thai, hi = Devanagari, el = Greek. At least
+# 15% of the characters in one script qualifies the language.
 _SCRIPT_RANGES: tuple[tuple[str, int, int], ...] = (
-    ("ru", 0x0400, 0x04FF),  # Cyrillic
-    ("ar", 0x0600, 0x06FF),  # Arabic
-    ("he", 0x0590, 0x05FF),  # Hebrew
-    ("ja", 0x3040, 0x30FF),  # Hiragana/Katakana (unambiguous Japanese)
-    ("zh", 0x4E00, 0x9FFF),  # CJK Unified (zh unless Japanese kana present)
-    ("ko", 0xAC00, 0xD7AF),  # Hangul
-    ("th", 0x0E00, 0x0E7F),  # Thai
-    ("hi", 0x0900, 0x097F),  # Devanagari
-    ("el", 0x0370, 0x03FF),  # Greek
+    ("ru", 0x0400, 0x04FF),
+    ("ar", 0x0600, 0x06FF),
+    ("he", 0x0590, 0x05FF),
+    ("ja", 0x3040, 0x30FF),
+    ("zh", 0x4E00, 0x9FFF),
+    ("ko", 0xAC00, 0xD7AF),
+    ("th", 0x0E00, 0x0E7F),
+    ("hi", 0x0900, 0x097F),
+    ("el", 0x0370, 0x03FF),
 )
 
 
-# Detect the dominant script of a query → 2-letter language code (default "en").
+# Detect the dominant script of a query → 2-letter language code (default "en"). Ported from the
+# legacy services/web_search.py::infer_query_language.
 # Used to route region/language per engine (e.g. Yandex for Cyrillic queries).
 def infer_query_language(query: str) -> str:
     text = str(query or "")
     if not text:
         return "en"
     threshold = max(1, len(text)) * 0.15
+
+    # Count the characters that fall into each script range.
     counts = {lang: 0 for lang, _, _ in _SCRIPT_RANGES}
     for ch in text:
         cp = ord(ch)
@@ -472,8 +500,12 @@ def infer_query_language(query: str) -> str:
             if lo <= cp <= hi:
                 counts[lang] += 1
                 break
+
+    # Kana present: the CJK block is Japanese, not Chinese.
     if counts["ja"] > 0:
-        counts["zh"] = 0  # kana present → the CJK block is Japanese, not Chinese
+        counts["zh"] = 0
+
+    # The first script (in table order) that reaches the threshold wins.
     for lang, _, _ in _SCRIPT_RANGES:
         if counts[lang] >= threshold:
             return lang

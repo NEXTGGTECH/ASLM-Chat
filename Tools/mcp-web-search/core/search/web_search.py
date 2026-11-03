@@ -1,23 +1,5 @@
 # Copyright NEXTGGTECH. Elastic License 2.0.
 
-"""Web-search orchestrator: stream → triage → bounded eager parse scheduler.
-
-Wires the live SERP stream to incremental triage and an eager parse scheduler:
-
-    search_stream → source event → triage.ingest (~0.1 ms)
-        ├─ PARSE  → fetch/parse starts immediately (bounded slots)
-        ├─ QUEUE  → held; consensus votes may upgrade it mid-stream
-        └─ SKIP   → dropped
-
-Engine selection is tier-based (low/medium/high) and gated by the per-engine
-circuit breaker. Parsing of early winners overlaps the tail of slow engines, so
-parse latency hides inside SERP latency.
-
-Process discipline (non-negotiable): every parse task is tracked and cancelled
-at the deadline. No fire-and-forget tasks. The persistent warm browser lives in
-its own daemon, so a cancelled search never leaves a browser process behind.
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -81,6 +63,7 @@ _STREAM_DONE = object()
 async def _merge_streams(*streams):
     queue: asyncio.Queue = asyncio.Queue()
 
+    # Copy every item of one stream into the shared queue, then post the done sentinel.
     async def drain(stream) -> None:
         try:
             async for item in stream:
@@ -88,6 +71,7 @@ async def _merge_streams(*streams):
         finally:
             await queue.put(_STREAM_DONE)
 
+    # One drain task per stream; yield items until every stream has posted its sentinel.
     tasks = [asyncio.create_task(drain(s)) for s in streams]
     remaining = len(tasks)
     try:
@@ -98,12 +82,13 @@ async def _merge_streams(*streams):
                 continue
             yield item
     finally:
+        # Cancel stragglers (early exit or error) and wait for them to finish.
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
-# Whether a source may be parsed inline during a search, or should stay snippet-only.
+# Return whether a source may be parsed inline during a search, or should stay snippet-only.
 # Two reasons to skip: a read_page-only custom-domain handler (reddit/x/ebay/youtube —
 # browser/slow APIs), or a domain the runtime store has learned is too slow to parse.
 # Either way the source still ranks and is returned; only its page is left for read_page.
@@ -112,8 +97,12 @@ def _inline_parse_allowed(url: str) -> bool:
         host = (urlsplit(str(url or "")).hostname or "").lower().rstrip(".")
     except ValueError:
         host = ""
+
+    # Always-blocked hosts (exact host or subdomain match).
     if any(host == domain or host.endswith(f".{domain}") for domain in _INLINE_PARSE_BLOCKED_DOMAINS):
         return False
+
+    # Domains with a read_page-only custom handler.
     try:
         import custom_domains
 
@@ -121,6 +110,8 @@ def _inline_parse_allowed(url: str) -> bool:
             return False
     except Exception:  # noqa: BLE001 — a handler lookup must never sink a search
         pass
+
+    # Domains the runtime profile store has learned to fetch too slowly; an unknown domain is allowed.
     try:
         from core.profiles import domain_of, get_runtime_profiles
 
@@ -138,9 +129,12 @@ def _inline_parse_allowed(url: str) -> bool:
 def _dedupe_near_duplicates(ranked: list[_Source]) -> list[_Source]:
     import re as _re
 
+    # Return the set of lowercase word tokens of a title.
     def toks(t: str) -> frozenset[str]:
         return frozenset(_re.findall(r"\w+", (t or "").lower()))
 
+    # Walk the ranking best-first and keep a source unless an already-kept source of the same host
+    # has a near-identical title.
     kept: list[_Source] = []
     seen_by_host: dict[str, list[frozenset[str]]] = {}
     for s in ranked:
@@ -150,6 +144,7 @@ def _dedupe_near_duplicates(ranked: list[_Source]) -> list[_Source]:
         for pt in prior:
             if not t or not pt:
                 continue
+
             # Containment: the shorter title's tokens almost fully inside the other →
             # same article (handles "X" vs "X - Site Name" and redirect stubs).
             overlap = len(t & pt) / max(1, min(len(t), len(pt)))
@@ -187,19 +182,25 @@ def _infer_pdf_url(url: str) -> str:
 #
 # parse_budget=0 means SERP-only. parse_timeout is the hard per-page cap (6s ceiling —
 # a wide search cannot afford a slow page; slow domains are left snippet-only anyway).
+# Fields: parse_budget is the total pages parsed per search, parse_concurrency the parallel parse
+# slots, parse_reserve the slots held back until the stream ends (anti-greed), parse_timeout the
+# hard cap per page parse, parse_max_chars the content limit per parsed page, deadline the hard cap
+# for the whole search, max_results the sources returned after ranking and allow_browser the limited
+# warm-browser escalation (high only).
 @dataclass(frozen=True, slots=True)
 class EffortProfile:
     name: str
-    parse_budget: int  # total pages parsed per search
-    parse_concurrency: int  # parallel parse slots
-    parse_reserve: int  # slots held back until the stream ends (anti-greed)
-    parse_timeout: float  # hard cap per page parse
+    parse_budget: int
+    parse_concurrency: int
+    parse_reserve: int
+    parse_timeout: float
     parse_max_chars: int
-    deadline: float  # hard cap for the whole search
-    max_results: int  # sources returned after ranking
-    allow_browser: bool  # high only: limited warm-browser escalation
+    deadline: float
+    max_results: int
+    allow_browser: bool
 
 
+# The three effort tiers by name; unknown names fall back to "low" at the call sites.
 EFFORT_PROFILES: dict[str, EffortProfile] = {
     "low": EffortProfile("low", 0, 0, 0, 0.0, 0, 8.0, 8, False),
     "medium": EffortProfile("medium", 3, 3, 1, 6.0, 8_000, 8.0, 10, False),
@@ -235,6 +236,8 @@ def _build_model_context(
 ) -> str:
     if not sources:
         return f"No results found for: {query}"
+
+    # Header: the query and the citation instructions for the model.
     first_handle = sources[0].get("id") or "id-1"
     lines: list[str] = [
         f"Search results for: {query}",
@@ -244,6 +247,9 @@ def _build_model_context(
         "",
         "Sources:",
     ]
+
+    # One block per source (parsed content when available, else the search preview), stopping once
+    # the total character budget would be exceeded.
     total = len("\n".join(lines))
     for s in sources:
         excerpt = str(s.get("markdown") or s.get("snippet") or "").strip()
@@ -271,11 +277,14 @@ def _build_model_context(
 # Adapt one shopping product into a citable source dict (price/seller/rating in the
 # snippet so it shows in model_context; structured fields kept for richer UI).
 def _shopping_product_dict(product: Any, *, citation_id: str, rank: int) -> dict[str, Any]:
+    # Price: prefer the displayed text, else format the numeric value with its currency.
     price = str(getattr(product, "price_text", "") or "").strip()
     price_value = getattr(product, "price_value", None)
     currency = str(getattr(product, "currency", "") or "").strip().upper()
     if not price and price_value is not None:
         price = f"{price_value:g} {currency}".strip()
+
+    # Converted prices (the first three are summarised in the snippet).
     converted_prices = [
         dict(item)
         for item in (getattr(product, "converted_prices", []) or [])
@@ -286,6 +295,8 @@ def _shopping_product_dict(product: Any, *, citation_id: str, rank: int) -> dict
         for item in converted_prices[:3]
         if str(item.get("price_text") or "").strip()
     )
+
+    # Snippet text shown to the model: price, converted prices, seller and rating.
     rating = getattr(product, "rating", None)
     bits = [b for b in (price, (f"≈ {converted_summary}" if converted_summary else ""),
                         str(getattr(product, "seller", "") or ""),
@@ -324,12 +335,15 @@ def _shopping_product_dict(product: Any, *, citation_id: str, rank: int) -> dict
 # snippet (model_context-visible) and the abstract feeds the markdown body so the model can
 # cite without a page fetch; structured fields are kept for richer UI.
 def _academic_paper_dict(paper: Any, *, citation_id: str, rank: int) -> dict[str, Any]:
+    # Bibliographic fields; the first three authors are shown, followed by "et al.".
     authors = list(getattr(paper, "authors", []) or [])
     author_str = ", ".join(authors[:3]) + (" et al." if len(authors) > 3 else "")
     year = getattr(paper, "year", None)
     venue = str(getattr(paper, "venue", "") or "")
     doi = str(getattr(paper, "doi", "") or "")
     cites = getattr(paper, "citations", None)
+
+    # Snippet = authors, year, venue and citation count, followed by the abstract.
     head = " · ".join(b for b in (
         author_str, str(year) if year else "", venue,
         f"{cites} citations" if cites else "",
@@ -359,7 +373,7 @@ def _academic_paper_dict(paper: Any, *, citation_id: str, rank: int) -> dict[str
     }
 
 
-# UI metadata block (source chips) the chat bridge surfaces alongside model_context.
+# Build the UI metadata block (source chips) the chat bridge surfaces alongside model_context.
 def _build_ui(sources: list[dict[str, Any]]) -> dict[str, Any]:
     chips = [
         {
@@ -401,6 +415,7 @@ def select_engines(
     if buffer is None:
         buffer = cfg.buffer_engine.enabled
 
+    # Return whether the config switch leaves this engine enabled (engines not listed are on).
     def on(parser: type) -> bool:
         return bool(enabled.get(parser.name, True))
 
@@ -454,6 +469,7 @@ def select_engines(
         and tracker.allow(StartpageParser.name)
     ):
         selected.append(StartpageParser)
+
     # …plus Qwant as a health-gated helper.
     if on(QwantParser) and tracker.allow(QwantParser.name):
         selected.append(QwantParser)
@@ -467,14 +483,16 @@ def select_engines(
     return selected
 
 
-# One aggregated source row under construction.
+# One aggregated source row under construction. `engine` is the first engine that surfaced it and
+# `families` the provider families that voted for it; the parsed_* and parse_ms fields are filled by
+# the eager parse.
 @dataclass(slots=True)
 class _Source:
     url: str
     host: str
     title: str
     snippet: str
-    engine: str  # first engine that surfaced it
+    engine: str
     rank: int
     score: float
     families: list[str]
@@ -483,9 +501,23 @@ class _Source:
     parse_ms: float = 0.0
 
 
-# Orchestrates one search: stream → triage → bounded eager parsing → ranking.
+# Orchestrator of one search: stream → triage → bounded eager parsing → ranking. It wires the live
+# SERP stream to incremental triage and an eager parse scheduler:
+#
+#     search_stream → source event → triage.ingest (~0.1 ms)
+#         ├─ PARSE  → fetch/parse starts immediately (bounded slots)
+#         ├─ QUEUE  → held; consensus votes may upgrade it mid-stream
+#         └─ SKIP   → dropped
+#
+# Engine selection is tier-based (low/medium/high) and gated by the per-engine circuit breaker.
+# Parsing of early winners overlaps the tail of slow engines, so parse latency hides inside SERP
+# latency.
+#
+# Process discipline (non-negotiable): every parse task is tracked and cancelled at the deadline.
+# No fire-and-forget tasks. The persistent warm browser lives in its own daemon, so a cancelled
+# search never leaves a browser process behind.
 class WebSearchService:
-
+    # Store the health tracker (the shared one by default) and an optional page reader for tests.
     def __init__(
         self,
         *,
@@ -493,6 +525,7 @@ class WebSearchService:
         read_page=None,
     ) -> None:
         self._tracker = tracker or get_health_tracker()
+
         # Injectable for tests; default import is deferred so SERP-only paths
         # never pay for the read service's heavy imports.
         self._read_page = read_page
@@ -510,6 +543,7 @@ class WebSearchService:
     async def _parse_one(
         self, source: _Source, profile: EffortProfile, *, query: str = ""
     ) -> None:
+        # Read the page within the per-page timeout and record whether the parse produced usable content.
         started = time.perf_counter()
         try:
             async with asyncio.timeout(profile.parse_timeout):
@@ -523,12 +557,14 @@ class WebSearchService:
                     allow_browser=profile.allow_browser,
                 )
             source.parsed_ok = bool(markdown) and not markdown.startswith("Error:")
+
             # A terminal domain handler may intentionally reject a page (for example,
             # Telegram group roots have no public HTTP message feed).  Keep the SERP
             # snippet as the preview instead of serialising the parser's diagnostic as
             # if it were useful source content.
             source.parsed_markdown = (markdown or "") if source.parsed_ok else ""
         except (TimeoutError, asyncio.CancelledError):
+            # Mark the source unparsed, then let the timeout or cancellation propagate.
             source.parsed_markdown = ""
             source.parsed_ok = False
             raise
@@ -536,6 +572,7 @@ class WebSearchService:
             logger.debug("parse failed for %s: %s", source.url, exc)
             source.parsed_ok = False
         finally:
+            # Always record how long the attempt took.
             source.parse_ms = (time.perf_counter() - started) * 1000
 
     # Build the hosted supplement stream when API keys are configured; None otherwise
@@ -551,6 +588,7 @@ class WebSearchService:
         operators: dict[str, Any] | None = None,
         timelimit: str | None = None,
     ):
+        # Bail out when the hosted layer cannot be imported or no provider has a key.
         try:
             from core.search.hosted_providers import available_providers
             from core.search.hosted_stream import hosted_search_stream
@@ -559,6 +597,8 @@ class WebSearchService:
             return None
         if not available_providers():
             return None
+
+        # Hosted results come back per provider, capped by _HOSTED_MAX_RESULTS.
         return hosted_search_stream(
             query,
             region=region,
@@ -569,7 +609,7 @@ class WebSearchService:
             timelimit=timelimit,
         )
 
-    # Run one full search. Returns the aggregated, ranked payload.
+    # Run one full search. Return the aggregated, ranked payload.
     async def search(
         self,
         query: str,
@@ -586,6 +626,7 @@ class WebSearchService:
         query_text: str = "",
         operators: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        # The effort tier decides the parse budget and deadlines; unknown names mean "low".
         profile = EFFORT_PROFILES.get(effort, EFFORT_PROFILES["low"])
         started = time.perf_counter()
 
@@ -617,6 +658,7 @@ class WebSearchService:
             )
             from core.config import load_search_config
 
+            # Build the shopping-only payload; no web engines are used.
             search_cfg = load_search_config().search
             model_context = _build_model_context(
                 query,
@@ -647,6 +689,8 @@ class WebSearchService:
                 "health": self._tracker.snapshot(),
             }
 
+        # Pick the engines for the tier and compile the query for each of them (operators an
+        # engine cannot express are omitted and reported).
         engines = select_engines(profile.name, self._tracker)
         from core.query.provider_compiler import compile_provider_query
 
@@ -664,6 +708,8 @@ class WebSearchService:
             "web_search.start effort=%s region=%s language=%s engines=%s query=%r",
             profile.name, region, language, [e.name for e in engines], query[:160],
         )
+
+        # SERP client over the shared pooled transport, limited to the selected engines.
         api = SerpApi(
             transport=_get_transport(8.0),
             timeout_seconds=8.0,
@@ -681,16 +727,21 @@ class WebSearchService:
             logger.debug("reputation snapshot unavailable: %s", exc)
             reputation = None
 
+        # Per-search state: the triage session, sources by canonical URL, the URLs held in QUEUE
+        # state, the final per-engine payloads and the tracked parse tasks. The parse slots are
+        # a semaphore (none when the tier parses nothing), and the reserve is held back until the
+        # stream ends.
         triage = TriageSession(query, reputation=reputation)
         sources: dict[str, _Source] = {}
-        queue: list[str] = []  # urls in QUEUE state
+        queue: list[str] = []
         engine_payloads: dict[str, dict[str, Any]] = {}
         parse_tasks: dict[str, asyncio.Task[None]] = {}
         parse_started_count = 0
         slots = asyncio.Semaphore(max(1, profile.parse_concurrency)) if profile.parse_budget else None
         budget_during_stream = max(0, profile.parse_budget - profile.parse_reserve)
 
-        # Spawn a tracked parse task for a triaged source.
+        # Spawn a tracked parse task for a triaged source, unless the budget is spent or the
+        # source must stay snippet-only.
         def spawn_parse(url: str) -> None:
             nonlocal parse_started_count
             if profile.parse_budget == 0 or url in parse_tasks:
@@ -698,6 +749,7 @@ class WebSearchService:
             if parse_started_count >= profile.parse_budget:
                 return
             source = sources[url]
+
             # Snippet-only sources (read_page-only handler / learned-slow domain) never
             # spend a parse slot — they stay in the ranked output without a page fetch.
             if not _inline_parse_allowed(url):
@@ -705,6 +757,7 @@ class WebSearchService:
                 return
             parse_started_count += 1
 
+            # Parse the source once a slot frees up.
             async def run() -> None:
                 assert slots is not None
                 async with slots:
@@ -761,19 +814,25 @@ class WebSearchService:
                     queue.remove(url)
                 spawn_parse(url)
 
+        # Register a consensus vote from a provider family for an already-seen URL.
         def apply_vote(url: str, family: str) -> None:
             apply_rescore(url, family, triage.ingest_vote(provider_family=family, url=url))
 
+        # Main loop: consume the merged event stream under the search deadline. Sources go through
+        # triage (PARSE starts a parse, QUEUE holds, SKIP drops), votes feed consensus and engine
+        # events update the health tracker.
         try:
             async with asyncio.timeout(profile.deadline):
                 async for event in event_stream:
                     kind = event["type"]
                     if kind == "source":
                         raw_url = event["url"]["url"]
+
                         # Dedup/consensus key is the canonical URL, so the same page from
                         # another family (http/https, www, trailing slash, tracking params)
                         # merges into one source and casts a vote instead of a duplicate.
                         url = canonicalize_url(raw_url)
+
                         # The same URL arriving from another stream/provider is a
                         # consensus vote plus a chance at a better positional view
                         # (rank/snippet from this engine), never an overwrite.
@@ -791,6 +850,9 @@ class WebSearchService:
                                 ),
                             )
                             continue
+
+                        # A new URL: triage it, keep it unless skipped, and either start its
+                        # parse right away or queue it for a later slot.
                         decision = triage.ingest_source(
                             engine=event["engine"],
                             provider_family=event["provider_family"],
@@ -821,8 +883,10 @@ class WebSearchService:
                         else:
                             queue.append(url)
                     elif kind == "vote":
+                        # A repeat sighting from another engine or family.
                         apply_vote(canonicalize_url(event["url"]["url"]), event["provider_family"])
                     elif kind == "engine":
+                        # An engine finished: keep its payload and report its outcome to the breaker.
                         payload = event["payload"]
                         engine_payloads[payload["engine"]] = payload
                         self._tracker.record(
@@ -843,6 +907,7 @@ class WebSearchService:
                     if parse_tasks:
                         await asyncio.gather(*parse_tasks.values(), return_exceptions=True)
         except TimeoutError:
+            # The deadline is a soft failure: keep whatever was already collected.
             logger.warning("web_search deadline %.0fs hit for query=%r", profile.deadline, query)
         finally:
             # Hard rule: no task survives the search. Cancellation propagates into
@@ -862,6 +927,7 @@ class WebSearchService:
                     triage.apply_page_date(url, page_date)
                     source.score = triage.score_of(url)
 
+        # Rank by score, collapse same-host near-duplicates and cut to the tier's result count.
         ranked = _dedupe_near_duplicates(
             sorted(sources.values(), key=lambda s: s.score, reverse=True)
         )
@@ -949,6 +1015,7 @@ class WebSearchService:
                 ))
             )
 
+        # Final payload, with the model-visible context built over all merged sources.
         model_context = _build_model_context(
             query, source_dicts,
             total_budget=int(search_cfg.total_context_budget or 0),
@@ -1043,6 +1110,9 @@ class WebSearchService:
         except Exception:  # noqa: BLE001 — onion is supplemental; never fail the search
             logger.warning("onion search failed for %r", query[:160], exc_info=True)
             return []
+
+        # Adapt each onion result; the scraped content doubles as snippet and parsed body, and a
+        # fixed mid-range score is used since onion sources are not ranked by triage.
         out: list[dict[str, Any]] = []
         for i, r in enumerate(results):
             rank = start_rank + i
@@ -1065,7 +1135,7 @@ class WebSearchService:
         return out
 
 
-# True when at least one engine produced a real verdict (success/partial/genuine empty),
+# Return True when at least one engine produced a real verdict (success/partial/genuine empty),
 # vs every engine failing (error/blocked/timeout/changed). Distinguishes a genuine empty
 # SERP — which is worth negative-caching — from a transient outage, which is not.
 def _had_productive_engine(payload: dict[str, Any]) -> bool:
@@ -1087,7 +1157,8 @@ def _repeat_block_payload(query: str, effort: str, age: float) -> dict[str, Any]
         "blocked": True,
         "block_reason": "repeat",
         "note": note,
-        "model_context": note,  # bridge reads model_context as the model-visible text
+        # The bridge reads model_context as the model-visible text.
+        "model_context": note,
         "sources": [],
     }
 
@@ -1123,6 +1194,7 @@ async def run_web_search(
     cache_cfg = load_search_config().cache
     tracker = get_recent_tracker()
     cache = get_hosted_cache()
+
     # shopping/academic are part of the cache/repeat key: vertical and plain runs differ.
     key_args = dict(region=region, safesearch=safesearch, timelimit=timelimit,
                     effort=effort, shopping=shopping, academic=academic)
@@ -1155,6 +1227,7 @@ async def run_web_search(
     if payload is not None:
         payload = {**payload, "cached": True}
     else:
+        # Cache miss: run the live pipeline.
         payload = await WebSearchService().search(
             query, effort=effort, region=region, safesearch=safesearch,
             timelimit=timelimit, shopping=shopping, academic=academic,
@@ -1164,12 +1237,14 @@ async def run_web_search(
         )
         payload["cached"] = False
         empty = not payload.get("sources")
+
         # A negative cache must reflect a genuine empty SERP, not a transient outage. If the
         # result is empty only because every engine errored/blocked/timed out, don't cache it
         # at all — caching would freeze a momentary failure into "nothing exists" for the TTL.
         if empty and not _had_productive_engine(payload):
             logger.info("web_search.skip_cache transient empty (no productive engine) query=%r", query[:160])
         else:
+            # A genuine result (or genuine empty SERP) is cached.
             cache.set(query, payload, is_empty=empty, **key_args)
 
     # 3. Drop sources the model was already shown within the suppression window.
@@ -1179,6 +1254,7 @@ async def run_web_search(
     )
     if seen:
         kept = [s for s in sources if s.get("url") not in seen]
+
         # Rebuild the model-visible text and chips so handles match the kept sources.
         search_cfg = load_search_config().search
         payload = {
@@ -1206,6 +1282,11 @@ async def run_web_search(
     return payload
 
 
+# Merge the results of several searches (one per plan) into a single payload. Sources are
+# re-numbered under one new search id with continuous ranks and tagged with their batch query, the
+# model context gets one section per query (the total budget split evenly), and the UI status is
+# done, partial or empty depending on how many queries returned sources. legacy_flags are copied
+# into the payload as-is.
 def _combine_search_results(
     plans: list[dict[str, Any]],
     results: list[dict[str, Any]],
@@ -1224,6 +1305,7 @@ def _combine_search_results(
     sources_by_query: list[list[dict[str, Any]]] = []
     next_rank = 1
 
+    # Re-number the sources of every query and tag them with their query and vertical.
     for query_index, (plan, result) in enumerate(zip(plans, results), 1):
         query_sources: list[dict[str, Any]] = []
         for raw_source in result.get("sources") or []:
@@ -1240,6 +1322,7 @@ def _combine_search_results(
             next_rank += 1
         sources_by_query.append(query_sources)
 
+    # One context section per query; a query without sources keeps its own context text.
     total_budget = int(search_cfg.total_context_budget or 0)
     query_budget = total_budget // len(plans) if total_budget else 0
     per_source_chars = int(search_cfg.preview_max_chars or 0)
@@ -1255,6 +1338,7 @@ def _combine_search_results(
         else:
             context_sections.append(str(result.get("model_context") or f"No results found for: {query}"))
 
+    # Describe the request (queries and operators) so the UI can show what was searched.
     request_queries = [
         {
             "vertical": str(plan.get("vertical") or "web"),
@@ -1270,6 +1354,8 @@ def _combine_search_results(
     }
     if description:
         search_request["description"] = description
+
+    # UI block: done when every query returned sources, partial when only some did, empty otherwise.
     ui = _build_ui(all_sources)
     queries_with_sources = sum(bool(sources) for sources in sources_by_query)
     if queries_with_sources == 0:
@@ -1283,6 +1369,7 @@ def _combine_search_results(
     if description:
         ui["description"] = description
 
+    # Assemble the combined payload.
     queries = [plan["compiled_query"] for plan in plans]
     payload: dict[str, Any] = {
         "query": queries[0] if len(queries) == 1 else queries,
@@ -1330,7 +1417,8 @@ def _combine_search_results(
     return payload
 
 
-# Run up to three independent legacy searches concurrently.
+# Run several independent legacy searches concurrently (one query each, shared effort and flags)
+# and combine them into one payload. An empty or single-query list is a plain run_web_search call.
 async def run_web_search_batch(
     queries: list[str],
     *,
@@ -1353,6 +1441,7 @@ async def run_web_search_batch(
             timelimit=timelimit, shopping=shopping, academic=academic, onion=onion,
         )
 
+    # Run all queries concurrently, then describe each as a plan of the single active vertical.
     started = time.perf_counter()
     results = await asyncio.gather(*(
         run_web_search(
@@ -1377,13 +1466,14 @@ async def run_web_search_batch(
     )
 
 
+# Run a prepared mixed-vertical advanced plan concurrently and combine the results. Dates are
+# already resolved in the plan, and a shopping item runs as a shopping-only search.
 async def run_web_search_plan(search_request: dict[str, Any]) -> dict[str, Any]:
-    """Run a prepared mixed-vertical advanced plan concurrently."""
-
     plans = [dict(item) for item in search_request.get("queries", []) if isinstance(item, dict)]
     effort = str(search_request.get("effort") or "medium")
     started = time.perf_counter()
 
+    # Run one plan item through run_web_search with the flags of its vertical.
     async def run_item(plan: dict[str, Any]) -> dict[str, Any]:
         vertical = str(plan.get("vertical") or "web")
         return await run_web_search(

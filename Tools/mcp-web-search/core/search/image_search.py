@@ -1,12 +1,5 @@
 # Copyright NEXTGGTECH. Elastic License 2.0.
 
-"""Concurrent image search with cross-provider deduplication.
-
-Ported from ASLM-Search, adapted to this core's SerpApi (no page routing: the
-tool only serves first pages) and query_locales (the query's own script picks
-the region, so a Russian query searches Yandex-friendly ru-ru image indexes).
-"""
-
 from __future__ import annotations
 
 import re
@@ -21,6 +14,8 @@ from .serp_api import SerpApi
 from .web_search import canonicalize_url
 
 
+# Return the image engine parser types switched on in the given map (or in the search config when
+# None). Falls back to Bing Images when nothing is enabled.
 def enabled_image_engine_types(
     enabled: dict[str, bool] | None = None,
 ) -> tuple[type, ...]:
@@ -37,11 +32,13 @@ def enabled_image_engine_types(
     return selected or (BingImagesParser,)
 
 
+# Return the canonical image URL used as the deduplication key, or an empty string without one.
 def _image_key(source: dict[str, Any]) -> str:
     image_url = str(source.get("image_url") or "").strip()
     return canonicalize_url(image_url) if image_url else ""
 
 
+# Record the engine on the kept result and fill its empty metadata fields from the duplicate.
 def _merge_duplicate(keep: dict[str, Any], other: dict[str, Any], engine: str) -> None:
     engines = keep.setdefault("engines", [])
     if engine not in engines:
@@ -61,6 +58,7 @@ def _merge_duplicate(keep: dict[str, Any], other: dict[str, Any], engine: str) -
             keep[field] = other[field]
 
 
+# Return the share (0..1) of distinct query terms found in the result's text fields.
 def _query_relevance(query: str, source: dict[str, Any]) -> float:
     terms = {
         token.casefold()
@@ -76,9 +74,12 @@ def _query_relevance(query: str, source: dict[str, Any]) -> float:
     return sum(term in haystack for term in terms) / len(terms)
 
 
+# Concurrent image search with cross-provider deduplication. Adapted to this core's SerpApi (no page
+# routing: the tool only serves first pages) and to query_locales (the query's own script picks the
+# region, so a Russian query searches Yandex-friendly ru-ru image indexes).
 class ImageSearchService:
-    """Run the configured image adapters and interleave their ranked results."""
-
+    # Run the configured image adapters, deduplicate by image URL and interleave their ranked results.
+    # Return the query, resolved region and language, the scored sources and the per-engine payloads.
     async def search(
         self,
         query: str,
@@ -93,6 +94,7 @@ class ImageSearchService:
         normalized_query = " ".join(str(query or "").split()).strip()
         if not normalized_query:
             raise ValueError("query must not be empty")
+
         # The query's own script picks the region (query_locales): image indexes
         # are far more language-sensitive than web SERPs.
         analysis = analyze_query(normalized_query)
@@ -106,6 +108,8 @@ class ImageSearchService:
             source_limit=per_engine_limit,
             engines=selected,
         )
+
+        # Run all selected engines through SerpApi and collect their final engine payloads.
         engine_payloads: dict[str, dict[str, Any]] = {}
         try:
             async for event in api.search_stream(
@@ -125,6 +129,8 @@ class ImageSearchService:
         finally:
             await transport.close()
 
+        # Interleave the engines rank by rank (round robin) so no engine dominates; a repeated image
+        # URL is merged into the first occurrence instead of being listed twice.
         merged: list[dict[str, Any]] = []
         seen: dict[str, dict[str, Any]] = {}
         longest = max(
@@ -153,6 +159,7 @@ class ImageSearchService:
                 seen[key] = source
                 merged.append(source)
 
+        # Score by rank position, query relevance and cross-engine agreement, then sort best first.
         for source in merged:
             position = 1.0 / max(1, int(source.get("rank") or 1))
             relevance = _query_relevance(normalized_query, source)

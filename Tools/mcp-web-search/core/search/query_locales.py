@@ -1,16 +1,5 @@
 # Copyright NEXTGGTECH. Elastic License 2.0.
 
-"""Deterministic query-locale detection and result-language scoring.
-
-Ported from ASLM-Search's query_analysis: stdlib-only (no nltk or model calls),
-sub-millisecond per query. Two jobs:
-- analyze_query() maps a raw query to one of the 20 supported locales using script
-  ranges, distinctive diacritics and stop-word hints — this drives region routing
-  so a French query searches fr-fr instead of us-en.
-- detect_result_language() + language_mismatch_penalty() let triage gently prefer
-  results written in the query's language without banning foreign-language pages.
-"""
-
 from __future__ import annotations
 
 import re
@@ -19,6 +8,8 @@ from dataclasses import dataclass
 from urllib.parse import urlsplit
 
 
+# One supported locale: its code (such as "pt-BR"), the language it belongs to, the engine region
+# code used to route searches (such as "us-en") and its display name in its own language.
 @dataclass(frozen=True, slots=True)
 class LocaleProfile:
     code: str
@@ -27,6 +18,8 @@ class LocaleProfile:
     label: str
 
 
+# The 20 supported locales. Where a language has several, the order decides the fallback (see
+# _DEFAULT_BY_LANGUAGE).
 LOCALE_PROFILES: tuple[LocaleProfile, ...] = (
     LocaleProfile("ar", "ar", "sa-ar", "العربية"),
     LocaleProfile("de", "de", "de-de", "Deutsch"),
@@ -50,6 +43,9 @@ LOCALE_PROFILES: tuple[LocaleProfile, ...] = (
     LocaleProfile("zh-Hant", "zh", "tw-zh", "繁體中文"),
 )
 
+# Lookup tables: profiles by lowercased locale code, and the default profile per language. The
+# reversed iteration lets the first listed profile of a language win; the update then pins the
+# defaults for English, Portuguese (Brazil) and Chinese (Simplified).
 _BY_CODE = {profile.code.lower(): profile for profile in LOCALE_PROFILES}
 _DEFAULT_BY_LANGUAGE = {
     profile.language: profile for profile in reversed(LOCALE_PROFILES)
@@ -62,6 +58,7 @@ _DEFAULT_BY_LANGUAGE.update(
     }
 )
 
+# Common stop and shopping words per Latin-script language; a token found here scores for that language.
 _LATIN_HINTS: dict[str, frozenset[str]] = {
     "de": frozenset({"der", "die", "das", "ein", "eine", "und", "wie", "was", "für", "mit", "ohne", "kaufen"}),
     "es": frozenset({"el", "la", "los", "las", "una", "como", "cómo", "para", "con", "sin", "comprar", "mejor", "dónde", "qué", "más", "cuánto"}),
@@ -76,6 +73,7 @@ _LATIN_HINTS: dict[str, frozenset[str]] = {
     "en": frozenset({"the", "a", "an", "how", "what", "for", "with", "without", "buy", "best", "price"}),
 }
 
+# Characters (mostly diacritics) that point to one Latin-script language.
 _DISTINCTIVE_LATIN: dict[str, frozenset[str]] = {
     "de": frozenset("äöüß"),
     "es": frozenset("ñ¿¡áíóú"),
@@ -86,11 +84,14 @@ _DISTINCTIVE_LATIN: dict[str, frozenset[str]] = {
     "vi": frozenset("ăđơưắằẳẵặớờởỡợứừửữự"),
 }
 
+# Cyrillic disambiguation: letters and words that separate Ukrainian from Russian, and Russian
+# words that separate Russian from Ukrainian. Traditional Chinese characters tell zh-Hant from zh-Hans.
 _UKRAINIAN_CHARS = frozenset("іїєґ")
 _UKRAINIAN_WORDS = frozenset({"як", "що", "для", "та", "або", "купити", "кращий", "ціна"})
 _RUSSIAN_WORDS = frozenset({"как", "что", "для", "и", "или", "купить", "лучший", "цена"})
 _TRADITIONAL_CHARS = frozenset("體國臺灣學術網頁搜尋購買與這為後發現點開關門書車電腦")
 
+# Language implied by a country-code TLD, used as a tiebreaker for ambiguous Latin-script results.
 _TLD_LANGUAGES = {
     "de": "de", "at": "de", "es": "es", "fr": "fr", "id": "id", "it": "it",
     "jp": "ja", "kr": "ko", "nl": "nl", "pl": "pl", "br": "pt", "pt": "pt",
@@ -98,6 +99,9 @@ _TLD_LANGUAGES = {
 }
 
 
+# Result of analyzing a query: the detected language, the matching locale code, the engine region to
+# search, a confidence in [0,1] and the script the decision was based on ("latin", "cyrillic",
+# "kana", ..., or "configured" / "unknown" when no detection ran).
 @dataclass(frozen=True, slots=True)
 class QueryAnalysis:
     language: str
@@ -107,23 +111,30 @@ class QueryAnalysis:
     script: str
 
 
+# Return the locale profile for a locale code (case-insensitive), falling back to English.
 def locale_profile(code: str) -> LocaleProfile:
     return _BY_CODE.get(str(code or "").strip().lower(), _BY_CODE["en"])
 
 
+# Return the default locale profile of a language, falling back to English.
 def locale_for_language(language: str) -> LocaleProfile:
     return _DEFAULT_BY_LANGUAGE.get(str(language or "").lower(), _BY_CODE["en"])
 
 
+# Return the alphabetic characters of the text.
 def _letters(text: str) -> list[str]:
     return [character for character in text if character.isalpha()]
 
 
+# Split the text into casefolded runs of letters, dropping digits and underscores.
 def _tokens(text: str) -> list[str]:
     return re.findall(r"[^\W\d_]+", text.casefold(), flags=re.UNICODE)
 
 
+# Guess the language of a Latin-script text from distinctive characters and stop-word hints.
+# Return (language code, confidence); fall back to English at low confidence when nothing matches.
 def _latin_language(text: str, tokens: list[str]) -> tuple[str, float]:
+    # Score each language: distinctive characters weigh more than a matching hint word.
     scores = {language: 0.0 for language in _LATIN_HINTS}
     lowered = text.casefold()
     for language, characters in _DISTINCTIVE_LATIN.items():
@@ -134,9 +145,12 @@ def _latin_language(text: str, tokens: list[str]) -> tuple[str, float]:
             # the base hint word from its language.
             if token in hints or (len(token) > 3 and token.rstrip("s") in hints):
                 scores[language] += 1
+
+    # Pick the winner; the confidence grows with the lead over the runner-up.
     score = max(scores.values())
     if score <= 0:
         return "en", 0.35
+
     # Ties break toward English: short queries legitimately hit one hint in
     # several languages ("a" family collisions), and English is the web's
     # default — a wrong pt/es call routes the whole search to the wrong region.
@@ -150,6 +164,10 @@ def _latin_language(text: str, tokens: list[str]) -> tuple[str, float]:
     return language, confidence
 
 
+# Map a raw query to one of the supported locales, deterministically (stdlib only, no model calls,
+# sub-millisecond per query), using script ranges, distinctive diacritics and stop-word hints. This
+# drives region routing, so a French query searches fr-fr instead of us-en. An explicit
+# locale_override wins with full confidence; a text without letters falls back to English.
 def analyze_query(text: str, *, locale_override: str = "") -> QueryAnalysis:
     normalized = unicodedata.normalize("NFKC", str(text or "")).strip()
     if locale_override:
@@ -160,6 +178,8 @@ def analyze_query(text: str, *, locale_override: str = "") -> QueryAnalysis:
         profile = _BY_CODE["en"]
         return QueryAnalysis(profile.language, profile.code, profile.region, 0.0, "unknown")
     tokens = _tokens(normalized)
+
+    # Count the letters that fall into each non-Latin script block.
     counts = {"arabic": 0, "cyrillic": 0, "devanagari": 0, "hangul": 0, "kana": 0, "cjk": 0}
     for character in letters:
         codepoint = ord(character)
@@ -175,12 +195,18 @@ def analyze_query(text: str, *, locale_override: str = "") -> QueryAnalysis:
             counts["kana"] += 1
         elif 0x3400 <= codepoint <= 0x9FFF:
             counts["cjk"] += 1
+
+    # Find the dominant script. Japanese is checked first: any kana together with kana and CJK
+    # ideographs making up at least 15% of the letters means Japanese, since Chinese has no kana.
     dominant_script, dominant_count = max(counts.items(), key=lambda item: item[1])
     ratio = dominant_count / max(1, len(letters))
     if counts["kana"] > 0 and (counts["kana"] + counts["cjk"]) / max(1, len(letters)) >= 0.15:
         profile = locale_profile("ja")
         confidence = min(0.99, 0.7 + (counts["kana"] + counts["cjk"]) / max(1, len(letters)) * 0.29)
         return QueryAnalysis("ja", profile.code, profile.region, confidence, "kana")
+
+    # A non-Latin script covering at least 15% of the letters decides the language; Cyrillic needs
+    # the Ukrainian/Russian check and CJK the traditional/simplified check.
     if ratio >= 0.15:
         language, locale = "en", "en"
         if dominant_script == "arabic":
@@ -202,15 +228,23 @@ def analyze_query(text: str, *, locale_override: str = "") -> QueryAnalysis:
         confidence = min(0.99, 0.65 + ratio * 0.34)
         profile = locale_profile(locale)
         return QueryAnalysis(language, profile.code, profile.region, confidence, dominant_script)
+
+    # Otherwise treat the text as Latin script and decide by diacritics and hint words.
     language, confidence = _latin_language(normalized, tokens)
     profile = locale_for_language(language)
     return QueryAnalysis(language, profile.code, profile.region, confidence, "latin")
 
 
+# Detect the language of a result from its title and snippet. For a weakly detected Latin-script
+# text, the language implied by the URL's country TLD (when known) wins. Together with
+# language_mismatch_penalty() this lets triage gently prefer results written in the query's
+# language without banning foreign-language pages.
 def detect_result_language(title: str, snippet: str = "", url: str = "") -> str:
     analysis = analyze_query(f"{title} {snippet}".strip())
     if analysis.script != "latin" or analysis.confidence >= 0.62:
         return analysis.language
+
+    # Low-confidence Latin text: fall back to the TLD of the result URL.
     try:
         host = (urlsplit(url).hostname or "").lower()
     except ValueError:
@@ -219,12 +253,10 @@ def detect_result_language(title: str, snippet: str = "", url: str = "") -> str:
     return _TLD_LANGUAGES.get(tld, analysis.language)
 
 
+# Return the soft penalty (at most 0.3, scaled by weight) for a result written in a different
+# language than the query. English results never pay (it is the web's lingua franca and the
+# fallback for every locale), and a confident same-language match never pays either.
 def language_mismatch_penalty(query_language: str, result_language: str, weight: float) -> float:
-    """Soft penalty for a result written in a different language than the query.
-
-    English results never pay (it is the web's lingua franca and the fallback for
-    every locale), and a confident same-language match never pays either.
-    """
     query = str(query_language or "en").lower()
     result = str(result_language or "").lower()
     if not result or not weight or result == query or result == "en":

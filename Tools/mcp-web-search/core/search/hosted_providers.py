@@ -1,18 +1,5 @@
 # Copyright NEXTGGTECH. Elastic License 2.0.
 
-"""Hosted search-API clients (optional supplement layer).
-
-Ported from the legacy `core/fetch/hosted_clients.py` and rebuilt async-first on httpx
-(the new stack's HTTP client) instead of sync `requests` in a thread pool. Every client
-exposes the same Tavily-style shape — `search() -> list[HostedResult]` — where
-content-bearing providers (Tavily advanced, Firecrawl) carry the full page text in
-`HostedResult.content`. That text is pre-populated into SourceCache by `hosted_stream`
-so the shared read_page extraction/compaction pipeline runs on it without a re-fetch.
-
-`provider_family` drives consensus voting: SerpApi serves Google's index, so it votes
-with the Google scrape parser; Tavily/Firecrawl/Brave are their own families.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -30,10 +17,15 @@ logger = logging.getLogger("services.web_search")
 # tiers only return short snippets, which defeats the whole point of the content feed.
 _TAVILY_SEARCH_DEPTH = "advanced"
 
+# Characters that break hosted API query parsers: square brackets, asterisks and backslashes.
 _API_QUERY_STRIP_RE = re.compile(r"[\[\]*\\]")
 
 
-# One hosted result row. `content` is non-empty only for content-bearing providers.
+# One hosted result row. `content` is non-empty only for content-bearing providers (Tavily advanced,
+# Firecrawl), which carry the full page text; hosted_stream pre-populates it into SourceCache so the
+# shared read_page extraction and compaction pipeline runs on it without a re-fetch.
+# `provider_family` drives consensus voting: SerpApi serves Google's index, so it votes with the
+# Google scrape parser, while Tavily, Firecrawl and Brave are their own families.
 @dataclass(slots=True)
 class HostedResult:
     url: str
@@ -53,32 +45,39 @@ def sanitize_query_for_api(query: str) -> str:
     return " ".join(query.split())
 
 
+# Interface shared by every hosted search-API client (async, httpx based). Each client exposes the
+# same Tavily-style shape: `search()` returns a list of HostedResult.
 class HostedProvider(Protocol):
     name: str
     provider_family: str
     returns_content: bool
 
+    # Return this provider's API key from the configured keys section, or None when it is not set.
     def key(self, keys: HostedSearchApiKeysSection) -> str | None: ...
 
+    # Run one query against the provider and return at most max_results rows.
     async def search(
         self, client: httpx.AsyncClient, query: str, *, max_results: int
     ) -> list[HostedResult]: ...
 
 
-# --- Tavily: POST /search, advanced depth → raw_content (full page text) ----------
+# Tavily client: POST /search, advanced depth returns raw_content (full page text).
 class TavilyClient:
     name = "tavily"
     provider_family = "tavily"
     returns_content = True
     BASE_URL = "https://api.tavily.com/search"
 
+    # Return the Tavily API key from the keys section.
     def key(self, keys: HostedSearchApiKeysSection) -> str | None:
         return keys.tavily_api_key
 
+    # Query Tavily and map its results to HostedResult rows (full page text only in content mode).
     async def search(self, client, query, *, max_results):
         api_key = load_api_keys().search.hosted_api.tavily_api_key
         if not api_key:
             return []
+
         # serp mode: cheap consensus rows only — basic depth, no raw page text, and
         # nothing fed into SourceCache (a snippet cached as "the page" would poison
         # read_page with a 200-char stub).
@@ -92,6 +91,8 @@ class TavilyClient:
             "include_raw_content": content_mode,
         }
         data = await _post_json(client, self.BASE_URL, json=payload, provider=self.name)
+
+        # Map result rows, skipping those without a URL.
         out: list[HostedResult] = []
         for item in (data or {}).get("results", []):
             url = item.get("url") or ""
@@ -110,20 +111,23 @@ class TavilyClient:
         return out
 
 
-# --- Firecrawl: POST /v1/search with scrapeOptions → markdown (full page text) ----
+# Firecrawl client: POST /v1/search with scrapeOptions returns markdown (full page text).
 class FirecrawlClient:
     name = "firecrawl"
     provider_family = "firecrawl"
     returns_content = True
     BASE_URL = "https://api.firecrawl.dev/v1/search"
 
+    # Return the Firecrawl API key from the keys section.
     def key(self, keys: HostedSearchApiKeysSection) -> str | None:
         return keys.firecrawl_api_key
 
+    # Query Firecrawl and map its results to HostedResult rows (markdown only in content mode).
     async def search(self, client, query, *, max_results):
         api_key = load_api_keys().search.hosted_api.firecrawl_api_key
         if not api_key:
             return []
+
         # serp mode (the default): plain search rows, no per-result headless scrape.
         # Content mode was measured at ~9.4s — past the medium hosted deadline, so the
         # scrape credits were being spent on results the deadline then threw away.
@@ -138,6 +142,8 @@ class FirecrawlClient:
             client, self.BASE_URL, json=payload, provider=self.name,
             headers={"Authorization": f"Bearer {api_key}"},
         )
+
+        # Map result rows, falling back to the page metadata for title and description.
         out: list[HostedResult] = []
         for item in (data or {}).get("data", []):
             url = item.get("url") or ""
@@ -156,16 +162,18 @@ class FirecrawlClient:
         return out
 
 
-# --- Brave Search API: GET /res/v1/web/search (SERP rows + rich snippets) ----------
+# Brave Search API client: GET /res/v1/web/search returns SERP rows with rich snippets.
 class BraveClient:
     name = "brave"
     provider_family = "brave"
     returns_content = False
     BASE_URL = "https://api.search.brave.com/res/v1/web/search"
 
+    # Return the Brave API key from the keys section.
     def key(self, keys: HostedSearchApiKeysSection) -> str | None:
         return keys.brave_api_key
 
+    # Query Brave and map its web results to HostedResult rows (no page content).
     async def search(self, client, query, *, max_results):
         api_key = load_api_keys().search.hosted_api.brave_api_key
         if not api_key:
@@ -192,16 +200,18 @@ class BraveClient:
         return out
 
 
-# --- SerpApi (Google engine): GET /search.json. Votes with the Google scrape family.
+# SerpApi client (Google engine): GET /search.json. Votes with the Google scrape family.
 class SerpApiClient:
     name = "serpapi"
     provider_family = "google"
     returns_content = False
     BASE_URL = "https://serpapi.com/search.json"
 
+    # Return the SerpApi API key from the keys section.
     def key(self, keys: HostedSearchApiKeysSection) -> str | None:
         return keys.serpapi_api_key
 
+    # Query SerpApi's Google engine and map its organic results to HostedResult rows (no page content).
     async def search(self, client, query, *, max_results):
         api_key = load_api_keys().search.hosted_api.serpapi_api_key
         if not api_key:
@@ -243,7 +253,7 @@ def provider_mode(name: str) -> str:
     return str(getattr(load_search_config().hosted_api, name, "serp"))
 
 
-# Providers that have an API key configured right now and are not switched off.
+# Return the providers that have an API key configured right now and are not switched off.
 def available_providers() -> list[HostedProvider]:
     keys = load_api_keys().search.hosted_api
     return [
@@ -252,7 +262,7 @@ def available_providers() -> list[HostedProvider]:
     ]
 
 
-# POST JSON helper; never raises (returns None on any failure).
+# Send a JSON POST and return the decoded body; never raises (returns None on any failure).
 async def _post_json(client, url, *, json, provider, headers=None):
     try:
         resp = await client.post(url, json=json, headers=headers or {})
@@ -263,7 +273,7 @@ async def _post_json(client, url, *, json, provider, headers=None):
         return None
 
 
-# GET JSON helper; never raises (returns None on any failure).
+# Send a GET and return the decoded JSON body; never raises (returns None on any failure).
 async def _get_json(client, url, *, params, provider, headers=None):
     try:
         resp = await client.get(url, params=params, headers=headers or {})

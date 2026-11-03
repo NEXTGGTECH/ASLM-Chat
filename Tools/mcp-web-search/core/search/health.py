@@ -1,19 +1,5 @@
 # Copyright NEXTGGTECH. Elastic License 2.0.
 
-"""Per-engine health tracking with a circuit breaker.
-
-States follow the classic breaker: CLOSED (healthy) → OPEN (cooling down) →
-HALF_OPEN (one probe allowed) → CLOSED on success or back to OPEN with
-exponential backoff on failure.
-
-Two trigger classes with different cooldowns:
-- error (HTTP 4xx/5xx block, timeout, BLOCKED/CHANGED parse): long cooldown;
-- degradation (success but thin results or latency spike): short cooldown.
-
-The tracker is in-memory and per-process. EWMA latency uses a fixed alpha —
-cheap and good enough to spot a p95-style spike without storing samples.
-"""
-
 from __future__ import annotations
 
 import random
@@ -21,7 +7,9 @@ import time
 from dataclasses import dataclass, field
 from enum import StrEnum
 
-# Cooldowns (seconds). Config-level constants by design — tune here, not inline.
+# Cooldowns in seconds for the two trigger classes: a short one after a degradation (success but thin
+# results or a latency spike) and a long one after an error (HTTP block, timeout, blocked or changed
+# parse). Config-level constants by design: tune here, not inline.
 DEGRADATION_COOLDOWN = 30.0
 ERROR_COOLDOWN = 300.0
 
@@ -61,17 +49,21 @@ _THIN_RESULTS_FLOOR = 1
 _ERROR_STATUSES = frozenset({"blocked", "timeout", "error", "changed"})
 
 
+# Circuit breaker states: CLOSED (healthy), OPEN (cooling down) and HALF_OPEN (one probe allowed).
 class BreakerState(StrEnum):
     CLOSED = "closed"
     OPEN = "open"
     HALF_OPEN = "half_open"
 
 
+# Mutable health record of one engine: breaker state, cooldown timing, counters and pacing gates.
+# open_until is the clock time the OPEN state ends, cooldown is the current cooldown length (it
+# grows with backoff) and ewma_fetch_ms is the smoothed fetch latency in milliseconds.
 @dataclass(slots=True)
 class EngineHealth:
     state: BreakerState = BreakerState.CLOSED
     open_until: float = 0.0
-    cooldown: float = 0.0  # current cooldown (grows with backoff)
+    cooldown: float = 0.0
     ewma_fetch_ms: float = 0.0
     successes: int = 0
     errors: int = 0
@@ -85,10 +77,14 @@ class EngineHealth:
     paced_until: float = field(default=0.0, repr=False)
 
 
-# In-memory health registry + circuit breaker for SERP engines.
+# In-memory, per-process health registry and circuit breaker for SERP engines.
+# The breaker goes CLOSED -> OPEN (cooling down) -> HALF_OPEN (one probe allowed) -> CLOSED on
+# success, or back to OPEN with exponential backoff on failure. Errors (HTTP 4xx/5xx block,
+# timeout, BLOCKED/CHANGED parse) get the long cooldown; degradation (success but thin results or
+# a latency spike) gets the short one. Latency is tracked as an EWMA with a fixed alpha, which is
+# cheap and good enough to spot a p95-style spike without storing samples.
 class EngineHealthTracker:
-
-    # clock is injectable for tests.
+    # Create an empty registry; the clock is injectable for tests.
     def __init__(self, *, clock=time.monotonic) -> None:
         self._clock = clock
         self._engines: dict[str, EngineHealth] = {}
@@ -101,7 +97,7 @@ class EngineHealthTracker:
             self._engines[engine] = health
         return health
 
-    # True when the engine may be called right now. Layers Stage C pacing over the
+    # Return True when the engine may be called right now. Layers Stage C pacing over the
     # breaker: an engine fired too recently (within its jittered min-interval) is held
     # back even when healthy. A HALF_OPEN engine allows exactly one in-flight probe.
     # Callers that get False should use a substitute of the same tier.
@@ -115,7 +111,7 @@ class EngineHealthTracker:
         self._note_fired(engine, health, now)
         return True
 
-    # True only when the engine's breaker is solidly CLOSED (healthy). Pure read — no
+    # Return True only when the engine's breaker is solidly CLOSED (healthy). Pure read — no
     # pacing, no probe consumption, no state transition — so selection code can ask "is
     # this engine trustworthy right now?" without side effects. An OPEN breaker (cooling)
     # OR a HALF_OPEN probe (recovery unproven) both read False: in either case a same-family
@@ -131,7 +127,7 @@ class EngineHealthTracker:
             return False
         return health.state == BreakerState.CLOSED
 
-    # The circuit-breaker half of allow(): CLOSED passes, OPEN waits then probes once.
+    # Apply the circuit-breaker half of allow(): CLOSED passes, OPEN waits then probes once.
     def _breaker_admits(self, health: EngineHealth, now: float) -> bool:
         if health.state == BreakerState.CLOSED:
             return True
@@ -140,6 +136,7 @@ class EngineHealthTracker:
                 return False
             health.state = BreakerState.HALF_OPEN
             health.probe_inflight = False
+
         # HALF_OPEN: admit a single probe. An in-flight probe whose outcome was
         # never recorded (deadline lost the engine event) is expired so it cannot
         # wedge the engine shut forever.
@@ -161,6 +158,7 @@ class EngineHealthTracker:
         health.last_status = status
         is_error = status in _ERROR_STATUSES
 
+        # Classify the call: a latency spike against the EWMA or a thin result set is a degradation.
         spike = (
             not is_error
             and health.ewma_fetch_ms > 0
@@ -169,12 +167,14 @@ class EngineHealthTracker:
         thin = not is_error and results < _THIN_RESULTS_FLOOR
         is_degraded = spike or thin
 
+        # Fold the latency of successful calls into the EWMA (the first sample seeds it).
         if not is_error and fetch_ms > 0:
             if health.ewma_fetch_ms <= 0:
                 health.ewma_fetch_ms = fetch_ms
             else:
                 health.ewma_fetch_ms += _EWMA_ALPHA * (fetch_ms - health.ewma_fetch_ms)
 
+        # Trip the breaker with the cooldown of the trigger class, or close it on a clean success.
         if is_error:
             health.errors += 1
             self._trip(health, ERROR_COOLDOWN)
@@ -183,6 +183,7 @@ class EngineHealthTracker:
             self._trip(health, DEGRADATION_COOLDOWN)
         else:
             health.successes += 1
+
             # Success closes the breaker and resets backoff.
             health.state = BreakerState.CLOSED
             health.cooldown = 0.0
@@ -199,7 +200,7 @@ class EngineHealthTracker:
         health.state = BreakerState.OPEN
         health.probe_inflight = False
 
-    # Snapshot for diagnostics payloads.
+    # Return a per-engine snapshot of breaker state, remaining cooldowns and counters for diagnostics payloads.
     def snapshot(self) -> dict[str, dict[str, object]]:
         now = self._clock()
         out: dict[str, dict[str, object]] = {}
@@ -221,6 +222,7 @@ class EngineHealthTracker:
 _shared_tracker: EngineHealthTracker | None = None
 
 
+# Return the process-wide tracker, creating it on first use.
 def get_health_tracker() -> EngineHealthTracker:
     global _shared_tracker
     if _shared_tracker is None:
