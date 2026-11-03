@@ -10,6 +10,7 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+# Project root and the JSON file that stores the last locale snapshot received from the ASLM host.
 BASE_DIR = Path(__file__).resolve().parent.parent
 HOST_LOCALE_FILE = BASE_DIR / "Settings" / "host_locale.json"
 
@@ -28,6 +29,7 @@ def atomic_write_json(path: Path, data: dict[str, Any]) -> None:
             try:
                 tmp_path.unlink()
             except OSError:
+                # The leftover temporary file is harmless; the original write error is re-raised below.
                 pass
         raise
 

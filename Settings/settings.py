@@ -12,6 +12,8 @@ from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
+# Project root, the module settings file and the config files of the tools that mirror part of
+# the module settings (web search keys and options, browser agent, sandbox).
 BASE_DIR = Path(__file__).resolve().parent.parent
 SETTINGS_FILE = BASE_DIR / "Settings" / "settings.json"
 WEB_SEARCH_API_KEYS_FILE = BASE_DIR / "Tools" / "mcp-web-search" / "core" / "config" / "api_keys.json"
@@ -19,6 +21,7 @@ WEB_SEARCH_CONFIG_FILE = BASE_DIR / "Tools" / "mcp-web-search" / "core" / "confi
 BROWSER_AGENT_CONFIG_FILE = BASE_DIR / "Tools" / "mcp-browser-agent" / "config.json"
 SANDBOX_CONFIG_FILE = BASE_DIR / "Tools" / "mcp-sandbox" / "sandbox.json"
 
+# Display names of the supported LLM engines, keyed by canonical engine id.
 ENGINE_LABELS = {
     "ollama-service": "Ollama",
     "lms": "LM Studio",
@@ -26,8 +29,10 @@ ENGINE_LABELS = {
     "google-genai": "Google GenAI",
 }
 
+# Canonical engine ids in their priority order; the first enabled one is the fallback engine.
 ENGINE_IDS = ("ollama-service", "lms", "openai", "google-genai")
 
+# Accepted spellings of engine names mapped to the canonical engine id.
 ENGINE_ALIASES = {
     "ollama": "ollama-service",
     "ollama-service": "ollama-service",
@@ -41,6 +46,8 @@ ENGINE_ALIASES = {
     "gemini": "google-genai",
 }
 
+# Setting key that holds each engine's address (None: the engine has no configurable address,
+# its port is a separate setting).
 ENGINE_URL_KEYS = {
     "ollama-service": None,
     "lms": "lms_url",
@@ -48,13 +55,17 @@ ENGINE_URL_KEYS = {
     "google-genai": "google_genai_url",
 }
 
+# Setting key that holds the API key of each engine that needs one.
 ENGINE_API_KEY_KEYS = {
     "openai": "openai_api_key",
     "google-genai": "google_genai_api_key",
 }
 
+# Host account key settings; they live only in the local settings file and are never mirrored
+# into the module manifest.
 HOST_KEY_SETTING_KEYS = frozenset({"key-aslm", "key-gh"})
 
+# Module setting key -> key in the web search api_keys.json file.
 WEB_SEARCH_API_KEY_SETTINGS = {
     "web-search-tavily-api-key": "tavily_api_key",
     "web-search-firecrawl-api-key": "firecrawl_api_key",
@@ -62,6 +73,7 @@ WEB_SEARCH_API_KEY_SETTINGS = {
     "web-search-serpapi-api-key": "serpapi_api_key",
 }
 
+# Module setting key -> (section, key) in the web search search_config.json file.
 WEB_SEARCH_CONFIG_SETTINGS = {
     "web-search-max-results": ("search", "max_results"),
     "web-search-total-context-budget": ("search", "total_context_budget"),
@@ -105,6 +117,8 @@ WEB_SEARCH_CONFIG_SETTINGS = {
     "web-search-profile-import-purge-on-disable": ("profile_import", "purge_on_disable"),
 }
 
+# Fixed search_config.json values that are not user settings and are rewritten on every sync
+# (the browsers and domains used by the profile import).
 WEB_SEARCH_STATIC_CONFIG = {
     "profile_import": {
         "browsers": ["chrome", "edge", "brave", "firefox"],
@@ -123,6 +137,7 @@ WEB_SEARCH_STATIC_CONFIG = {
     }
 }
 
+# Module setting key -> key in the browser agent config.json file.
 BROWSER_AGENT_CONFIG_SETTINGS = {
     "browser-agent-width": "browser_width",
     "browser-agent-height": "browser_height",
@@ -133,6 +148,7 @@ BROWSER_AGENT_CONFIG_SETTINGS = {
     "browser-agent-auto-text-preview-length": "auto_text_preview_length",
 }
 
+# Module setting key -> variable name in the sandbox sandbox.json file.
 SANDBOX_CONFIG_SETTINGS = {
     "sandbox-container-name": "SANDBOX_CONTAINER_NAME",
     "sandbox-image": "SANDBOX_IMAGE",
@@ -164,11 +180,13 @@ SANDBOX_CONFIG_SETTINGS = {
     "sandbox-docker-start-timeout-seconds": "SANDBOX_DOCKER_START_TIMEOUT_SECONDS",
 }
 
+# Fixed sandbox.json values that are not user settings and are written on every sync.
 SANDBOX_STATIC_CONFIG = {
     "SANDBOX_IMAGE_SOURCE": "registry",
     "SANDBOX_AUTO_START_DOCKER": True,
 }
 
+# Sandbox settings stored as a whole number of gigabytes and written to sandbox.json with a "G" suffix.
 SANDBOX_GIGABYTE_SETTINGS = frozenset(
     {
         "sandbox-memory-limit",
@@ -177,6 +195,7 @@ SANDBOX_GIGABYTE_SETTINGS = frozenset(
     }
 )
 
+# Settings that are always loaded as floats, accepting either a dot or a comma as the separator.
 DECIMAL_SETTING_KEYS = frozenset(
     {
         "web-search-prefetch-timeout",
@@ -187,6 +206,7 @@ DECIMAL_SETTING_KEYS = frozenset(
     }
 )
 
+# Settings of earlier versions that no longer exist; they are dropped when settings are loaded.
 REMOVED_TOOL_SETTING_KEYS = frozenset(
     {
         "web-search-query-rewriter-endpoint",
@@ -199,7 +219,11 @@ REMOVED_TOOL_SETTING_KEYS = frozenset(
     }
 )
 
+# Default value of every module setting. A key listed here is a known setting: it is also the
+# canonical spelling used when keys come from ASLM_* environment variables. Groups below: core
+# service, engines, API keys, web search, browser agent and sandbox.
 DEFAULTS: dict[str, Any] = {
+    # Core service: ports, logging and Django security values.
     "ui-port": 20000,
     "debug": True,
     "console_log_level": "debug",
@@ -209,6 +233,7 @@ DEFAULTS: dict[str, Any] = {
     "llm-engine": "ollama-service",
     "ollama-service_port": 20003,
     "browser-daemon-port": 20010,
+    # Engines: enabled flag plus connection details and paths of each LLM engine.
     "ollama-service": False,
     "ollama-service_path": None,
     "ollama-service_data": None,
@@ -221,12 +246,14 @@ DEFAULTS: dict[str, Any] = {
     "google-genai": False,
     "google_genai_url": "generativelanguage.googleapis.com",
     "google_genai_api_key": "",
+    # Host account keys and web search provider API keys.
     "key-aslm": None,
     "key-gh": None,
     "web-search-tavily-api-key": "",
     "web-search-firecrawl-api-key": "",
     "web-search-brave-api-key": "",
     "web-search-serpapi-api-key": "",
+    # Web search options mirrored into search_config.json.
     "web-search-max-results": 10,
     "web-search-total-context-budget": 40000,
     "web-search-prefetch-timeout": 8.0,
@@ -267,6 +294,7 @@ DEFAULTS: dict[str, Any] = {
     "web-search-profile-import-all-profiles": False,
     "web-search-profile-import-refresh-hours": 12.0,
     "web-search-profile-import-purge-on-disable": True,
+    # Browser agent options mirrored into the browser agent config.json.
     "browser-agent-width": 1280,
     "browser-agent-height": 800,
     "browser-agent-headless": False,
@@ -274,6 +302,7 @@ DEFAULTS: dict[str, Any] = {
     "browser-agent-max-elements": 200,
     "browser-agent-max-main-interactive": 60,
     "browser-agent-auto-text-preview-length": 1500,
+    # Sandbox options mirrored into sandbox.json (memory, swap and storage limits are in gigabytes).
     "sandbox-container-name": "aslm-chat-sandbox",
     "sandbox-image": "nggtlightkeeper/aslm-chat-sandbox:latest",
     "sandbox-cpu-limit": 8,
@@ -304,14 +333,20 @@ DEFAULTS: dict[str, Any] = {
     "sandbox-docker-start-timeout-seconds": 60,
 }
 
+# Valid console log levels, settings whose engine address is normalized on load and save, and
+# ASLM_* environment variables that describe the module itself rather than a setting.
 CONSOLE_LOG_LEVELS = {"basic", "debug", "trace"}
 NORMALIZED_ADDRESS_KEYS = {"lms_url", "openai_url", "google_genai_url"}
 IGNORED_ENV_KEYS = {"ASLM_MODULE_ID", "ASLM_MODULE_DIR"}
 
+# In-memory copy of the effective settings, the settings file mtime it was built from, and the
+# lock that guards both. A changed mtime invalidates the copy.
 _settings_cache_lock = threading.RLock()
 _settings_cache: dict[str, Any] | None = None
 _settings_cache_mtime_ns: int | None = None
 
+
+# Settings cache
 
 # Return the current settings file mtime.
 def _get_settings_mtime_ns() -> int | None:
@@ -339,11 +374,16 @@ def _invalidate_settings_cache() -> None:
         _settings_cache_mtime_ns = None
 
 
-# Normalize one raw settings value.
+# Value and key normalization
+
+# Normalize one raw settings value: "true"/"false"/"none" keywords, numbers (a single decimal comma
+# is accepted) and JSON objects or arrays are converted; any other value is returned unchanged.
 def normalize_setting_value(value: Any) -> Any:
+    # Only strings are converted; values that already have a type pass through unchanged.
     if not isinstance(value, str):
         return value
 
+    # Boolean and null keywords.
     lowered = value.strip().lower()
     if lowered == "true":
         return True
@@ -352,22 +392,27 @@ def normalize_setting_value(value: Any) -> Any:
     if lowered in {"none", "null"}:
         return None
 
+    # Try to read the text as a number: integer, float, then a float with a decimal comma.
     try:
         return int(value)
     except ValueError:
+        # Not an integer; try the next interpretation.
         pass
 
     try:
         return float(value)
     except ValueError:
+        # Not a float either; try the decimal comma form.
         pass
 
     if value.count(",") == 1 and "." not in value:
         try:
             return float(value.replace(",", "."))
         except ValueError:
+            # Not a number; fall through to the JSON check and then the plain string.
             pass
 
+    # JSON objects and arrays are decoded; invalid JSON stays a plain string.
     if value.startswith(("{", "[")):
         try:
             return json.loads(value)
@@ -377,7 +422,8 @@ def normalize_setting_value(value: Any) -> Any:
     return value
 
 
-# Normalize one raw settings key.
+# Normalize one raw settings key to the canonical spelling used in DEFAULTS; an unknown key
+# comes back stripped and lowercased.
 def normalize_setting_key(raw_key: str) -> str:
     key = raw_key.strip().lower()
     if key in DEFAULTS:
@@ -426,6 +472,8 @@ def normalize_engine_name(engine: str | None) -> str:
     return ENGINE_ALIASES.get(normalized, normalized)
 
 
+# Engine selection
+
 # List enabled engine identifiers from one settings snapshot.
 def _get_enabled_engine_ids_from_settings(settings_data: dict[str, Any]) -> list[str]:
     return [engine_id for engine_id in ENGINE_IDS if bool(settings_data.get(engine_id, False))]
@@ -446,7 +494,6 @@ def _resolve_enabled_engine_from_settings(
         return enabled_engine_ids[0]
 
     return canonical
-
 
 
 # List engines supported by the UI.
@@ -472,6 +519,7 @@ def resolve_enabled_engine(engine: str | None, default: str = "ollama-service") 
     return _resolve_enabled_engine_from_settings(load_settings(), engine, default)
 
 
+# Loading settings
 
 # Read the settings payload from disk.
 def _load_settings_from_disk() -> dict[str, Any]:
@@ -492,6 +540,7 @@ def _load_settings_from_disk() -> dict[str, Any]:
 def _apply_environment_overrides(data: dict[str, Any]) -> dict[str, Any]:
     updated = dict(data)
 
+    # ASLM_<KEY> environment variables override the stored value of the matching setting.
     for env_key, env_value in os.environ.items():
         if not env_key.startswith("ASLM_") or env_key in IGNORED_ENV_KEYS:
             continue
@@ -502,6 +551,7 @@ def _apply_environment_overrides(data: dict[str, Any]) -> dict[str, Any]:
     return updated
 
 
+# Settings that hold a TCP port of one of the module's own services.
 _PORT_SETTING_KEYS = ("ui-port", "ollama-service_port", "browser-daemon-port")
 
 
@@ -513,6 +563,7 @@ def _warn_port_collisions(settings: dict[str, Any]) -> None:
         try:
             port = int(raw)
         except (TypeError, ValueError):
+            # A missing or non-numeric port cannot collide with another one.
             continue
         if port <= 0 or port > 65535:
             continue
@@ -528,12 +579,14 @@ def _warn_port_collisions(settings: dict[str, Any]) -> None:
 
 # Normalize a loaded settings snapshot (addresses, active engine, port checks).
 def _normalize_loaded_settings(data: dict[str, Any]) -> dict[str, Any]:
+    # Drop settings of earlier versions.
     normalized = dict(data)
     normalized.pop("lms_load_config", None)
 
     for key in REMOVED_TOOL_SETTING_KEYS:
         normalized.pop(key, None)
 
+    # Normalize engine addresses, gigabyte limits and decimal numbers.
     for key in NORMALIZED_ADDRESS_KEYS:
         normalized[key] = normalize_engine_address(normalized.get(key, DEFAULTS.get(key, "")))
 
@@ -543,6 +596,7 @@ def _normalize_loaded_settings(data: dict[str, Any]) -> dict[str, Any]:
     for key in DECIMAL_SETTING_KEYS:
         normalized[key] = _normalize_decimal_setting_value(normalized.get(key), DEFAULTS[key])
 
+    # The active engine must be an enabled one; then warn about shared ports.
     normalized["llm-engine"] = _resolve_enabled_engine_from_settings(
         normalized,
         normalized.get("llm-engine"),
@@ -552,13 +606,16 @@ def _normalize_loaded_settings(data: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
-# Load the effective settings snapshot.
+# Load the effective settings snapshot: defaults, then the settings file, then ASLM_* environment
+# overrides, normalized and cached until the settings file changes.
 def load_settings() -> dict[str, Any]:
+    # Serve the cached snapshot while the settings file is unchanged.
     mtime_ns = _get_settings_mtime_ns()
     with _settings_cache_lock:
         if _settings_cache is not None and _settings_cache_mtime_ns == mtime_ns:
             return dict(_settings_cache)
 
+    # Rebuild the snapshot from its layers and cache it.
     settings_data = dict(DEFAULTS)
     settings_data.update(_load_settings_from_disk())
     settings_data = _apply_environment_overrides(settings_data)
@@ -567,17 +624,22 @@ def load_settings() -> dict[str, Any]:
     return dict(settings_data)
 
 
+# Generated tool configs
+
 # Serialize and atomically replace one generated JSON configuration when its content changed.
 def _write_generated_json(path: Path, data: dict[str, Any]) -> None:
+    # Skip the write when the file already holds exactly this content.
     serialized = json.dumps(data, indent=4, ensure_ascii=False) + "\n"
     try:
         if path.read_text(encoding="utf-8-sig") == serialized:
             return
     except FileNotFoundError:
+        # No file yet, so there is nothing to compare; it is created below.
         pass
     except OSError as exc:
         logger.warning("Could not compare generated config %s: %s", path, exc)
 
+    # Write a temporary file next to the target and replace the target with it.
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = path.with_name(path.name + ".tmp")
     try:
@@ -587,6 +649,7 @@ def _write_generated_json(path: Path, data: dict[str, Any]) -> None:
         try:
             temporary_path.unlink(missing_ok=True)
         except OSError:
+            # The leftover temporary file is harmless; the original write error is re-raised below.
             pass
         raise
 
@@ -647,12 +710,16 @@ def _load_web_search_config_payload() -> dict[str, Any]:
 
 # Generate managed search_config.json values without replacing JSON-only sections.
 def _write_web_search_config(settings_data: dict[str, Any]) -> None:
+    # Start from the existing file and prune keys that earlier versions wrote.
     payload = _load_web_search_config_payload()
     for key in ("endpoint", "model"):
         payload.get("query_rewriter", {}).pop(key, None)
+
     # The legacy Yandex widget left the engines rotation for the buffer_engine
     # section; prune the stale key so old installs stop carrying it.
     payload.get("engines", {}).pop("legacy_yandex", None)
+
+    # Apply the fixed values, then every managed setting.
     for section_name, section_values in WEB_SEARCH_STATIC_CONFIG.items():
         payload.setdefault(section_name, {}).update(section_values)
 
@@ -685,6 +752,7 @@ def _write_sandbox_config(settings_data: dict[str, Any]) -> None:
 
 # Synchronize generated tool configs affected by one setting, or every config during bootstrap.
 def _sync_tool_configs(settings_data: dict[str, Any], setting_key: str | None = None) -> None:
+    # Compute the effective values, then rewrite only the config files that the setting feeds.
     effective = dict(DEFAULTS)
     effective.update(settings_data)
     effective = _apply_environment_overrides(effective)
@@ -702,17 +770,21 @@ def _sync_tool_configs(settings_data: dict[str, Any], setting_key: str | None = 
 
 # Save the settings snapshot and optionally refresh all generated tool configs.
 def save_settings(data: dict[str, Any], *, sync_tool_configs: bool = True) -> None:
+    # Write the settings file and refresh the generated tool configs.
     SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
     with SETTINGS_FILE.open("w", encoding="utf-8") as file:
         json.dump(data, file, indent=4, ensure_ascii=False)
     if sync_tool_configs:
         _sync_tool_configs(data)
+
+    # Refresh the in-memory snapshot so the next read does not hit the disk.
     settings_data = dict(DEFAULTS)
     settings_data.update(data)
     settings_data = _apply_environment_overrides(settings_data)
     _store_settings_cache(_normalize_loaded_settings(settings_data), _get_settings_mtime_ns())
 
 
+# Process environment and module manifest
 
 # Build one runtime environment variable name.
 def _to_env_var_name(key: str) -> str:
@@ -762,6 +834,7 @@ def _get_module_manifest_path() -> Path | None:
 
 # Mirror one runtime setting into the module manifest.
 def _sync_module_manifest_setting(key: str, value: Any) -> None:
+    # Read the manifest; without one, or without a settings list, there is nothing to mirror into.
     manifest_path = _get_module_manifest_path()
     if manifest_path is None:
         return
@@ -777,6 +850,7 @@ def _sync_module_manifest_setting(key: str, value: Any) -> None:
     if not isinstance(settings_list, list):
         return
 
+    # Update the matching entry; an unchanged value or an unknown key needs no write.
     changed = False
     for setting_item in settings_list:
         if not isinstance(setting_item, dict):
@@ -794,6 +868,7 @@ def _sync_module_manifest_setting(key: str, value: Any) -> None:
     if not changed:
         return
 
+    # Persist the updated manifest.
     try:
         with manifest_path.open("w", encoding="utf-8") as file:
             json.dump(manifest, file, indent=4, ensure_ascii=False)
@@ -802,14 +877,18 @@ def _sync_module_manifest_setting(key: str, value: Any) -> None:
         logger.warning("Could not write %s: %s", manifest_path, exc)
 
 
+# Reading and writing single settings
 
 # Read one setting value.
 def get(key: str, default: Any = None) -> Any:
     return load_settings().get(key, default)
 
 
-# Persist one setting value.
+# Persist one setting value. The value is normalized for its key first; when it equals the stored
+# one only the derived configs and the process environment are refreshed. A saved value is also
+# mirrored into the module manifest and, for an engine toggle, the engine runtimes are synced.
 def set(key: str, value: Any, *, sync_runtime: bool = True) -> None:
+    # Normalize the value according to the kind of setting.
     if key == "llm-engine":
         value = resolve_enabled_engine(str(value) if value is not None else None)
 
@@ -822,6 +901,7 @@ def set(key: str, value: Any, *, sync_runtime: bool = True) -> None:
     if key in DECIMAL_SETTING_KEYS:
         value = _normalize_decimal_setting_value(value, DEFAULTS[key])
 
+    # An already stored value is not rewritten; only the derived state is refreshed.
     stored_raw_data = _load_settings_from_disk()
     stored_data = dict(DEFAULTS)
     stored_data.update(stored_raw_data)
@@ -846,6 +926,7 @@ def set(key: str, value: Any, *, sync_runtime: bool = True) -> None:
     if key not in HOST_KEY_SETTING_KEYS:
         _sync_module_manifest_setting(key, value)
 
+    # Changing an engine toggle syncs the engine runtimes; a failure is logged and does not undo the setting.
     if sync_runtime and key in ENGINE_IDS:
         try:
             from API import llm_api
@@ -855,6 +936,7 @@ def set(key: str, value: Any, *, sync_runtime: bool = True) -> None:
             logger.warning("Failed to sync engine runtimes after setting %s: %s", key, exc)
 
 
+# Engine endpoints and keys
 
 # Read the active LLM engine name.
 def get_llm_engine(default: str = "ollama-service") -> str:
@@ -933,8 +1015,9 @@ def get_engine_api_key(engine: str | None) -> str:
     return ""
 
 
-# Build the runtime settings payload for the UI.
+# Build the runtime settings payload for the UI. API keys are never included, only whether one is set.
 def get_runtime_engine_settings() -> dict[str, Any]:
+    # Which engines have an API key configured (Ollama and LM Studio need none).
     openai_api_key = get_openai_api_key()
     google_genai_api_key = get_google_genai_api_key()
     active_engine = get_llm_engine()
@@ -945,6 +1028,7 @@ def get_runtime_engine_settings() -> dict[str, Any]:
         "google-genai": bool(google_genai_api_key),
     }
 
+    # Active engine, console log level, engine addresses and API key presence flags.
     return {
         "llm-engine": active_engine,
         "console_log_level": get_console_log_level(),
@@ -965,6 +1049,7 @@ def get_runtime_engine_settings() -> dict[str, Any]:
     }
 
 
+# Console log level
 
 # Read the console log level.
 def get_console_log_level(default: str = "debug") -> str:
@@ -982,6 +1067,7 @@ def is_console_trace_enabled() -> bool:
     return get_console_log_level() == "trace"
 
 
+# Engine state
 
 # Check whether one engine is enabled.
 def is_engine_enabled(engine: str | None) -> bool:

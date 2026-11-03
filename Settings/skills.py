@@ -16,10 +16,16 @@ from typing import Any
 
 from .settings import BASE_DIR
 
+# Project Skills folder, its mirror inside the sandbox, and the path prefix under which the model
+# sees that mirror from the sandbox workspace.
 SKILLS_DIR = BASE_DIR / "Skills"
 SANDBOX_SKILLS_DIR = BASE_DIR / "Tools" / "mcp-sandbox" / "_sandbox" / "Skills"
 SANDBOX_MODEL_SKILLS_PREFIX = "/workspace/_sandbox/Skills"
+
+# File names tried, in order, as the primary markdown file of a skill folder.
 PRIMARY_SKILL_FILENAMES = ("SKILL.md", "skills.md")
+
+# Text file types the skills manager may list, read and write; anything else is ignored or rejected.
 ALLOWED_TEXT_SUFFIXES = {
     ".bat",
     ".css",
@@ -36,12 +42,20 @@ ALLOWED_TEXT_SUFFIXES = {
     ".yaml",
     ".yml",
 }
+
+# Largest text file, in bytes, that the skills manager reads or writes.
 MAX_TEXT_FILE_BYTES = 2 * 1024 * 1024
 
+# Allowed skill folder name, and the leading "---" front matter block of a skill markdown file.
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._ -]{0,79}$")
 _FRONT_MATTER_RE = re.compile(r"\A---[ \t]*\r?\n(.*?)\r?\n---[ \t]*(?:\r?\n|\Z)", re.DOTALL)
+
+# Marker of the pending skills config refresh: the old file inside the Skills folder (migrated away
+# and deleted) and the current file under the project's .aslm folder.
 _LEGACY_PENDING_NOTIFY_FILE = ".skills-pending-notify.json"
 _PENDING_NOTIFY_PATH = BASE_DIR / ".aslm" / "skills-pending-notify.json"
+
+# Re-entrant locks that serialize sandbox sync and changes to the pending refresh marker.
 _sync_lock = threading.RLock()
 _notify_lock = threading.RLock()
 logger = logging.getLogger(__name__)
@@ -56,6 +70,8 @@ class SkillFile:
     size_bytes: int
     updated_at: float
 
+
+# Paths and validation
 
 # Ensure the project-level Skills root directory exists.
 def ensure_skills_dir() -> Path:
@@ -142,6 +158,7 @@ def _skill_subdir_path(folder: str, dir_path: str) -> Path:
     return target
 
 
+# Safe file access
 
 # Read a text file with size and binary guards for the skills manager.
 def _safe_read_text(path: Path) -> str:
@@ -166,6 +183,7 @@ def _atomic_write_text(path: Path, content: str) -> None:
         Path(tmp_path).unlink(missing_ok=True)
 
 
+# Front matter
 
 # Parse one YAML-like front matter scalar value.
 def _parse_scalar(value: str) -> Any:
@@ -243,6 +261,8 @@ def _format_front_matter(meta: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n\n"
 
 
+# Skill metadata and file tree
+
 # Locate the primary markdown file for one skill folder.
 def _primary_file_for_skill(skill_root: Path) -> Path:
     for filename in PRIMARY_SKILL_FILENAMES:
@@ -316,14 +336,18 @@ def _build_tree(path: Path, root: Path) -> list[dict[str, Any]]:
     return nodes
 
 
+# Skill folder and file operations
 
 # List all skill folders with metadata and file trees.
 def list_skills() -> dict[str, Any]:
     root = ensure_skills_dir()
     folders: list[dict[str, Any]] = []
     for skill_root in sorted(root.iterdir(), key=lambda item: item.name.casefold()):
+        # Skip files, symlinks and hidden folders; only real skill folders are listed.
         if not skill_root.is_dir() or skill_root.is_symlink() or _is_hidden_part(skill_root.name):
             continue
+
+        # Describe the folder from its front matter and add timestamps and the file tree.
         meta, primary = _read_skill_meta(skill_root)
         stat = skill_root.stat()
         folders.append({
@@ -542,6 +566,7 @@ def import_skill_files(skill_name: str, files: list[dict[str, Any]]) -> dict[str
         content = str(entry.get("content") or "")
         if not raw_path or "\x00" in raw_path:
             continue
+
         # Normalise and security-check the relative path.
         parts = [p for p in raw_path.split("/") if p]
         if not parts or any(_is_hidden_part(p) for p in parts):
@@ -555,6 +580,7 @@ def import_skill_files(skill_name: str, files: list[dict[str, Any]]) -> dict[str
             if not dest.is_relative_to(target_resolved):
                 continue
         except ValueError:
+            # A path that cannot be compared with the skill root is outside it; skip the file.
             continue
         validated.append((rel, content))
 
@@ -596,6 +622,7 @@ def import_skill_files(skill_name: str, files: list[dict[str, Any]]) -> dict[str
     return list_skills()
 
 
+# System prompt inventory
 
 # Render enabled skill tree nodes as indented lines for the system prompt.
 def _format_skill_tree_lines(nodes: list[dict[str, Any]], *, indent: int = 2) -> list[str]:
@@ -622,6 +649,7 @@ def _format_skill_tree_lines(nodes: list[dict[str, Any]], *, indent: int = 2) ->
     return lines
 
 
+# Pending refresh notification
 
 # Return the path used to queue a one-shot skills config refresh.
 def _pending_notify_path() -> Path:
@@ -697,14 +725,17 @@ def _queue_skill_config_refresh() -> None:
         _save_notify_state({"config_refresh_pending": True})
 
 
+# System prompt sections
 
 # Build a system-prompt block listing enabled skills and their on-disk layout.
 def build_system_prompt_inventory() -> str:
+    # Only enabled skills are listed; no enabled skills means no block at all.
     payload = list_skills()
     folders = [folder for folder in payload["folders"] if folder.get("enabled", True)]
     if not folders:
         return ""
 
+    # Header lines tell the model where to read the skill files in the sandbox and on the host.
     sandbox_prefix = str(payload.get("sandbox_path_prefix") or SANDBOX_MODEL_SKILLS_PREFIX).rstrip("/")
     project_root = str(payload.get("root") or SKILLS_DIR)
 
@@ -717,6 +748,7 @@ def build_system_prompt_inventory() -> str:
         "",
     ]
 
+    # One entry per skill: folder name, optional title and description, sandbox path, then its markdown files.
     for folder in folders:
         name = str(folder.get("name") or "").strip()
         if not name:
@@ -735,6 +767,7 @@ def build_system_prompt_inventory() -> str:
         header += f" → {skill_sandbox}"
         lines.append(header)
 
+        # Fall back to the primary file name when the tree has no markdown file to list.
         tree_lines = _format_skill_tree_lines(folder.get("tree") or [])
         if tree_lines:
             lines.extend(tree_lines)
@@ -776,6 +809,7 @@ def build_system_prompt_skill_delta(*, consume: bool = True, include_baseline: b
     return build_system_prompt_skills_section(consume=consume, include_baseline=include_baseline)
 
 
+# Sandbox sync
 
 # Compute the SHA-256 digest of one file.
 def _sha256_file(path: Path) -> str:
@@ -811,6 +845,7 @@ def _iter_sync_files(root: Path, skill_names: set[str] | None = None) -> dict[st
         try:
             rel_parts = path.relative_to(root).parts
         except ValueError:
+            # A path outside the root cannot be part of the sync set.
             continue
         if any(_is_hidden_part(part) for part in rel_parts):
             continue
@@ -836,10 +871,10 @@ def _remove_tree_entry(path: Path) -> None:
         shutil.rmtree(path)
 
 
-
 # Mirror project Skills into the sandbox Skills directory.
 def sync_skills_to_sandbox() -> dict[str, Any]:
     with _sync_lock:
+        # Resolve both roots and make sure the sandbox target stays inside the sandbox folder.
         source_root = ensure_skills_dir().resolve()
         target_root = SANDBOX_SKILLS_DIR.resolve()
         if target_root.exists() and target_root.is_symlink():
@@ -848,6 +883,7 @@ def sync_skills_to_sandbox() -> dict[str, Any]:
         if not target_root.is_relative_to((BASE_DIR / "Tools" / "mcp-sandbox" / "_sandbox").resolve()):
             raise RuntimeError("Sandbox Skills target escapes sandbox root.")
 
+        # Only enabled skills are mirrored; compare the source and target file sets by size and hash.
         enabled_names = _enabled_skill_names(source_root)
         source_files = _iter_sync_files(source_root, enabled_names)
         target_files = _iter_sync_files(target_root)
@@ -876,6 +912,7 @@ def sync_skills_to_sandbox() -> dict[str, Any]:
             try:
                 rel_path = target_entry.relative_to(target_root).as_posix()
             except ValueError:
+                # An entry that is not under the target root is not ours to clean up.
                 continue
             if rel_path.startswith(".skills_sync_manifest"):
                 _remove_tree_entry(target_entry)
@@ -910,8 +947,10 @@ def sync_skills_to_sandbox() -> dict[str, Any]:
             try:
                 directory.rmdir()
             except OSError:
+                # rmdir only succeeds on empty directories; a non-empty one is still in use and stays.
                 pass
 
+        # Summarize what the sync did.
         manifest = {
             "source": str(source_root),
             "target": str(target_root),

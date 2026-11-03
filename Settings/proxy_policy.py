@@ -10,7 +10,10 @@ from typing import Any
 from urllib.parse import urlsplit
 
 
+# Loopback spellings that must always bypass a proxy.
 LOOPBACK_PROXY_BYPASS_HOSTS = ("localhost", "127.0.0.1", "::1")
+
+# Proxy environment families (HTTP_PROXY, HTTPS_PROXY, ALL_PROXY) handled when merging proxy settings.
 PROXY_SCHEMES = ("http", "https", "all")
 
 
@@ -40,6 +43,7 @@ def _split_bypass_values(values: list[Any]) -> list[str]:
             token = raw_token.strip()
             if not token:
                 continue
+
             # HTTPX expects a bare IPv6 literal in NO_PROXY and adds URL
             # brackets itself. Preserving [::1] makes HTTPX parse ':1]' as a port.
             if token.casefold() == "[::1]" or token.casefold().startswith("[::1]:"):

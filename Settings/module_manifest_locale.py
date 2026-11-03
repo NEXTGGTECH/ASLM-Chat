@@ -11,9 +11,13 @@ from Settings.host_locale import atomic_write_json, normalize_host_language
 
 logger = logging.getLogger(__name__)
 
+# Project root, the module manifest that gets patched in place and the folder with one
+# translated catalog per language (<language>.json).
 BASE_DIR = Path(__file__).resolve().parent.parent
 MANIFEST_FILE = BASE_DIR / "ASLM_Module.json"
 MANIFEST_LOCALES_DIR = Path(__file__).resolve().parent / "module_manifest_locales"
+
+# Language whose catalog is the fallback when the requested one is missing.
 BASE_LOCALE = "en"
 
 
@@ -118,6 +122,7 @@ def _patch_download_categories(categories: list[dict[str, Any]], localized: list
 
 # Patch ASLM_Module.json with localized manifest strings for the given language.
 def apply_manifest_locale(language: str | None) -> None:
+    # Read the current manifest; a missing, unreadable or non-object manifest is left untouched.
     if not MANIFEST_FILE.is_file():
         logger.warning("Module manifest not found at %s", MANIFEST_FILE)
         return
@@ -131,15 +136,18 @@ def apply_manifest_locale(language: str | None) -> None:
         logger.warning("Module manifest must be a JSON object.")
         return
 
+    # Load the translated catalog; an empty catalog means there is nothing to apply.
     locale = _load_manifest_locale(language)
     if not locale:
         return
 
+    # Module name and description.
     if "name" in locale:
         manifest["name"] = locale["name"]
     if "description" in locale:
         manifest["description"] = locale["description"]
 
+    # Command lists (first run and run) are patched by position.
     commands = manifest.get("commands")
     localized_commands = locale.get("commands")
     if isinstance(commands, dict) and isinstance(localized_commands, dict):
@@ -152,10 +160,12 @@ def apply_manifest_locale(language: str | None) -> None:
             localized_commands.get("run") if isinstance(localized_commands.get("run"), list) else None,
         )
 
+    # Settings entries are matched by key.
     settings = manifest.get("settings")
     if isinstance(settings, list):
         _patch_settings(settings, locale.get("settings") if isinstance(locale.get("settings"), dict) else None)
 
+    # Setting categories are matched by id.
     setting_categories = manifest.get("settingCategories")
     localized_setting_categories = locale.get("settingCategories")
     if isinstance(setting_categories, list):
@@ -164,6 +174,7 @@ def apply_manifest_locale(language: str | None) -> None:
             localized_setting_categories if isinstance(localized_setting_categories, list) else None,
         )
 
+    # Downloads bridge categories are matched by id.
     downloads_bridge = manifest.get("downloadsBridge")
     localized_bridge = locale.get("downloadsBridge")
     if isinstance(downloads_bridge, dict) and isinstance(localized_bridge, dict):
@@ -175,5 +186,6 @@ def apply_manifest_locale(language: str | None) -> None:
                 localized_categories if isinstance(localized_categories, list) else None,
             )
 
+    # Persist the patched manifest atomically.
     atomic_write_json(MANIFEST_FILE, manifest)
     logger.info("Applied manifest locale %s to %s", normalize_host_language(language), MANIFEST_FILE)
