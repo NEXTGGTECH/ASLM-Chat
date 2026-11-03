@@ -33,7 +33,8 @@ class ToolRegistryTestMixin:
         self._tools_dir_context.cleanup()
         super().tearDown()
 
-    # Write a temporary MCP server.
+    # Write a temporary mcp-server.py module into a folder of the isolated tools directory and
+    # refresh tool discovery.
     def write_server(self, folder: str, body: str) -> None:
         server_dir = self.tools_dir / folder
         server_dir.mkdir(parents=True, exist_ok=True)

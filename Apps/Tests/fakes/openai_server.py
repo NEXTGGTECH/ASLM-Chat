@@ -9,16 +9,23 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pytest
 
 
-# In-process fake of an OpenAI-compatible endpoint speaking SSE streaming.
+# In-process fake of an OpenAI-compatible endpoint speaking SSE streaming. It answers
+# GET /v1/models and POST /v1/chat/completions on a free localhost port and records the
+# Authorization header of every request; tests tune its payloads and status before issuing requests.
 class FakeOpenAiServer:
+    # Start the HTTP server on a free localhost port in a daemon thread.
     def __init__(self):
+        # Recorded chat request bodies and Authorization headers, plus the canned responses.
         self.chat_requests: list[dict] = []
         self.auth_headers: list[str] = []
         self.models_payload: dict = {"object": "list", "data": []}
         self.chat_status = 200
         self.chat_chunks: list[dict] = []
+
+        # Guards the recorded request data against the server threads.
         self._lock = threading.Lock()
 
+        # Bind port 0 so the OS picks a free port, then serve in the background.
         self._httpd = ThreadingHTTPServer(("127.0.0.1", 0), self._make_handler())
         self.port = self._httpd.server_address[1]
         self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
@@ -28,7 +35,9 @@ class FakeOpenAiServer:
     def _make_handler(self):
         server = self
 
+        # Request handler emulating the OpenAI endpoints from the server's canned state.
         class Handler(BaseHTTPRequestHandler):
+            # Silence the default per-request access log.
             def log_message(self, *args):
                 pass
 
@@ -41,6 +50,8 @@ class FakeOpenAiServer:
                 self.end_headers()
                 self.wfile.write(body)
 
+            # Emulate GET /v1/models (record the Authorization header, return the model list); any
+            # other path is a 404.
             def do_GET(self):
                 if self.path.startswith("/v1/models"):
                     server.auth_headers.append(self.headers.get("Authorization") or "")
@@ -48,6 +59,8 @@ class FakeOpenAiServer:
                     return
                 self._send_json(404, {"error": {"message": "not found"}})
 
+            # Emulate POST /v1/chat/completions: record the body and Authorization header, then either
+            # stream the queued chunks as SSE ending with [DONE] or fail with the configured status.
             def do_POST(self):
                 length = int(self.headers.get("Content-Length") or 0)
                 body = json.loads(self.rfile.read(length) or b"{}")
@@ -62,6 +75,7 @@ class FakeOpenAiServer:
                         self._send_json(server.chat_status, {"error": {"message": "boom"}})
                         return
 
+                    # Stream each queued chunk as one SSE data event.
                     self.send_response(200)
                     self.send_header("Content-Type", "text/event-stream")
                     self.end_headers()
@@ -92,11 +106,13 @@ class FakeOpenAiServer:
 
         self.enqueue_delta({}, finish_reason="stop", model=model)
 
+    # Shut the HTTP server down and release its socket.
     def stop(self) -> None:
         self._httpd.shutdown()
         self._httpd.server_close()
 
 
+# Provide a running fake OpenAI server and stop it after the test.
 @pytest.fixture
 def openai_server():
     server = FakeOpenAiServer()

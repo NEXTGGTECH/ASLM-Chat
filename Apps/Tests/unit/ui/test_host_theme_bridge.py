@@ -10,8 +10,10 @@ from Apps.UI import host_theme_bridge
 pytestmark = [pytest.mark.unit]
 
 
+# Provide a function that makes the host theme loader return a given snapshot payload.
 @pytest.fixture
 def host_theme_payload(monkeypatch):
+    # Replace the host theme loader with one that returns the payload, and return the payload.
     def install(payload):
         monkeypatch.setattr(host_theme_bridge, "load_host_theme", lambda: payload)
         return payload
@@ -19,16 +21,16 @@ def host_theme_payload(monkeypatch):
     return install
 
 
-# MAUI color normalization.
+# MAUI color normalization
 
-
-# Host color formats convert to CSS colors.
+# Verify that host color formats (short and long hex, MAUI AARRGGBB with or without transparency, surrounding
+# spaces) are converted to CSS colors. MAUI ToHex order is AARRGGBB, so #FF0000FF is opaque blue and #FFFF0000
+# is opaque red.
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
         ("#fff", "#ffffff"),
         ("#00FF00", "#00ff00"),
-        # MAUI ToHex order is AARRGGBB: opaque blue, then opaque red.
         ("#FF0000FF", "#0000ff"),
         ("#FFFF0000", "#ff0000"),
         ("#80FF0000", "rgba(255, 0, 0, 0.502)"),
@@ -39,7 +41,8 @@ def test_normalize_color_to_css_converts_host_formats(raw, expected):
     assert host_theme_bridge.normalize_color_to_css(raw) == expected
 
 
-# Invalid color values never reach the CSS output.
+# Verify that invalid color values (empty, wrong length, rgb() notation, text, non-hex digits) are rejected with
+# None.
 @pytest.mark.parametrize(
     "raw",
     [None, "", "#12345", "rgb(1,2,3)", "not-a-color", "#GGGGGG"],
@@ -48,10 +51,10 @@ def test_normalize_color_to_css_rejects_invalid_values(raw):
     assert host_theme_bridge.normalize_color_to_css(raw) is None
 
 
-# Host palette resolution.
+# Host palette resolution
 
-
-# Palette keys map to CSS variables and teal aliases to cyan.
+# Verify that known palette keys map to CSS variables with normalized colors, teal is also exposed under the
+# legacy cyan alias, and unknown or invalid colors are left out.
 def test_resolve_host_css_variables_maps_and_aliases(host_theme_payload):
     host_theme_payload(
         {
@@ -71,13 +74,15 @@ def test_resolve_host_css_variables_maps_and_aliases(host_theme_payload):
     assert theme == "dark"
     assert resolved["--c-bg"] == "#1c1c1e"
     assert resolved["--c-text"] == "#ffffff"
+
     # Teal is additionally exposed under the legacy cyan alias.
     assert resolved["--c-system-cyan"] == resolved["--c-system-teal"]
+
     # Unknown and invalid host colors never reach the CSS output.
     assert all("NotARealKey" not in var for var in resolved)
 
 
-# A snapshot without colors yields an empty palette but keeps the theme.
+# Verify that a snapshot without colors gives an empty palette but keeps the theme name.
 def test_resolve_host_css_variables_without_colors_is_empty(host_theme_payload):
     host_theme_payload({"theme": "light"})
 
@@ -87,7 +92,7 @@ def test_resolve_host_css_variables_without_colors_is_empty(host_theme_payload):
     assert theme == "light"
 
 
-# Without a snapshot the palette is empty and the theme defaults to dark.
+# Verify that without a snapshot the palette is empty and the theme defaults to dark.
 def test_resolve_host_css_variables_defaults_to_dark_without_snapshot(monkeypatch):
     monkeypatch.setattr(host_theme_bridge, "load_host_theme", lambda: None)
 
@@ -97,10 +102,10 @@ def test_resolve_host_css_variables_defaults_to_dark_without_snapshot(monkeypatc
     assert theme == "dark"
 
 
-# Luminance-driven surface inference.
+# Luminance-driven surface inference
 
-
-# CSS colors parse into sRGB channels.
+# Verify that hex and rgba CSS colors are parsed into sRGB channels between 0 and 1 (alpha ignored) and
+# unparsable text gives None.
 def test_css_color_to_srgb_channels_parses_css_colors():
     assert host_theme_bridge.css_color_to_srgb_channels("#ffffff") == (1.0, 1.0, 1.0)
     assert host_theme_bridge.css_color_to_srgb_channels("#000000") == (0.0, 0.0, 0.0)
@@ -108,23 +113,26 @@ def test_css_color_to_srgb_channels_parses_css_colors():
     assert host_theme_bridge.css_color_to_srgb_channels("junk") is None
 
 
-# Light/dark activity surfaces follow the canvas luminance, not just the theme.
+# Verify that light or dark activity surfaces follow the luminance of the canvas background rather than the
+# theme name, and that the theme name decides only when no background color can be resolved.
 def test_infer_prefer_light_activity_surfaces_uses_canvas_luminance():
     white = {"--c-bg": "#ffffff"}
     dark = {"--c-bg": "#1c1c1e"}
 
     assert host_theme_bridge.infer_prefer_light_activity_surfaces(white, "dark") is True
     assert host_theme_bridge.infer_prefer_light_activity_surfaces(dark, "dark") is False
+
     # Without a resolvable background the theme string decides.
     assert host_theme_bridge.infer_prefer_light_activity_surfaces({}, "light") is True
     assert host_theme_bridge.infer_prefer_light_activity_surfaces({}, "dark") is False
 
 
-# Template context for the chat page.
+# Template context for the chat page
 
-
-# The page context carries the :root block and script-safe metadata.
+# Verify that the page context carries the availability flag, the effective theme, a :root block with the CSS
+# variables and script-tag-safe JSON metadata.
 def test_template_context_contains_root_block_and_metadata(host_theme_payload):
+    # Arrange: a dark snapshot with a custom theme whose name contains angle brackets.
     host_theme_payload(
         {
             "theme": "dark",
@@ -138,8 +146,10 @@ def test_template_context_contains_root_block_and_metadata(host_theme_payload):
         }
     )
 
+    # Act: build the template context.
     context = host_theme_bridge.build_host_theme_template_context()
 
+    # Assert: flags, CSS variables and the embedded JSON.
     assert context["host_theme_available"] is True
     assert context["host_theme_effective"] == "dark"
 
@@ -153,7 +163,8 @@ def test_template_context_contains_root_block_and_metadata(host_theme_payload):
     assert "custom-1" in context["host_theme_json"]
 
 
-# Without a snapshot the context falls back to dark defaults.
+# Verify that without a snapshot the template context reports the theme as unavailable and falls back to the
+# dark theme with no CSS variables and empty JSON.
 def test_template_context_falls_back_when_snapshot_missing(monkeypatch):
     monkeypatch.setattr(host_theme_bridge, "load_host_theme", lambda: None)
 
@@ -167,10 +178,10 @@ def test_template_context_falls_back_when_snapshot_missing(monkeypatch):
     }
 
 
-# Preview document tokens for offline HTML shells.
+# Preview document tokens for offline HTML shells
 
-
-# Without a host theme the preview tokens are the documented dark defaults.
+# Verify that without a host theme the preview tokens are the dark defaults and carry a 12-character fingerprint
+# that is the same on every call.
 def test_preview_document_theme_defaults_without_host(monkeypatch):
     monkeypatch.setattr(host_theme_bridge, "load_host_theme", lambda: None)
 
@@ -185,7 +196,8 @@ def test_preview_document_theme_defaults_without_host(monkeypatch):
     assert again["fingerprint"] == tokens["fingerprint"]
 
 
-# A host palette drives every preview token.
+# Verify that the host palette determines the color scheme and the background, surface, border, text and link
+# preview tokens.
 def test_preview_document_theme_follows_host_palette(host_theme_payload):
     host_theme_payload(
         {
@@ -213,7 +225,7 @@ def test_preview_document_theme_follows_host_palette(host_theme_payload):
     assert tokens["link"] == "#007aff"
 
 
-# A changed palette produces a different cache fingerprint.
+# Verify that a changed palette gives a different preview fingerprint, so caches are invalidated.
 def test_preview_fingerprint_changes_with_palette(host_theme_payload):
     host_theme_payload({"theme": "dark", "colors": {"BackgroundPrimary": "#1c1c1e"}})
     first = host_theme_bridge.resolve_preview_document_theme()["fingerprint"]

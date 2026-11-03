@@ -69,6 +69,7 @@ def isolated_settings(tmp_path, monkeypatch) -> Path:
 
 # Isolated Tools directory with helpers for writing fake mcp-server.py modules.
 class ToolsDir:
+    # Remember the root of the isolated Tools directory.
     def __init__(self, root: Path):
         self.root = root
 
@@ -104,8 +105,7 @@ def isolated_tools_dir(tmp_path, monkeypatch) -> ToolsDir:
     tool_registry.reset_cache()
 
 
-# Manifest helpers.
-
+# Manifest helpers
 
 # Write a minimal module manifest for manifest mirroring tests.
 def write_test_manifest(path: Path, setting_keys: tuple[str, ...]) -> Path:
@@ -121,7 +121,8 @@ def write_test_manifest(path: Path, setting_keys: tuple[str, ...]) -> Path:
     return path
 
 
-# Prepared temporary module manifest next to the isolated settings files.
+# Provide a temporary module manifest next to the isolated settings files; the fixture value holds
+# the manifest path and the settings directory.
 @pytest.fixture
 def isolated_manifest(isolated_settings) -> SimpleNamespace:
     manifest_path = write_test_manifest(
