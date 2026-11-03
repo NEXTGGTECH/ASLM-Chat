@@ -9,22 +9,23 @@ from django.db import IntegrityError, transaction
 
 from Apps.Data.models import OpenAiPreset
 
+# Name and config of the built-in preset that every endpoint and model pair gets on first use.
 DEFAULT_OPENAI_PRESET_NAME = "Default"
 DEFAULT_OPENAI_PRESET_CONFIG: dict[str, Any] = {}
 
 
-# Normalize the endpoint URL used to scope presets.
-def normalize_openai_endpoint_url(endpoint_url: str | None) -> str:
-    """Return a stable endpoint key so the same URL always maps to one scope."""
+# Endpoint scope
 
+# Return a stable endpoint key (trimmed, without a trailing slash) so the same URL always maps to one scope.
+def normalize_openai_endpoint_url(endpoint_url: str | None) -> str:
     return str(endpoint_url or "").strip().rstrip("/")
 
 
-# Normalize preset payload values.
-# Remove empty nested values while preserving scalar types.
-def _normalize_config_value(value: Any) -> Any:
-    """Remove empty values while preserving scalar types."""
+# Config normalization
 
+# Recursively drop empty values (empty dicts, lists, strings and None) from nested preset data,
+# keeping scalar values such as 0 and False as they are.
+def _normalize_config_value(value: Any) -> Any:
     if isinstance(value, dict):
         normalized: dict[str, Any] = {}
         for key, child in value.items():
@@ -42,10 +43,9 @@ def _normalize_config_value(value: Any) -> Any:
     return value
 
 
-# Keep the stored payload compact and predictable.
+# Return a compact OpenAI preset config ready for storage, with empty values removed.
+# A non-dict config yields an empty dict.
 def normalize_openai_preset_config(config: dict[str, Any] | None) -> dict[str, Any]:
-    """Return a compact OpenAI preset config ready for storage."""
-
     if not isinstance(config, dict):
         return {}
 
@@ -53,11 +53,10 @@ def normalize_openai_preset_config(config: dict[str, Any] | None) -> dict[str, A
     return normalized if isinstance(normalized, dict) else {}
 
 
-# Resolve preset records.
-# Pick the next available custom preset name.
-def _next_custom_preset_name(endpoint_url: str, model_name: str) -> str:
-    """Generate the next free custom preset name for an endpoint and model."""
+# Preset records
 
+# Return the first free "Custom N" preset name for the endpoint and model.
+def _next_custom_preset_name(endpoint_url: str, model_name: str) -> str:
     existing_names = set(
         OpenAiPreset.objects.filter(endpoint_url=endpoint_url, model_name=model_name).values_list(
             "name", flat=True
@@ -73,10 +72,8 @@ def _next_custom_preset_name(endpoint_url: str, model_name: str) -> str:
         index += 1
 
 
-# Convert a preset model into API payload data.
+# Convert a preset record into the JSON shape sent to the frontend, with its config normalized.
 def _serialize_preset(preset: OpenAiPreset) -> dict[str, Any]:
-    """Convert a preset model into the frontend JSON shape."""
-
     return {
         "id": str(preset.id),
         "endpoint_url": preset.endpoint_url,
@@ -88,10 +85,8 @@ def _serialize_preset(preset: OpenAiPreset) -> dict[str, Any]:
     }
 
 
-# Find one preset in a loaded collection.
+# Return one preset from an already loaded list, or raise OpenAiPreset.DoesNotExist when the id is not in it.
 def _get_preset_by_id(presets: list[OpenAiPreset], preset_id: str) -> OpenAiPreset:
-    """Return one preset from a loaded list or raise when it is missing."""
-
     preset = next((item for item in presets if str(item.id) == str(preset_id)), None)
     if preset is None:
         raise OpenAiPreset.DoesNotExist("Preset not found")
@@ -99,12 +94,13 @@ def _get_preset_by_id(presets: list[OpenAiPreset], preset_id: str) -> OpenAiPres
     return preset
 
 
-# Maintain preset state.
-# Ensure one default preset and one active preset exist for an endpoint and model.
+# Preset state
+
+# Ensure an endpoint and model pair has one default preset and exactly one active preset, repairing the
+# stored state when needed. Return all presets of the pair (active first) and the active preset. The rows
+# are locked for the duration of the transaction.
 @transaction.atomic
 def ensure_openai_preset_state(endpoint_url: str, model_name: str) -> tuple[list[OpenAiPreset], OpenAiPreset]:
-    """Ensure an endpoint/model pair has one default preset and one active preset."""
-
     normalized_endpoint = normalize_openai_endpoint_url(endpoint_url)
     normalized_model = str(model_name or "").strip()
     if not normalized_model:
@@ -151,10 +147,9 @@ def ensure_openai_preset_state(endpoint_url: str, model_name: str) -> tuple[list
     return presets, active_preset
 
 
-# Return the preset payload for one endpoint and model.
+# Return the presets of the selected endpoint and model, the active preset id and the active config as a
+# frontend payload.
 def get_openai_preset_payload(endpoint_url: str, model_name: str) -> dict[str, Any]:
-    """Return presets and the active config for the selected endpoint and model."""
-
     presets, active_preset = ensure_openai_preset_state(endpoint_url, model_name)
     return {
         "endpoint_url": normalize_openai_endpoint_url(endpoint_url),
@@ -165,11 +160,12 @@ def get_openai_preset_payload(endpoint_url: str, model_name: str) -> dict[str, A
     }
 
 
-# Mark one preset as active.
+# Preset actions
+
+# Mark one preset as the active one for its endpoint and model, deactivating the others, and return the
+# new payload.
 @transaction.atomic
 def activate_openai_preset(endpoint_url: str, model_name: str, preset_id: str) -> dict[str, Any]:
-    """Mark one preset as active for its endpoint and model."""
-
     normalized_endpoint = normalize_openai_endpoint_url(endpoint_url)
     presets, _active_preset = ensure_openai_preset_state(normalized_endpoint, model_name)
     preset = _get_preset_by_id(presets, preset_id)
@@ -185,7 +181,9 @@ def activate_openai_preset(endpoint_url: str, model_name: str, preset_id: str) -
     return get_openai_preset_payload(normalized_endpoint, model_name)
 
 
-# Create a new custom preset.
+# Create a custom preset for the selected endpoint and model and return the new payload. The preset stores
+# the normalized config, or the built-in default config when that is empty, and is activated unless activate
+# is False. Raise ValueError for an empty model name or a name that already exists for the pair.
 @transaction.atomic
 def create_openai_preset(
     endpoint_url: str,
@@ -195,8 +193,6 @@ def create_openai_preset(
     config: dict[str, Any] | None = None,
     activate: bool = True,
 ) -> dict[str, Any]:
-    """Create a custom preset for the selected endpoint and model."""
-
     normalized_endpoint = normalize_openai_endpoint_url(endpoint_url)
     normalized_model = str(model_name or "").strip()
     if not normalized_model:
@@ -223,11 +219,10 @@ def create_openai_preset(
     return get_openai_preset_payload(normalized_endpoint, normalized_model)
 
 
-# Rename a custom preset.
+# Rename a custom preset without changing its config. Raise ValueError for an empty name, the default
+# preset, or a name already used by another preset of the model.
 @transaction.atomic
 def rename_openai_preset(endpoint_url: str, model_name: str, preset_id: str, new_name: str) -> dict[str, Any]:
-    """Rename a custom preset without changing its config."""
-
     normalized_endpoint = normalize_openai_endpoint_url(endpoint_url)
     normalized_name = str(new_name or "").strip()
     if not normalized_name:
@@ -247,11 +242,10 @@ def rename_openai_preset(endpoint_url: str, model_name: str, preset_id: str, new
     return get_openai_preset_payload(normalized_endpoint, model_name)
 
 
-# Delete a custom preset.
+# Delete a custom preset and, when it was the active one, activate the default preset again.
+# Raise ValueError when the preset is the default one.
 @transaction.atomic
 def delete_openai_preset(endpoint_url: str, model_name: str, preset_id: str) -> dict[str, Any]:
-    """Delete a custom preset and restore the default when needed."""
-
     normalized_endpoint = normalize_openai_endpoint_url(endpoint_url)
     presets, _active_preset = ensure_openai_preset_state(normalized_endpoint, model_name)
     preset = _get_preset_by_id(presets, preset_id)
@@ -269,11 +263,10 @@ def delete_openai_preset(endpoint_url: str, model_name: str, preset_id: str) -> 
     return activate_openai_preset(normalized_endpoint, model_name, default_preset["id"])
 
 
-# Persist changes into the active preset.
+# Persist UI changes into the active preset. Editing the default preset never overwrites it: a changed
+# config is saved as a new custom active preset instead, and an unchanged one is a no-op.
 @transaction.atomic
 def sync_active_openai_preset(endpoint_url: str, model_name: str, config: dict[str, Any]) -> dict[str, Any]:
-    """Persist UI changes into the active preset."""
-
     normalized_endpoint = normalize_openai_endpoint_url(endpoint_url)
     normalized_model = str(model_name or "").strip()
     normalized_config = normalize_openai_preset_config(config)

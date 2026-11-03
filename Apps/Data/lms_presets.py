@@ -10,17 +10,18 @@ from django.db import IntegrityError, transaction
 from API import lms as lms_api
 from Apps.Data.models import LmsPreset
 
+# Name and config of the built-in preset that every model gets on first use.
 DEFAULT_LMS_PRESET_NAME = "Default"
 DEFAULT_LMS_PRESET_CONFIG: dict[str, Any] = {
     "operation": {},
 }
 
 
-# Normalize preset payload values.
-# Remove empty nested values while preserving scalar types.
-def _normalize_config_value(value: Any) -> Any:
-    """Remove empty values while preserving scalar types."""
+# Config normalization
 
+# Recursively drop empty values (empty dicts, lists, strings and None) from nested preset data,
+# keeping scalar values such as 0 and False as they are.
+def _normalize_config_value(value: Any) -> Any:
     if isinstance(value, dict):
         normalized: dict[str, Any] = {}
         for key, child in value.items():
@@ -37,10 +38,11 @@ def _normalize_config_value(value: Any) -> Any:
 
     return value
 
-# Keep the stored payload compact and predictable.
-def normalize_lms_preset_config(config: dict[str, Any] | None) -> dict[str, Any]:
-    """Return a compact LM Studio preset config ready for storage."""
 
+# Return a compact LM Studio preset config ready for storage, shaped as {"operation": {...}}.
+# A config without an "operation" section is read as the flat legacy shape: every key except "load"
+# is treated as an operation setting. A non-dict config yields a copy of the default config.
+def normalize_lms_preset_config(config: dict[str, Any] | None) -> dict[str, Any]:
     if not isinstance(config, dict):
         return deepcopy(DEFAULT_LMS_PRESET_CONFIG)
 
@@ -58,11 +60,10 @@ def normalize_lms_preset_config(config: dict[str, Any] | None) -> dict[str, Any]
     return normalized
 
 
-# Resolve preset records.
-# Load the built-in defaults from the selected model.
-def _get_default_lms_preset_config(model_name: str) -> dict[str, Any]:
-    """Read the default LM Studio config baked into the selected model."""
+# Preset records
 
+# Read the default LM Studio config baked into the selected model and normalize it for storage.
+def _get_default_lms_preset_config(model_name: str) -> dict[str, Any]:
     settings_payload = lms_api.get_model_settings(model_name)
     return normalize_lms_preset_config(
         {
@@ -70,10 +71,9 @@ def _get_default_lms_preset_config(model_name: str) -> dict[str, Any]:
         }
     )
 
-# Pick the next available custom preset name.
-def _next_custom_preset_name(model_name: str) -> str:
-    """Generate the next free custom preset name for a model."""
 
+# Return the first free "Custom N" preset name for the model.
+def _next_custom_preset_name(model_name: str) -> str:
     existing_names = set(
         LmsPreset.objects.filter(model_name=model_name).values_list("name", flat=True)
     )
@@ -86,10 +86,9 @@ def _next_custom_preset_name(model_name: str) -> str:
 
         index += 1
 
-# Convert a preset model into API payload data.
-def _serialize_preset(preset: LmsPreset) -> dict[str, Any]:
-    """Convert a preset model into the frontend JSON shape."""
 
+# Convert a preset record into the JSON shape sent to the frontend, with its config normalized.
+def _serialize_preset(preset: LmsPreset) -> dict[str, Any]:
     return {
         "id": str(preset.id),
         "model_name": preset.model_name,
@@ -99,10 +98,9 @@ def _serialize_preset(preset: LmsPreset) -> dict[str, Any]:
         "is_active": preset.is_active,
     }
 
-# Find one preset in a loaded collection.
-def _get_preset_by_id(presets: list[LmsPreset], preset_id: str) -> LmsPreset:
-    """Return one preset from a loaded list or raise when it is missing."""
 
+# Return one preset from an already loaded list, or raise LmsPreset.DoesNotExist when the id is not in it.
+def _get_preset_by_id(presets: list[LmsPreset], preset_id: str) -> LmsPreset:
     preset = next((item for item in presets if str(item.id) == str(preset_id)), None)
     if preset is None:
         raise LmsPreset.DoesNotExist("Preset not found")
@@ -110,12 +108,13 @@ def _get_preset_by_id(presets: list[LmsPreset], preset_id: str) -> LmsPreset:
     return preset
 
 
-# Maintain preset state.
-# Ensure one default preset and one active preset exist for a model.
+# Preset state
+
+# Ensure a model has one default preset and exactly one active preset, repairing the stored state when
+# needed. Return all presets of the model (active first) and the active preset. The rows are locked for the
+# duration of the transaction.
 @transaction.atomic
 def ensure_lms_preset_state(model_name: str) -> tuple[list[LmsPreset], LmsPreset]:
-    """Ensure a model has one default preset and one active preset."""
-
     normalized_model = str(model_name or "").strip()
     if not normalized_model:
         raise ValueError("Model name is required for LM Studio presets")
@@ -159,10 +158,9 @@ def ensure_lms_preset_state(model_name: str) -> tuple[list[LmsPreset], LmsPreset
     )
     return presets, active_preset
 
-# Return the preset payload for one model.
-def get_lms_preset_payload(model_name: str) -> dict[str, Any]:
-    """Return presets and the active config for the selected model."""
 
+# Return the presets of the selected model, the active preset id and the active config as a frontend payload.
+def get_lms_preset_payload(model_name: str) -> dict[str, Any]:
     presets, active_preset = ensure_lms_preset_state(model_name)
     return {
         "model": model_name,
@@ -171,11 +169,12 @@ def get_lms_preset_payload(model_name: str) -> dict[str, Any]:
         "active_config": normalize_lms_preset_config(active_preset.config or {}),
     }
 
-# Mark one preset as active.
+
+# Preset actions
+
+# Mark one preset as the active one for its model, deactivating the others, and return the new payload.
 @transaction.atomic
 def activate_lms_preset(model_name: str, preset_id: str) -> dict[str, Any]:
-    """Mark one preset as active for its model."""
-
     presets, _active_preset = ensure_lms_preset_state(model_name)
     preset = _get_preset_by_id(presets, preset_id)
 
@@ -189,7 +188,10 @@ def activate_lms_preset(model_name: str, preset_id: str) -> dict[str, Any]:
 
     return get_lms_preset_payload(model_name)
 
-# Create a new custom preset.
+
+# Create a custom preset for the selected model and return the new payload. The preset stores the normalized
+# config and is activated unless activate is False. Raise ValueError for an empty model name or a name that
+# already exists for the model.
 @transaction.atomic
 def create_lms_preset(
     model_name: str,
@@ -198,8 +200,6 @@ def create_lms_preset(
     config: dict[str, Any] | None = None,
     activate: bool = True,
 ) -> dict[str, Any]:
-    """Create a custom preset for the selected model."""
-
     normalized_model = str(model_name or "").strip()
     if not normalized_model:
         raise ValueError("Model name is required for LM Studio presets")
@@ -223,11 +223,11 @@ def create_lms_preset(
 
     return get_lms_preset_payload(normalized_model)
 
-# Rename a custom preset.
+
+# Rename a custom preset without changing its config. Raise ValueError for an empty name, the default
+# preset, or a name already used by another preset of the model.
 @transaction.atomic
 def rename_lms_preset(model_name: str, preset_id: str, new_name: str) -> dict[str, Any]:
-    """Rename a custom preset without changing its config."""
-
     normalized_name = str(new_name or "").strip()
     if not normalized_name:
         raise ValueError("Preset name cannot be empty")
@@ -245,11 +245,11 @@ def rename_lms_preset(model_name: str, preset_id: str, new_name: str) -> dict[st
 
     return get_lms_preset_payload(model_name)
 
-# Delete a custom preset.
+
+# Delete a custom preset and, when it was the active one, activate the default preset again.
+# Raise ValueError when the preset is the default one.
 @transaction.atomic
 def delete_lms_preset(model_name: str, preset_id: str) -> dict[str, Any]:
-    """Delete a custom preset and restore the default when needed."""
-
     presets, _active_preset = ensure_lms_preset_state(model_name)
     preset = _get_preset_by_id(presets, preset_id)
     if preset.is_default:
@@ -265,11 +265,11 @@ def delete_lms_preset(model_name: str, preset_id: str) -> dict[str, Any]:
     default_preset = next(item for item in payload["presets"] if item.get("is_default"))
     return activate_lms_preset(model_name, default_preset["id"])
 
-# Persist changes into the active preset.
+
+# Persist UI changes into the active preset. Editing the default preset never overwrites it: a changed
+# config is saved as a new custom active preset instead, and an unchanged one is a no-op.
 @transaction.atomic
 def sync_active_lms_preset(model_name: str, config: dict[str, Any]) -> dict[str, Any]:
-    """Persist UI changes into the active preset."""
-
     normalized_model = str(model_name or "").strip()
     normalized_config = normalize_lms_preset_config(config)
     presets, active_preset = ensure_lms_preset_state(normalized_model)

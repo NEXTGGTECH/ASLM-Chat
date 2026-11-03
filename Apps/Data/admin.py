@@ -20,6 +20,7 @@ class MessageAdmin(admin.ModelAdmin):
     search_fields = ("content",)
 
 
+# Register chat branch links (source chat/message to child chat/message) in the admin.
 @admin.register(ChatBranch)
 class ChatBranchAdmin(admin.ModelAdmin):
     list_display = ("source_chat", "source_message", "child_chat", "child_message", "created_at")

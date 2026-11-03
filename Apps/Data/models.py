@@ -18,6 +18,7 @@ class MessageRole(models.TextChoices):
 class Chat(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     title = models.CharField(max_length=255, default="New Chat")
+    # Slug of the tool currently selected for this chat; empty when none is active.
     active_tool_slug = models.CharField(max_length=120, blank=True, default="")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -26,10 +27,8 @@ class Chat(models.Model):
     class Meta:
         ordering = ["-updated_at"]
 
-    # Return the chat title.
+    # Return the chat title, used as the display name in Django admin and logs.
     def __str__(self) -> str:
-        """Return the display name for Django admin and logs."""
-
         return self.title
 
 
@@ -38,6 +37,8 @@ class Message(models.Model):
     chat = models.ForeignKey(Chat, on_delete=models.CASCADE, related_name="messages")
     role = models.CharField(max_length=50, choices=MessageRole.choices)
     content = models.TextField()
+    # Ordered list of LLM transcript entries (tool calls, uploaded file context and similar) replayed
+    # into later prompts.
     llm_transcript = models.JSONField(default=list, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
@@ -45,15 +46,15 @@ class Message(models.Model):
     class Meta:
         ordering = ["created_at"]
 
-    # Return a short message preview.
+    # Return a compact preview of the stored message: its role and the first 50 characters of content.
     def __str__(self) -> str:
-        """Return a compact preview of the stored message."""
-
         return f"{self.role}: {self.content[:50]}"
 
 
 # Link one copied conversation branch to the exact messages where it diverged.
 class ChatBranch(models.Model):
+    # The original chat and the message where it diverged, and the copied chat with the copy of that message.
+    # The message links are cleared (not cascaded) when a message is deleted.
     source_chat = models.ForeignKey(Chat, on_delete=models.CASCADE, related_name="outgoing_branches")
     source_message = models.ForeignKey(
         Message,
@@ -72,12 +73,12 @@ class ChatBranch(models.Model):
     )
     created_at = models.DateTimeField(auto_now_add=True)
 
+    # Configure chronological branch ordering.
     class Meta:
         ordering = ["created_at", "id"]
 
+    # Return a readable source-to-child branch label.
     def __str__(self) -> str:
-        """Return a readable source-to-child branch label."""
-
         return f"{self.source_chat} -> {self.child_chat}"
 
 
@@ -98,33 +99,31 @@ class MessageAttachment(models.Model):
     )
     name = models.CharField(max_length=255, blank=True, default="")
     mime_type = models.CharField(max_length=100, default="application/octet-stream")
+    # Base64-encoded file content (see data_url).
     data = models.TextField()
     size_bytes = models.PositiveIntegerField(default=0)
+    # Text extracted from the file or page for prompts; the flag marks that extraction already ran,
+    # even if the text is empty.
     extracted_text = models.TextField(blank=True, default="")
     extracted_text_ready = models.BooleanField(default=False)
+    # Position of the attachment within its message.
     order = models.PositiveSmallIntegerField(default=0)
 
     # Configure stable attachment ordering.
     class Meta:
         ordering = ["order", "id"]
 
-    # Build a browser-ready attachment URL.
+    # Return the stored attachment as a browser-ready base64 data URL.
     def data_url(self) -> str:
-        """Return the stored attachment as a data URL."""
-
         return f"data:{self.mime_type};base64,{self.data}"
 
-    # Return whether the attachment is an image.
+    # Return whether the attachment should be treated as an image, by kind or by an image MIME type.
     @property
     def is_image(self) -> bool:
-        """Return whether the attachment should be treated as an image."""
-
         return self.kind == MessageAttachmentKind.IMAGE or self.mime_type.startswith("image/")
 
-    # Return a readable attachment label.
+    # Return a readable label: the attachment name (or its kind and order) with the owning message id.
     def __str__(self) -> str:
-        """Return a readable label for the related attachment."""
-
         label = self.name or f"{self.kind} #{self.order}"
         return f"{label} for message {self.message_id}"
 
@@ -133,6 +132,7 @@ class MessageAttachment(models.Model):
 class MessageImage(models.Model):
     message = models.ForeignKey(Message, on_delete=models.CASCADE, related_name="images")
     mime_type = models.CharField(max_length=50, default="image/jpeg")
+    # Base64-encoded image content (see data_url).
     data = models.TextField()
     order = models.PositiveSmallIntegerField(default=0)
 
@@ -140,16 +140,12 @@ class MessageImage(models.Model):
     class Meta:
         ordering = ["order"]
 
-    # Build a browser-ready image URL.
+    # Return the stored image as a browser-ready base64 data URL.
     def data_url(self) -> str:
-        """Return the stored image as a data URL."""
-
         return f"data:{self.mime_type};base64,{self.data}"
 
-    # Return a readable image label.
+    # Return a readable image label with its order and the owning message id.
     def __str__(self) -> str:
-        """Return a readable label for the related image."""
-
         return f"Image #{self.order} for message {self.message_id}"
 
 
@@ -174,10 +170,8 @@ class OllamaPreset(models.Model):
             ),
         ]
 
-    # Return a readable preset label.
+    # Return a readable preset label made of the model name and the preset name.
     def __str__(self) -> str:
-        """Return a readable preset name with its model."""
-
         return f"{self.model_name} :: {self.name}"
 
 
@@ -202,10 +196,8 @@ class LmsPreset(models.Model):
             ),
         ]
 
-    # Return a readable preset label.
+    # Return a readable preset label made of the model name and the preset name.
     def __str__(self) -> str:
-        """Return a readable preset name with its model."""
-
         return f"{self.model_name} :: {self.name}"
 
 
@@ -233,10 +225,8 @@ class OpenAiPreset(models.Model):
             ),
         ]
 
-    # Return a readable preset label.
+    # Return a readable preset label made of the endpoint, the model name and the preset name.
     def __str__(self) -> str:
-        """Return a readable preset name with its endpoint and model."""
-
         return f"{self.endpoint_url} :: {self.model_name} :: {self.name}"
 
 
@@ -261,8 +251,6 @@ class GoogleGenAiPreset(models.Model):
             ),
         ]
 
-    # Return a readable preset label.
+    # Return a readable preset label made of the model name and the preset name.
     def __str__(self) -> str:
-        """Return a readable preset name with its model."""
-
         return f"{self.model_name} :: {self.name}"
