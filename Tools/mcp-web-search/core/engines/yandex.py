@@ -22,7 +22,8 @@ _SUPPORTED_LANGS = frozenset(
 )
 
 
-# ── adaptive User-Agent mode (native ya.ru) ────────────────────────────────────
+# Adaptive User-Agent mode for the native ya.ru parser
+
 # Default leg: a Yandex Browser UA on top of the pinned chrome TLS — for ya.ru the
 # most coherent client story (their own Chromium). Measured at parity with the
 # cookieless "no UA" recipe, but the two legs' captcha dice are independent, so
@@ -34,10 +35,15 @@ _YB_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/146.0.0.0 YaBrowser/26.10.0.0 Safari/537.36"
 )
+
+# Length of the plain (no User-Agent) cooldown window in seconds, and the number of consecutive blocked
+# parses that switches to it.
 _PLAIN_MODE_SECONDS = 15 * 60.0
 _BLOCKED_STRIKES_TO_FLIP = 2
 
-_ua_mode = "yabrowser"  # "yabrowser" | "plain"
+# Mode state: the current mode ("yabrowser" or "plain"), the time.monotonic() moment the plain window ends,
+# and the current streak of consecutive blocked parses.
+_ua_mode = "yabrowser"
 _plain_until = 0.0
 _blocked_streak = 0
 
@@ -48,7 +54,9 @@ def _active_user_agent() -> str:
     if _ua_mode == "plain":
         if time.monotonic() < _plain_until:
             return ""
-        _ua_mode = "yabrowser"  # cooldown elapsed — back to the default leg
+
+        # The cooldown elapsed, so return to the default leg.
+        _ua_mode = "yabrowser"
     return _YB_USER_AGENT
 
 
@@ -56,11 +64,13 @@ def _active_user_agent() -> str:
 def _note_parse_outcome(status: ParseStatus) -> None:
     global _blocked_streak, _ua_mode, _plain_until
     if status == ParseStatus.BLOCKED:
+        # A blocked streak long enough flips to the plain mode for the cooldown window.
         _blocked_streak += 1
         if _blocked_streak >= _BLOCKED_STRIKES_TO_FLIP:
             _ua_mode = "plain"
             _plain_until = time.monotonic() + _PLAIN_MODE_SECONDS
     else:
+        # Any other outcome ends the streak and returns to the default mode once the cooldown is over.
         _blocked_streak = 0
         if _ua_mode == "plain" and time.monotonic() >= _plain_until:
             _ua_mode = "yabrowser"
@@ -79,14 +89,20 @@ class YandexParser:
     provider_family = "yandex"
     search_url = "https://ya.ru/search/"
 
+    # Lowercase page fragments that mean Yandex served a captcha or robot check page.
     _BLOCK_MARKERS = ("showcaptcha", "smartcaptcha", "checkcaptcha", "robot check", "captcha")
+
+    # Lowercase page fragments (English and Russian) that mean the query genuinely returned no results.
     _EMPTY_MARKERS = ("nothing found", "there are no search results", "ничего не нашлось", "ничего не найдено")
+
+    # Known result card layouts as (variant name, CSS selector), tried in order until one matches.
     _VARIANTS = (
         ("native_organic", "div.Organic"),
         ("legacy_serp_items", "li[class*='serp-item']"),
     )
 
-    # Build a native Yandex search request.
+    # Build a native Yandex search request. Safe search and time limit are not supported and ignored; the
+    # User-Agent header follows the adaptive mode state.
     @staticmethod
     def build_request(
         query: str,
@@ -98,9 +114,14 @@ class YandexParser:
     ) -> EngineRequest:
         del safesearch, timelimit
         _, language = split_region(region)
+
+        # Query parameters: the page number is zero-based in the p argument.
         params = {"text": query}
         if page > 1:
             params["p"] = str(page - 1)
+
+        # Minimal headers: the region's Accept-Language (English by default) and the User-Agent of the
+        # current mode, which is omitted in plain mode.
         headers = {"Accept-Language": "en-US,en;q=0.9"}
         accept_language = accept_language_for(language)
         if accept_language:
@@ -123,15 +144,20 @@ class YandexParser:
             identity_key="yandex",
         )
 
-    # Parse a raw native Yandex HTML document into normalized results.
+    # Parse a raw native Yandex HTML document into normalized results, and feed the outcome into the
+    # adaptive User-Agent state.
     def parse(self, document: str) -> EngineParseResult:
+        # Detect block and empty-result pages from the raw lowercase text.
         lowered = document.lower()
         blocked = any(marker in lowered for marker in self._BLOCK_MARKERS)
         explicit_empty = any(marker in lowered for marker in self._EMPTY_MARKERS)
 
+        # Pick the first card layout that matches the page.
         tree = parse_html(document)
         variant, cards = first_cards(tree, self._VARIANTS)
 
+        # Extract title, link and snippet per card, skipping ads; cards without a title or a valid http(s)
+        # link are counted as malformed.
         results: list[SearchResult] = []
         malformed = 0
         for card in cards:
@@ -176,6 +202,8 @@ class YandexParser:
                 continue
             results.append(SearchResult(title=title, url=href, snippet=snippet))
 
+        # Classify the page (a block marker only counts without results), then record the status so a captcha
+        # streak can flip the User-Agent mode.
         outcome = classify_parse(
             engine=self.name,
             results=results,
@@ -199,8 +227,13 @@ class LegacyYandexParser:
     provider_family = "yandex"
     search_url = "https://yandex.com/search/site/"
 
+    # Lowercase page fragments that mean Yandex served a captcha or robot check page.
     _BLOCK_MARKERS = ("showcaptcha", "smartcaptcha", "checkcaptcha", "robot check", "captcha")
+
+    # Lowercase page fragments (English and Russian) that mean the query genuinely returned no results.
     _EMPTY_MARKERS = ("nothing found", "there are no search results", "ничего не нашлось", "ничего не найдено")
+
+    # Known result card layouts as (variant name, CSS selector), tried in order until one matches.
     _VARIANTS = (
         ("serp_items", "li[class*='serp-item']"),
         ("organic_results", "li[data-cid]"),
@@ -218,6 +251,9 @@ class LegacyYandexParser:
     ) -> EngineRequest:
         _, language = split_region(region)
         profile = for_engine("yandex")
+
+        # Fixed widget parameters; the language is only sent when the widget supports it, and the page number
+        # is zero-based in the p argument. Safe search and time limit are not supported and ignored.
         params = {
             "tmpl_version": "releases",
             "text": query,
@@ -230,6 +266,7 @@ class LegacyYandexParser:
         if page > 1:
             params["p"] = str(page - 1)
 
+        # Navigation headers as if searching from within yandex.com, and the fixed yp preference cookie.
         extra: dict[str, str] = {}
         accept_language = accept_language_for(language)
         if accept_language:
@@ -254,13 +291,17 @@ class LegacyYandexParser:
 
     # Parse a raw Yandex site-search HTML document into normalized results.
     def parse(self, document: str) -> EngineParseResult:
+        # Detect block and empty-result pages from the raw lowercase text.
         lowered = document.lower()
         blocked = any(marker in lowered for marker in self._BLOCK_MARKERS)
         explicit_empty = any(marker in lowered for marker in self._EMPTY_MARKERS)
 
+        # Pick the first card layout that matches the page.
         tree = parse_html(document)
         variant, cards = first_cards(tree, self._VARIANTS)
 
+        # Extract title, link and snippet per card; cards without a title or a valid http(s) link are counted
+        # as malformed.
         results: list[SearchResult] = []
         malformed = 0
         for card in cards:
@@ -293,6 +334,7 @@ class LegacyYandexParser:
                 continue
             results.append(SearchResult(title=title, url=href, snippet=snippet))
 
+        # A block marker only counts when no results were parsed.
         return classify_parse(
             engine=self.name,
             results=results,

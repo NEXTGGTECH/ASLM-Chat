@@ -32,8 +32,13 @@ class DuckDuckGoParser:
     provider_family = "duckduckgo"
     search_url = "https://html.duckduckgo.com/html/"
 
+    # Lowercase page fragments that mean DuckDuckGo served an anomaly or bot challenge page.
     _BLOCK_MARKERS = ("anomaly-modal", "challenge-form", "verify you are human", "captcha")
+
+    # Lowercase page fragments that mean the query genuinely returned no results.
     _EMPTY_MARKERS = ("no results.", "no more results")
+
+    # Known result card layouts as (variant name, CSS selector), tried in order until one matches.
     _VARIANTS = (
         ("result_cards", "div.result"),
         ("compact_body", "div.body"),
@@ -50,6 +55,9 @@ class DuckDuckGoParser:
         page: int = 1,
     ) -> EngineRequest:
         profile = for_engine("duckduckgo")
+
+        # Form fields: s is the result offset (first page 10, later pages step by 15), df the time limit and
+        # kp the safe search level (-2 off, 1 strict).
         data: dict[str, str] = {"q": query, "b": "", "l": region}
         if page > 1:
             data["s"] = str(10 + (page - 2) * 15)
@@ -84,13 +92,17 @@ class DuckDuckGoParser:
 
     # Parse a raw DuckDuckGo SERP HTML document into an EngineParseResult.
     def parse(self, document: str) -> EngineParseResult:
+        # Detect block and empty-result pages from the raw lowercase text.
         lowered = document.lower()
         blocked = any(marker in lowered for marker in self._BLOCK_MARKERS)
         explicit_empty = any(marker in lowered for marker in self._EMPTY_MARKERS)
 
+        # Pick the first card layout that matches the page.
         tree = parse_html(document)
         variant, cards = first_cards(tree, self._VARIANTS)
 
+        # Extract title, link and snippet per card; result links are unwrapped from DuckDuckGo redirects, and
+        # cards without a title or a valid http(s) link are counted as malformed.
         results: list[SearchResult] = []
         malformed = 0
         for card in cards:
@@ -117,6 +129,7 @@ class DuckDuckGoParser:
                 continue
             results.append(SearchResult(title=title, url=href, snippet=snippet))
 
+        # A block marker only counts when no results were parsed.
         return classify_parse(
             engine=self.name,
             results=results,

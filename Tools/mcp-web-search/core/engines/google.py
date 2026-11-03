@@ -66,6 +66,7 @@ class GoogleHtmlParser:
     provider_family = "google"
     search_url = "https://www.google.com/search"
 
+    # Lowercase page fragments that mean Google served a consent gate, bot challenge or JavaScript wall.
     _BLOCK_MARKERS = (
         "/sorry/",
         "unusual traffic",
@@ -74,7 +75,11 @@ class GoogleHtmlParser:
         "before you continue to google",
         "consent.google.com/save",
     )
+
+    # Lowercase page fragments that mean the query genuinely returned no results.
     _EMPTY_MARKERS = ("did not match any documents", "no results found for")
+
+    # Known result card layouts as (variant name, CSS selector), tried in order until one matches.
     _VARIANTS = (
         ("result_containers", "div.MjjYud, div.Gx5Zad"),
         ("title_anchors", "a[href]:has(h3)"),
@@ -92,6 +97,7 @@ class GoogleHtmlParser:
     ) -> EngineRequest:
         country, language = split_region(region)
         profile = for_engine("google")
+
         # Clean param set (no num/cr): those push Google into a degraded/withheld layout.
         params = {
             "q": query,
@@ -126,13 +132,17 @@ class GoogleHtmlParser:
 
     # Parse a raw Google SERP HTML document into an EngineParseResult.
     def parse(self, document: str) -> EngineParseResult:
+        # Detect block and empty-result pages from the raw lowercase text.
         lowered = document.lower()
         blocked = any(marker in lowered for marker in self._BLOCK_MARKERS)
         explicit_empty = any(marker in lowered for marker in self._EMPTY_MARKERS)
 
+        # Pick the first card layout that matches the page.
         tree = parse_html(document)
         variant, cards = first_cards(tree, self._VARIANTS)
 
+        # Extract title, link and snippet per card; result links are unwrapped from Google redirects, and
+        # cards without a title or a valid external http(s) link are counted as malformed.
         results: list[SearchResult] = []
         malformed = 0
         for card in cards:
@@ -145,7 +155,8 @@ class GoogleHtmlParser:
                     ".VwiC3b",
                     ".yXK7lf",
                     "div[data-sncf]",
-                    ".ilUpNd",      # current GSA/mobile SERP snippet class
+                    # Snippet class of the current GSA/mobile SERP.
+                    ".ilUpNd",
                 ),
             )
             if not title or not valid_http_url(href) or _is_internal(href):
@@ -153,6 +164,7 @@ class GoogleHtmlParser:
                 continue
             results.append(SearchResult(title=title, url=href, snippet=snippet))
 
+        # A block marker only counts when no results were parsed.
         return classify_parse(
             engine=self.name,
             results=results,

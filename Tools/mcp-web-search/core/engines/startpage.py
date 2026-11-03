@@ -14,12 +14,15 @@ from ..fetch.profiles import accept_language_for, build_nav_headers, for_engine
 from .models import EngineParseResult, EngineRequest, ParseStatus, SearchResult
 from .parsing import split_region
 
+# Matches an HTML tag so markup can be stripped from result fields.
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 
-# Startpage safesearch level expected by the form ('qadf'/family-filter).
+# Startpage safesearch level expected by the form ('qadf'/family-filter), and the supported time ranges
+# (the time limit values are passed through unchanged as 'with_date').
 _SAFESEARCH = {"off": "none", "moderate": "moderate", "on": "heavy"}
 _TIME_RANGE = {"d": "d", "w": "w", "m": "m", "y": "y"}
 
+# Startpage URLs: the homepage (where the 'sc' token form lives) and the search endpoint.
 _BASE_URL = "https://www.startpage.com"
 _SC_URL = f"{_BASE_URL}/"
 _SEARCH_URL = f"{_BASE_URL}/sp/search"
@@ -33,6 +36,9 @@ _SC_TTL = 3600.0
 # again — otherwise every Startpage search serializes a fresh homepage fetch under
 # the global lock, turning one blocked homepage into a queue across all searches.
 _SC_RETRY_COOLDOWN = 30.0
+
+# Process-wide token cache: the lock serializes refreshes, and the timestamps (time.monotonic) record when
+# the cached code was fetched and when the last scrape failed (0.0 means never).
 _SC_LOCK = asyncio.Lock()
 _sc_code: str = ""
 _sc_fetched_at: float = 0.0
@@ -58,6 +64,7 @@ def _between(text: str, start: str, end: str) -> str:
 
 # Minimal transport surface needed to prefetch the sc token.
 class _Transport(Protocol):
+    # Execute the request and return the response.
     async def fetch(self, request: EngineRequest): ...
 
 
@@ -65,6 +72,7 @@ class _Transport(Protocol):
 async def _fetch_sc_code(transport: _Transport) -> str:
     from .parsing import first_attribute, parse_html
 
+    # Request the homepage as a same-origin navigation.
     profile = for_engine("startpage")
     headers = build_nav_headers(profile, referer=f"{_BASE_URL}/", sec_fetch_site="same-origin")
     request = EngineRequest(
@@ -75,6 +83,8 @@ async def _fetch_sc_code(transport: _Transport) -> str:
         primp_os=profile.primp_os,
         identity_key="startpage",
     )
+
+    # Read the token from the search form; an HTTP error yields an empty token.
     response = await transport.fetch(request)
     if response.status >= 400:
         return ""
@@ -86,18 +96,24 @@ async def _fetch_sc_code(transport: _Transport) -> str:
 # Return a cached sc token, refreshing it through the transport when stale.
 async def _get_sc_code(transport: _Transport) -> str:
     global _sc_code, _sc_fetched_at, _sc_failed_at
+
+    # Fast path without the lock: the cached token is still fresh.
     now = time.monotonic()
     if _sc_code and (now - _sc_fetched_at) < _SC_TTL:
         return _sc_code
     async with _SC_LOCK:
+        # Re-check under the lock: another search may have refreshed the token while this one waited.
         now = time.monotonic()
         if _sc_code and (now - _sc_fetched_at) < _SC_TTL:
             return _sc_code
+
         # A recent scrape failure is still cooling down — reuse the stale/empty
         # token instead of hammering the homepage on every search.
         # Apply backoff only after an actual failure, not to the first request after an OS startup.
         if _sc_failed_at and (now - _sc_failed_at) < _SC_RETRY_COOLDOWN:
             return _sc_code
+
+        # Scrape a fresh token; a failure starts the cooldown.
         code = await _fetch_sc_code(transport)
         if code:
             _sc_code = code
@@ -118,7 +134,10 @@ class StartpageParser:
     provider_family = "google"
     search_url = _SEARCH_URL
 
+    # Lowercase page fragments that mean Startpage served a captcha or bot challenge page.
     _BLOCK_MARKERS = ("/sp/captcha", "verify you are human", "px-captcha")
+
+    # Lowercase page fragments that mean the query genuinely returned no results.
     _EMPTY_MARKERS = ("no results found", "did not return any results")
 
     # Build the search request, prefetching the sc token through the transport.
@@ -136,6 +155,7 @@ class StartpageParser:
         sc_code = await _get_sc_code(transport)
         profile = for_engine("startpage")
 
+        # Form body: the sc token, the optional date range and, for later pages, the page number and segment.
         data: dict[str, str] = {
             "query": query,
             "cat": "web",
@@ -174,6 +194,7 @@ class StartpageParser:
         }
         preferences = "N1N".join(f"{key}EEE{value}" for key, value in prefs.items())
 
+        # Same-origin form POST headers with the region's Accept-Language.
         extra = {"Origin": _BASE_URL}
         accept_language = accept_language_for(language, country)
         if accept_language:
@@ -197,16 +218,20 @@ class StartpageParser:
 
     # Parse Startpage's HTML, reading the embedded JSON the React app renders.
     def parse(self, document: str) -> EngineParseResult:
+        # Detect block and empty-result pages from the raw lowercase text.
         lowered = document.lower()
         blocked = any(marker in lowered for marker in self._BLOCK_MARKERS)
         explicit_empty = any(marker in lowered for marker in self._EMPTY_MARKERS)
 
+        # Cut the props object of the AppSerpWeb component out of the page script.
         raw = _between(document, "React.createElement(UIStartpage.AppSerpWeb, {", "}})")
         results: list[SearchResult] = []
         cards_seen = 0
         malformed = 0
         diagnostics: list[str] = []
 
+        # Decode the props and walk render.presenter.regions.mainline; only "web-google" blocks hold organic
+        # results, and items without a title or a valid http(s) URL are counted as malformed.
         if raw:
             try:
                 payload = json.loads("{" + raw + "}}")
@@ -231,6 +256,8 @@ class StartpageParser:
                             continue
                         results.append(SearchResult(title=title, url=href, snippet=snippet))
 
+        # Pick the status: a block marker only counts without results, and a page without the embedded results
+        # block and without an empty marker means the layout changed.
         if blocked and not results:
             status = ParseStatus.BLOCKED
         elif results:
