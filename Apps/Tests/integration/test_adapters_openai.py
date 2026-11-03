@@ -13,6 +13,8 @@ from Apps.Tests.fakes.openai_server import openai_server  # noqa: F401 - registe
 pytestmark = [pytest.mark.integration]
 
 
+# Provide the fake OpenAI server with the OpenAI engine enabled in the isolated settings, pointed at
+# the fake server's URL and configured with a test API key.
 @pytest.fixture
 def openai_endpoint(openai_server, isolated_settings, monkeypatch):
     from Settings import settings as project_settings
@@ -35,7 +37,7 @@ def openai_endpoint(openai_server, isolated_settings, monkeypatch):
     return openai_server
 
 
-# Read one message field from an adapter chunk stream.
+# Concatenate one message field (for example content or thinking) over an adapter chunk stream.
 def _chunk_field(chunks, name):
     parts = []
     for chunk in chunks:
@@ -45,10 +47,10 @@ def _chunk_field(chunks, name):
     return "".join(parts)
 
 
-# Model discovery.
+# Model discovery
 
-
-# Model discovery reads the /v1/models payload with bearer auth.
+# Verify that model discovery returns the models listed in the /v1/models payload and sends the API
+# key as a bearer token.
 def test_get_models_reads_list_payload(openai_endpoint):
     openai_endpoint.models_payload = {
         "object": "list",
@@ -64,7 +66,7 @@ def test_get_models_reads_list_payload(openai_endpoint):
     assert openai_endpoint.auth_headers[0] == "Bearer test-key-123"
 
 
-# An unreachable endpoint degrades to an empty model list.
+# Verify that model discovery returns an empty list when the endpoint is no longer reachable.
 def test_get_models_survives_outage(openai_server, isolated_settings):
     from Settings import settings as project_settings
 
@@ -77,10 +79,9 @@ def test_get_models_survives_outage(openai_server, isolated_settings):
     assert openai_api.get_models() == []
 
 
-# Streaming generation.
+# Streaming generation
 
-
-# Plain generation streams SSE deltas through the SDK.
+# Verify that plain generation streams the SSE content deltas through the SDK.
 def test_generate_streams_content(openai_endpoint):
     openai_endpoint.enqueue_text("Hello ", "from fake OpenAI")
 
@@ -93,7 +94,8 @@ def test_generate_streams_content(openai_endpoint):
     assert "from fake OpenAI" in visible
 
 
-# Options and reasoning levels reach the request payload.
+# Verify that the model, runtime options and the reasoning level (under its configured parameter
+# name) reach the chat request payload.
 def test_generate_forwards_options_and_reasoning_level(openai_endpoint):
     openai_endpoint.enqueue_text("ok")
 
@@ -115,7 +117,7 @@ def test_generate_forwards_options_and_reasoning_level(openai_endpoint):
     assert request["reasoning_effort"] == "high"
 
 
-# The configured API key travels as a bearer token.
+# Verify that the configured API key is sent as a bearer token with the chat request.
 def test_generate_sends_bearer_auth(openai_endpoint):
     openai_endpoint.enqueue_text("ok")
 
@@ -124,7 +126,7 @@ def test_generate_sends_bearer_auth(openai_endpoint):
     assert openai_endpoint.auth_headers[0] == "Bearer test-key-123"
 
 
-# Engine failures propagate to the caller.
+# Verify that an HTTP 500 answer from the engine raises an exception for the caller.
 def test_generate_error_response_raises(openai_endpoint):
     openai_endpoint.chat_status = 500
 
@@ -132,10 +134,10 @@ def test_generate_error_response_raises(openai_endpoint):
         list(openai_api.generate("gpt-fake", [{"role": "user", "content": "hi"}], stream=True))
 
 
-# Reasoning channels.
+# Reasoning channels
 
-
-# Reasoning deltas map onto the normalized chunk shape.
+# Verify that a reasoning_content delta is exposed as the thinking field and a content delta as the
+# content field of the normalized chunks.
 def test_generate_maps_reasoning_deltas(openai_endpoint):
     openai_endpoint.enqueue_delta({"reasoning_content": "thinking hard"})
     openai_endpoint.enqueue_delta({"content": "Answer"})

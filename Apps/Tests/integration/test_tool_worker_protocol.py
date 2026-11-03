@@ -15,9 +15,13 @@ import pytest
 pytestmark = [pytest.mark.integration]
 
 
+# Path of the tool worker script that every test launches as a subprocess.
 WORKER_FILE = Path(__file__).resolve().parents[3] / "Services" / "tool_worker.py"
 
 
+# Source of the fake mcp-server.py module the worker loads: it exposes the sync echo and slow tools
+# (async_echo is only a handler without a listed tool), supports only the ollama-service engine and
+# has a generic call_tool dispatcher for unregistered tool ids.
 FAKE_SERVER = """
 import time
 
@@ -77,6 +81,7 @@ TOOL_HANDLERS = {
 
 # Minimal protocol client speaking the real worker envelope format.
 class WorkerClient:
+    # Launch the worker in serve mode for the given server module with piped stdio.
     def __init__(self, server_file: Path):
         self.process = subprocess.Popen(
             [sys.executable, str(WORKER_FILE), "serve", str(server_file)],
@@ -86,6 +91,8 @@ class WorkerClient:
             text=True,
             encoding="utf-8",
         )
+
+        # Serializes access to the worker pipes so one request owns the stream at a time.
         self._lock = threading.Lock()
 
     # Send one request and read the next response envelope.
@@ -128,11 +135,14 @@ class WorkerClient:
             self.process.stdin.close()
         return self.process.wait(timeout=30)
 
+    # Kill the worker process and wait until it is gone.
     def terminate(self) -> None:
         self.process.kill()
         self.process.wait(timeout=30)
 
 
+# Provide a protocol client for a worker serving the fake server module; kill the worker afterwards
+# if it is still running.
 @pytest.fixture
 def worker(tmp_path):
     server_file = tmp_path / "protocol_suite" / "mcp-server.py"
@@ -144,10 +154,9 @@ def worker(tmp_path):
         client.terminate()
 
 
-# describe.
+# Describe operation
 
-
-# describe returns the server metadata and tool surface.
+# Verify that the describe operation returns the server id and name and the ids of its listed tools.
 def test_describe_returns_metadata_and_tools(worker):
     envelope = worker.request("describe")
 
@@ -159,19 +168,18 @@ def test_describe_returns_metadata_and_tools(worker):
     assert tool_ids == ["echo", "slow"]
 
 
-# supports.
+# Supports operation
 
-
-# supports gates engines through the server's own predicate.
+# Verify that the supports operation answers through the server's own predicate: true for
+# ollama-service and false for openai.
 def test_supports_respects_server_predicate(worker):
     assert worker.request("supports", {"engine": "ollama-service"})["result"] is True
     assert worker.request("supports", {"engine": "openai"})["result"] is False
 
 
-# Tool calls.
+# Tool calls
 
-
-# Sync handlers receive arguments and context.
+# Verify that a call to a sync handler passes both the arguments and the context to it.
 def test_call_executes_sync_handler_with_context(worker):
     envelope = worker.request(
         "call",
@@ -183,7 +191,7 @@ def test_call_executes_sync_handler_with_context(worker):
     assert envelope["result"]["chat_id"] == "chat-9"
 
 
-# Async handlers run through the worker's async runner.
+# Verify that a call to an async handler runs it and returns its result.
 def test_call_executes_async_handler(worker):
     envelope = worker.request(
         "call",
@@ -194,7 +202,8 @@ def test_call_executes_async_handler(worker):
     assert envelope["result"] == {"value": "async", "async": True}
 
 
-# Unregistered tools fall back to the generic dispatcher.
+# Verify that a call to a tool without a registered handler falls back to the server's call_tool
+# dispatcher.
 def test_call_falls_back_to_server_dispatcher(worker):
     envelope = worker.request("call", {"tool_id": "unregistered", "arguments": {}})
 
@@ -202,10 +211,10 @@ def test_call_falls_back_to_server_dispatcher(worker):
     assert envelope["result"] == {"tool_id": "unregistered", "via": "dispatcher"}
 
 
-# Error envelopes.
+# Error envelopes
 
-
-# Broken JSON lines answer with a structured error envelope.
+# Verify that a line that is not valid JSON is answered with an error envelope naming the JSON
+# decode error.
 def test_broken_json_line_returns_error_envelope(worker):
     envelope = worker.request("", raw="{not json")
 
@@ -213,7 +222,7 @@ def test_broken_json_line_returns_error_envelope(worker):
     assert "JSONDecodeError" in envelope["error"]
 
 
-# Unknown operations answer with a structured error envelope.
+# Verify that an unknown operation is answered with an error envelope.
 def test_unknown_operation_returns_error_envelope(worker):
     envelope = worker.request("teleport")
 
@@ -221,11 +230,10 @@ def test_unknown_operation_returns_error_envelope(worker):
     assert "Unknown worker operation" in envelope["error"]
 
 
-# Heartbeats.
+# Heartbeats
 
-
-# Long-running calls emit heartbeats so the parent can distinguish a busy
-# worker from a dead one.
+# Verify that a long-running call emits at least one heartbeat event before its answer, so the
+# parent can distinguish a busy worker from a dead one.
 def test_long_call_emits_heartbeats(worker):
     envelope, heartbeats = worker.call_collecting_heartbeats({"tool_id": "slow"})
 
@@ -234,18 +242,17 @@ def test_long_call_emits_heartbeats(worker):
     assert heartbeats >= 1, "expected at least one heartbeat during the 6s call"
 
 
-# Shutdown.
+# Shutdown
 
-
-# The worker shuts down cleanly on stdin EOF.
+# Verify that the worker exits with code 0 when its stdin is closed.
 def test_worker_exits_cleanly_on_stdin_close(worker):
     assert worker.close() == 0
 
 
-# One-shot mode.
+# One-shot mode
 
-
-# One-shot mode answers a single request from stdin.
+# Verify that the one-shot describe mode answers a single request read from stdin and exits with
+# code 0.
 def test_one_shot_describe(tmp_path):
     server_file = tmp_path / "one_shot" / "mcp-server.py"
     server_file.parent.mkdir(parents=True)
