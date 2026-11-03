@@ -4,6 +4,8 @@ import os
 import sys
 from pathlib import Path
 
+# Package root of mcp-sandbox; its sandbox source directory is put on sys.path and the host workspace is
+# set at import time so the sandbox package can be imported.
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 os.environ["SANDBOX_HOST_WORKSPACE"] = str(ROOT)
@@ -11,7 +13,7 @@ os.environ["SANDBOX_HOST_WORKSPACE"] = str(ROOT)
 from sandbox.intent import Intent, classify
 
 
-# All read-like commands classify as OPEN.
+# Verify that read-like commands (cat, head, tail, less, more, sed -n) classify as OPEN.
 def test_open_variants():
     cases = [
         "cat file.py",
@@ -27,7 +29,7 @@ def test_open_variants():
         assert nc.intent == Intent.OPEN, f"Expected OPEN for: {cmd}, got {nc.intent}"
 
 
-# head/tail/sed extract line ranges.
+# Verify that head -n and sed -n 'a,bp' yield the start and end line of the requested range.
 def test_open_line_ranges():
     nc = classify("head -n 30 file.py")
     assert nc.start_line == 1
@@ -38,8 +40,7 @@ def test_open_line_ranges():
     assert nc.end_line == 50, f"end_line={nc.end_line}"
 
 
-
-# All search commands classify as LOCATE.
+# Verify that search commands (grep, rg, egrep) classify as LOCATE with the expected pattern.
 def test_locate_variants():
     cases = [
         ("grep -r pattern .", "pattern"),
@@ -54,7 +55,7 @@ def test_locate_variants():
         assert nc.pattern == expected_pattern, f"Expected pattern={expected_pattern!r}, got {nc.pattern!r} for: {cmd}"
 
 
-# ls/tree/find classify as SURVEY.
+# Verify that ls, tree and find commands classify as SURVEY.
 def test_survey_variants():
     cases = ["ls .", "ls -la src/", "tree -L 2", "find . -name '*.py'"]
     for cmd in cases:
@@ -63,7 +64,7 @@ def test_survey_variants():
         assert nc.intent == Intent.SURVEY, f"Expected SURVEY for: {cmd}, got {nc.intent}"
 
 
-# cat file | head -n 20 → OPEN with line range.
+# Verify that `cat file | head -n 20` classifies as a compound OPEN of file.py ending at line 20.
 def test_compound_cat_head():
     nc = classify("cat file.py | head -n 20")
     assert nc is not None, "Got None for compound cat|head"
@@ -73,7 +74,7 @@ def test_compound_cat_head():
     assert nc.target == "file.py", f"Expected target=file.py, got {nc.target}"
 
 
-# cat file | grep pattern → LOCATE.
+# Verify that `cat file | grep pattern` classifies as a compound LOCATE of the pattern in file.py.
 def test_compound_cat_grep():
     nc = classify("cat file.py | grep pattern")
     assert nc is not None, "Got None for compound cat|grep"
@@ -83,7 +84,7 @@ def test_compound_cat_grep():
     assert nc.target == "file.py", f"Expected target=file.py, got {nc.target}"
 
 
-# head -n 50 file | grep pattern → LOCATE.
+# Verify that `head -n 50 file | grep pattern` classifies as a compound LOCATE.
 def test_compound_head_grep():
     nc = classify("head -n 50 file.py | grep pattern")
     assert nc is not None
@@ -91,7 +92,8 @@ def test_compound_head_grep():
     assert nc.was_compound is True
 
 
-# Execution commands return None (→ real bash).
+# Verify that execution commands (python, pytest, npm, git, curl, make, pip) are not classified as
+# OPEN/LOCATE/SURVEY: the result is None or RUN, so they reach real bash.
 def test_run_commands_return_none():
     run_cases = [
         "python script.py",
@@ -104,12 +106,14 @@ def test_run_commands_return_none():
     ]
     for cmd in run_cases:
         nc = classify(cmd)
+
         # These should either return None or Intent.RUN
         if nc is not None:
             assert nc.intent == Intent.RUN, f"Expected RUN for: {cmd}, got {nc.intent}"
 
 
-# &&, ||, ;, subshells, redirections → None (real bash).
+# Verify that commands with &&, ||, ;, subshells or redirections are not routed as OPEN/LOCATE/SURVEY, so
+# they reach real bash.
 def test_chains_return_none():
     chain_cases = [
         "echo hello && cat file.py",
@@ -121,6 +125,7 @@ def test_chains_return_none():
     ]
     for cmd in chain_cases:
         nc = classify(cmd)
+
         # These must not be routed as OPEN/LOCATE/SURVEY
         if nc is not None:
             assert nc.intent not in (Intent.OPEN, Intent.LOCATE, Intent.SURVEY), (
@@ -128,7 +133,7 @@ def test_chains_return_none():
             )
 
 
-# grep -i → case_sensitive=False.
+# Verify that grep -i produces a LOCATE with case_sensitive False.
 def test_locate_case_sensitivity():
     nc = classify("grep -ri pattern src/")
     assert nc is not None
@@ -136,7 +141,7 @@ def test_locate_case_sensitivity():
     assert nc.case_sensitive is False, "Expected case_sensitive=False"
 
 
-# rg --type py → glob_pattern=*.py.
+# Verify that `rg --type py` produces a LOCATE with the glob pattern *.py.
 def test_locate_rg_type_flag():
     nc = classify("rg pattern --type py src/")
     assert nc is not None
@@ -144,7 +149,8 @@ def test_locate_rg_type_flag():
     assert nc.glob_pattern == "*.py", f"Expected glob=*.py, got {nc.glob_pattern}"
 
 
-# find -name '*.py' -type f → NormalizedCommand with name_pattern/find_type.
+# Verify that find with -name, -type f and -maxdepth classifies as SURVEY carrying the name pattern, the
+# file type and the depth.
 def test_find_carries_name_and_type():
     nc = classify('find . -name "*.py" -type f -maxdepth 2')
     assert nc is not None, "find with supported flags should classify"
@@ -154,7 +160,7 @@ def test_find_carries_name_and_type():
     assert nc.depth == 2, f"depth={nc.depth!r}"
 
 
-# grep -C 2 pattern file → context_before/after = 2.
+# Verify that grep -C sets both context sizes, and that -A and -B set the lines after and before separately.
 def test_grep_context_carried():
     nc = classify("grep -C 2 pattern file.py")
     assert nc is not None
@@ -168,7 +174,7 @@ def test_grep_context_carried():
     assert nc.context_before == 1 and nc.context_after == 3
 
 
-# ls -la and combined short flags must enable include_hidden.
+# Verify that the ls flags -la, -al, -lah and -A all set include_hidden.
 def test_ls_la_includes_hidden():
     for cmd in ("ls -la", "ls -al", "ls -lah .", "ls -A"):
         nc = classify(cmd)
@@ -177,15 +183,17 @@ def test_ls_la_includes_hidden():
         assert nc.include_hidden is True, f"include_hidden False for: {cmd}"
 
 
-# du is NOT routed as a directory listing — must reach real bash.
+# Verify that du is not routed as a directory listing: the result is None or RUN, so it reaches real bash.
 def test_du_falls_through_to_bash():
     nc = classify("du -sh .")
+
     # Either None (no routing) or RUN intent — must not be SURVEY.
     if nc is not None:
         assert nc.intent == Intent.RUN, f"du routed as {nc.intent}"
 
 
-# find with -exec / -mtime / etc. must fall back to real bash.
+# Verify that find with unsupported flags (-exec, -mtime, -iname, -type l) is not routed: the result is
+# None or RUN, so it falls back to real bash.
 def test_find_unsupported_flags_fall_back():
     for cmd in (
         "find . -name '*.log' -exec rm {} ;",
@@ -198,18 +206,19 @@ def test_find_unsupported_flags_fall_back():
             assert nc.intent == Intent.RUN, f"{cmd!r} routed as {nc.intent}"
 
 
-# grep -l changes output format to filenames — not implemented, fall back to bash.
+# Verify that grep -l, which changes the output to file names and is not handled by the router, is not
+# routed: the result is None or RUN, so it falls back to real bash.
 def test_grep_files_with_matches():
     nc = classify("grep -l pattern src/")
+
     # -l/-L are not handled by the router, so classifier returns None → real bash
     if nc is not None:
         assert nc.intent == Intent.RUN
 
 
-# grep -v changes semantics — fall back to real bash.
+# Verify that the inverted grep -v, which changes the match semantics, is not routed: the result is None
+# or RUN, so it falls back to real bash.
 def test_grep_inverted_falls_back():
     nc = classify("grep -v pattern file.py")
     if nc is not None:
         assert nc.intent == Intent.RUN
-
-

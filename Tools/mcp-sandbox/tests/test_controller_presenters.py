@@ -8,8 +8,9 @@ from sandbox.controller import dispatch  # noqa: F401 - import must succeed
 from sandbox.presenters import present_grep_results, present_read_slice
 
 
+# Verify that present_read_slice output contains the file path, the [lines 1-1] window marker and the
+# content.
 @pytest.mark.unit
-# present_read_slice includes line window metadata in output.
 def test_present_read_slice_includes_line_window() -> None:
     text = present_read_slice(
         path="src/main.py",
@@ -24,8 +25,8 @@ def test_present_read_slice_includes_line_window() -> None:
     assert "print('hi')" in text
 
 
+# Verify that present_grep_results prints the searched pattern and each match as path:line:text.
 @pytest.mark.unit
-# present_grep_results formats match lines for display.
 def test_present_grep_results_formats_matches() -> None:
     text = present_grep_results(
         matches=[{"path": "a.py", "line_number": 3, "line": "needle"}],

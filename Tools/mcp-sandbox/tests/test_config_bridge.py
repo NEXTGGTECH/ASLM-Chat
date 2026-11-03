@@ -7,7 +7,8 @@ import json
 from sandbox.config_bridge import sync_sandbox_env
 
 
-# Generate active sandbox.env assignments from the intermediate JSON file.
+# Verify that sandbox.env is generated from the JSON file with active assignments for known keys
+# (booleans written as 0/1) and without unknown keys.
 def test_sync_sandbox_env_generates_active_assignments(tmp_path) -> None:
     json_path = tmp_path / "sandbox.json"
     env_path = tmp_path / "sandbox.env"
@@ -28,7 +29,7 @@ def test_sync_sandbox_env_generates_active_assignments(tmp_path) -> None:
     assert "IGNORED_VALUE" not in content
 
 
-# Remove stale generated ENV data when the JSON source no longer exists.
+# Verify that an existing sandbox.env is removed when the JSON source no longer exists.
 def test_sync_sandbox_env_removes_stale_env_without_json(tmp_path) -> None:
     json_path = tmp_path / "sandbox.json"
     env_path = tmp_path / "sandbox.env"
@@ -39,7 +40,7 @@ def test_sync_sandbox_env_removes_stale_env_without_json(tmp_path) -> None:
     assert not env_path.exists()
 
 
-# Avoid replacing sandbox.env when the generated content has not changed.
+# Verify that a second sync with unchanged JSON does not rewrite sandbox.env (its mtime stays the same).
 def test_sync_sandbox_env_keeps_unchanged_file(tmp_path) -> None:
     json_path = tmp_path / "sandbox.json"
     env_path = tmp_path / "sandbox.env"
