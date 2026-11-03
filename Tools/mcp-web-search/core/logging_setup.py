@@ -6,12 +6,12 @@ import logging
 import logging.handlers
 from pathlib import Path
 
-# Mirrors the legacy adapters/mcp/logging_setup.py: same format, same rotating files,
-# same logger names, so logs are byte-compatible with the old pipeline. Covers both the
-# web_search and read_page services plus the MCP adapter; serp_api/triage/health/quality
-# log under the `core` namespace and land in core.log via propagation.
+# Directory that holds the rotating log files (the logs folder next to the core package).
 _LOG_DIR = Path(__file__).resolve().parents[1] / "logs"
 
+# Logger name -> log file name. Covers the web_search and read_page services plus the MCP adapter;
+# serp_api/triage/health/quality log under the `core` namespace and land in core.log via
+# propagation.
 _SERVICE_LOGS: dict[str, str] = {
     "services.web_search": "web_search.log",
     "trace.web_search": "web_search_trace.log",
@@ -29,11 +29,14 @@ _SERVICE_LOGS: dict[str, str] = {
     "core": "core.log",
 }
 
+# Line and timestamp format shared by every log file.
 _FORMAT = "%(asctime)s [%(levelname)s] %(name)s - %(message)s"
 _DATE_FORMAT = "%Y-%m-%dT%H:%M:%S"
 
 
-# Configure rotating file handlers for every read_page service logger.
+# Attach a rotating file handler to every logger in _SERVICE_LOGS (idempotent: a logger that already
+# has one is left alone). Each logger stops propagating, so its lines do not reach the root console
+# handler.
 def setup_logging(
     log_dir: Path | None = None,
     level: int = logging.INFO,
@@ -49,9 +52,11 @@ def setup_logging(
         log = logging.getLogger(logger_name)
         log.setLevel(level)
 
+        # Skip loggers that were already configured by an earlier call.
         if any(isinstance(handler, logging.handlers.RotatingFileHandler) for handler in log.handlers):
             continue
 
+        # Write this logger to its own size-rotated file and keep it off the root handlers.
         handler = logging.handlers.RotatingFileHandler(
             target_dir / filename,
             encoding="utf-8",

@@ -16,16 +16,20 @@ logger = logging.getLogger("core.profiles.runtime")
 # Observations older than this are ignored when recommending a method, so a site that
 # changed its protection no longer pins read_page to a stale strategy.
 _TTL_SECONDS = 14 * 86_400
-# Recency half-life: a fortnight-old success counts half as much as a fresh one.
+
+# Recency half-life: a week-old success counts half as much as a fresh one.
 _HALFLIFE_SECONDS = 7 * 86_400
+
 # Below this many observations a recommendation is low-confidence (still usable as a hint).
 _MIN_OBS_FOR_CONFIDENCE = 2
+
 # A working method whose mean wall-clock fetch exceeds this is flagged avoid for fast paths.
 _AVOID_FETCH_MS = 12_000.0
+
 # A method that succeeds less than half the time is treated as unreliable.
 _MIN_SUCCESS_RATE = 0.5
 
-# --- domain reputation (negative trust, earned at runtime) ----------------------
+# Domain reputation (negative trust, earned at runtime).
 # Anti-recursion contract (do not weaken):
 #   * the table stores RAW event counters only — the penalty is computed at read time
 #     and never stored, so a penalty can never compound on top of itself;
@@ -34,15 +38,23 @@ _MIN_SUCCESS_RATE = 0.5
 #   * counters from a stale epoch (silent for _TTL_SECONDS) are reset on the next
 #     write, and the snapshot ignores domains without FRESH failures — a domain nobody
 #     re-observes simply ages out of the penalty set instead of rotting in it.
-_REP_TLS_MIN_FAILS = 2        # one broken handshake may be a transient network blip
-_REP_TLS_STEP = 0.10          # per TLS failure beyond the first
+# Penalty tuning. TLS: failures count from the second one on (one broken handshake may be a
+# transient network blip), each failure beyond the first adds _REP_TLS_STEP up to _REP_TLS_CAP.
+# Empty parses: the ratio needs _REP_EMPTY_MIN_ATTEMPTS samples to mean anything and adds at most
+# _REP_EMPTY_CAP. _REP_TOTAL_CAP is the hard ceiling for the combined penalty magnitude, a penalty
+# below _REP_MIN_PENALTY leaves the domain out of the snapshot, and _REP_PROVEN_PARSES recent
+# successful parses mark a domain proven.
+_REP_TLS_MIN_FAILS = 2
+_REP_TLS_STEP = 0.10
 _REP_TLS_CAP = 0.20
-_REP_EMPTY_MIN_ATTEMPTS = 3   # the empty-parse ratio needs a sample to mean anything
+_REP_EMPTY_MIN_ATTEMPTS = 3
 _REP_EMPTY_CAP = 0.15
-_REP_TOTAL_CAP = 0.25         # hard ceiling for the combined penalty magnitude
-_REP_MIN_PENALTY = 0.02       # below this the domain is left out of the snapshot
-_REP_PROVEN_PARSES = 2        # recent successful parses that mark a domain proven
+_REP_TOTAL_CAP = 0.25
+_REP_MIN_PENALTY = 0.02
+_REP_PROVEN_PARSES = 2
 
+# SQLite schema: `domain_reputation` holds the raw trust counters per domain, `domain_methods`
+# the rolling fetch statistics per (domain, method).
 _SCHEMA_SQL = """
 PRAGMA journal_mode=WAL;
 
@@ -78,7 +90,6 @@ CREATE INDEX IF NOT EXISTS idx_dm_domain ON domain_methods(domain);
 # Learns, per (domain, fetch-method), how reliable and how fast each approach is, so
 # read_page can pick a known-good method up front instead of probing a fallback chain.
 class RuntimeDomainProfiles:
-
     # Open the SQLite store and apply the schema.
     def __init__(self, db_path: str) -> None:
         self._db_path = db_path
@@ -93,8 +104,11 @@ class RuntimeDomainProfiles:
         if conn is None:
             conn = sqlite3.connect(self._db_path, check_same_thread=False, timeout=10)
             conn.row_factory = sqlite3.Row
+
+            # WAL mode; keep the -wal file at most 8 MiB (truncated after a checkpoint); wait up
+            # to 5 s on a locked database.
             conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA journal_size_limit=8388608")  # 8 MiB — truncate -wal after checkpoint
+            conn.execute("PRAGMA journal_size_limit=8388608")
             conn.execute("PRAGMA busy_timeout=5000")
             self._local.conn = conn
         return conn
@@ -114,6 +128,9 @@ class RuntimeDomainProfiles:
         if not domain or not attempt.method:
             return
         now = time.time()
+
+        # Upsert the (domain, method) row: the first observation inserts it, later ones add
+        # their counters and timings to the running sums. A database error is only logged.
         try:
             with self._write_lock:
                 conn = self._get_conn()
@@ -171,6 +188,9 @@ class RuntimeDomainProfiles:
         now = time.time()
         stale_before = now - _TTL_SECONDS
         failed = tls_failed or parse_empty
+
+        # Upsert the domain row. Counters of a stale epoch (no event within the TTL) restart
+        # from zero before the new event is added. A database error is only logged.
         try:
             with self._write_lock:
                 conn = self._get_conn()
@@ -210,6 +230,9 @@ class RuntimeDomainProfiles:
     def reputation_snapshot(self) -> ReputationSnapshot:
         now = time.time()
         cutoff = now - _TTL_SECONDS
+
+        # Load the domains with any event inside the TTL; on a database error return an empty
+        # snapshot.
         try:
             rows = self._get_conn().execute(
                 "SELECT * FROM domain_reputation WHERE MAX(last_fail, last_ok) > ?",
@@ -219,6 +242,7 @@ class RuntimeDomainProfiles:
             logger.warning("runtime_profiles: reputation snapshot failed: %s", exc)
             return ReputationSnapshot(penalties={}, proven=frozenset())
 
+        # Per domain: mark proven domains, then compute the decayed penalty from fresh failures.
         penalties: dict[str, float] = {}
         proven: set[str] = set()
         for row in rows:
@@ -231,14 +255,18 @@ class RuntimeDomainProfiles:
 
             if parse_ok >= _REP_PROVEN_PARSES and last_ok > cutoff:
                 proven.add(domain)
+
+            # No fresh failures means no penalty, whatever the history says.
             if last_fail <= cutoff:
-                continue  # no fresh failures → no penalty, whatever the history says
+                continue
 
             penalty = 0.0
+
             # TLS: needs repeat failures AND no success since — a host that recovered
             # (or renewed its certificate) sheds the penalty on the first good fetch.
             if tls_fail >= _REP_TLS_MIN_FAILS and last_fail > last_ok:
                 penalty += min(_REP_TLS_CAP, _REP_TLS_STEP * (tls_fail - 1))
+
             # Systematic empty parses: ratio-based so successes offset failures; scales
             # 0 → cap as the empty share climbs from ½ to 1.
             attempts = parse_ok + parse_empty
@@ -246,6 +274,8 @@ class RuntimeDomainProfiles:
                 empty_share = parse_empty / attempts
                 if empty_share > 0.5:
                     penalty += _REP_EMPTY_CAP * (empty_share - 0.5) * 2.0
+
+            # Cap the total, fade it with the age of the last failure, and drop negligible ones.
             decay = 0.5 ** ((now - last_fail) / _HALFLIFE_SECONDS)
             penalty = min(_REP_TOTAL_CAP, penalty) * decay
             if penalty >= _REP_MIN_PENALTY:
@@ -261,6 +291,7 @@ class RuntimeDomainProfiles:
 
         override = get_override(domain)
 
+        # Load the learned statistics of the domain; a database error counts as no data.
         try:
             rows = self._get_conn().execute(
                 "SELECT * FROM domain_methods WHERE domain = ?", (domain,)
@@ -269,6 +300,7 @@ class RuntimeDomainProfiles:
             logger.warning("runtime_profiles: lookup failed domain=%r: %s", domain, exc)
             rows = []
 
+        # Pick the best method among those that succeeded at least once within the TTL.
         now = time.time()
         best: ProfileHint | None = None
         best_rank: tuple[float, float] = (-1.0, 0.0)
@@ -286,6 +318,7 @@ class RuntimeDomainProfiles:
             avg_fetch_ms = float(row["sum_fetch_ms"] or 0.0) / obs
             avg_quality = float(row["sum_quality"] or 0.0) / obs
             confidence = success_rate * decay * min(1.0, obs / _MIN_OBS_FOR_CONFIDENCE)
+
             # Rank by reliability first, then prefer the cheaper method.
             rank = (round(success_rate * decay, 4), -avg_fetch_ms)
             if rank > best_rank:
@@ -310,15 +343,16 @@ class RuntimeDomainProfiles:
         return best
 
 
+# The shared store, created on first use by get_runtime_profiles().
 _store: RuntimeDomainProfiles | None = None
 
-# Runtime DB lives beside the page cache under the server root's _cache/ directory.
 from pathlib import Path  # noqa: E402
 
+# Runtime DB lives beside the page cache under the server root's _cache/ directory.
 _DB_PATH = Path(__file__).resolve().parents[2] / "_cache" / "domain_runtime.db"
 
 
-# Shared RuntimeDomainProfiles singleton.
+# Return the shared RuntimeDomainProfiles singleton, creating it on first use.
 def get_runtime_profiles() -> RuntimeDomainProfiles:
     global _store
     if _store is None:

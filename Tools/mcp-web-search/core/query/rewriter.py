@@ -1,26 +1,5 @@
 # Copyright NEXTGGTECH. Elastic License 2.0.
 
-"""Optional LLM query rewriter: turn conversational model "thoughts" into search queries.
-
-Models routinely write conversational requests into the search field ("where can I
-see how people make those charts") instead of effective query terms. When enabled,
-each incoming query string is treated as raw intent and rewritten by a subagent call:
-a local model with a CLEAN context — only the machine-format instruction — returns one
-small JSON object with plain search terms.
-
-The subagent always follows the active chat model: engine + model come from
-Tools/model_runtime_metadata.json (written by the chat on model selection) and the
-endpoint is resolved by the module's shared settings reader (including environment
-overrides and defaults).
-
-Design constraints:
-- Fail-open: any error, timeout or malformed reply returns the input unchanged. The
-  rewriter must never break a search that would have worked without it.
-- Heuristic gate: only conversational-looking strings pay the rewrite latency; a clean
-  3-word query passes through untouched.
-- TTL cache: identical thoughts are rewritten once.
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -38,6 +17,9 @@ from core.config import load_search_config
 
 logger = logging.getLogger("mcp.web_search.rewriter")
 
+# System prompt of the rewriter subagent: a CLEAN context with only the machine-format instruction.
+# The model must judge first (approve an already clean query unchanged) and otherwise reply with
+# one small JSON object holding plain search terms.
 REWRITER_SYSTEM_PROMPT = """You convert a researcher's raw thoughts into web-search queries.
 First JUDGE the input: if it is already a clean, focused search query, APPROVE it —
 return exactly that query, unchanged, as the single element of "queries". Never
@@ -50,18 +32,24 @@ pick the vertical honestly.
 Output ONLY one JSON object, nothing else:
 {"queries": ["...", "..."], "vertical": "web|academic|shopping", "language": "ru|en|..."}"""
 
+# TTL cache of rewrites, so identical thoughts are rewritten once: (target, text) -> (variants,
+# expiry on the monotonic clock, rewritten flag). The lock guards it; the flag makes the
+# "no active model" warning appear only once per process.
 _CACHE_TTL_SECONDS = 3600.0
 _cache: dict[tuple[RewriterTarget, str], tuple[list[str], float, bool]] = {}
 _cache_lock = asyncio.Lock()
 _warned_no_target = False
 
-_TOOL_ROOT = Path(__file__).resolve().parents[2]  # .../Tools/mcp-web-search
+# The mcp-web-search tool root, and the Tools/model_runtime_metadata.json file that the chat writes
+# on model selection (it names the active engine and model).
+_TOOL_ROOT = Path(__file__).resolve().parents[2]
 _RUNTIME_METADATA_FILE = _TOOL_ROOT.parent / "model_runtime_metadata.json"
 
 
+# Load the shared settings reader (Settings/settings.py) by path, so it works even in the isolated
+# tool environment where the project package is not importable.
 @lru_cache(maxsize=1)
 def _project_settings():
-    """Load the shared settings reader even in the isolated tool environment."""
     path = _TOOL_ROOT.parents[1] / "Settings" / "settings.py"
     spec = importlib.util.spec_from_file_location("aslm_rewriter_settings", path)
     module = importlib.util.module_from_spec(spec)
@@ -69,20 +57,23 @@ def _project_settings():
     return module
 
 
+# Return the project settings with the engine URLs resolved to full addresses.
 def _load_engine_settings() -> dict[str, Any]:
     settings = _project_settings()
     values = dict(settings.load_settings())
+
     # Stored addresses omit schemes; the shared resolver restores HTTP/HTTPS.
     for engine in ("lms", "openai", "google-genai"):
         values[f"{engine.replace('-', '_')}_url"] = settings.get_engine_url(engine)
     return values
 
 
+# Cheap per-call view of the query rewriter config, loaded fresh on every call and clamped to
+# sane minimums.
 class RewriterConfigSnapshot:
-    """Cheap per-call view of the rewriter config (loaded fresh each call)."""
-
     __slots__ = ("enabled", "timeout_seconds", "max_queries", "mode", "markers")
 
+    # Read the query_rewriter section of the search config.
     def __init__(self) -> None:
         section = load_search_config().query_rewriter
         self.enabled = bool(section.enabled)
@@ -92,26 +83,26 @@ class RewriterConfigSnapshot:
         self.markers = tuple(section.conversational_markers)
 
 
+# One resolved subagent endpoint: how and where to call the model. The flavor is "ollama" (native
+# /api/chat) or "openai" (/chat/completions); api_key is empty when the endpoint needs none.
 class RewriterTarget(NamedTuple):
-    """One resolved subagent endpoint: how and where to call the model."""
-
-    flavor: str  # "ollama" native /api/chat or "openai" /chat/completions
+    flavor: str
     url: str
     model: str
     api_key: str
 
 
+# Return True when the token equals the stem, or starts with it for stems of 4+ characters.
 def _token_hits_stem(token: str, stem: str) -> bool:
     return token == stem or (len(stem) >= 4 and token.startswith(stem))
 
 
+# Heuristic gate: return True when the string reads like a thought rather than a search query
+# (6+ words, a question mark, or 3+ words with a word that matches a marker stem).
+# Markers are deployment-configured (search_config.json -> query_rewriter.conversational_markers);
+# there are NO built-in marker lists, and an empty marker set disables the marker check, so only the
+# length and question mark rules apply.
 def looks_conversational(query: str, markers: tuple[str, ...] = ()) -> bool:
-    """Heuristic: does this string read like a thought rather than a search query?
-
-    Word-stem match over deployment-configured `markers` (search_config.json ->
-    query_rewriter.conversational_markers). There are NO built-in marker lists:
-    an empty marker set disables the gate entirely, making heuristic mode behave
-    like always (the model judges every query)."""
     text = str(query or "").strip()
     words = text.split()
     if len(words) >= 6:
@@ -127,10 +118,12 @@ def looks_conversational(query: str, markers: tuple[str, ...] = ()) -> bool:
     ) and len(words) >= 3
 
 
+# Read a JSON file, tolerating a UTF-8 byte order mark.
 def _read_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8-sig"))
 
 
+# Normalize a stored address into an http base URL without a trailing slash (empty when blank).
 def _http_base(raw: Any) -> str:
     base = str(raw or "").strip().rstrip("/")
     if not base:
@@ -140,12 +133,17 @@ def _http_base(raw: Any) -> str:
     return base
 
 
+# Append the OpenAI-compatible chat completions path to a base URL, avoiding a doubled /v1.
 def _chat_completions_url(base: str) -> str:
     return base + ("/chat/completions" if base.endswith("/v1") else "/v1/chat/completions")
 
 
+# Resolve the active chat model (engine + model from the runtime metadata file) into a callable
+# endpoint. The subagent always follows the active chat model; the endpoint comes from the shared
+# settings reader (including environment overrides and defaults). Return None when no active
+# model is recorded, the engine is unsupported, or a required URL or API key is missing.
 def _runtime_target() -> RewriterTarget | None:
-    """Resolve the active chat model into a callable endpoint. None when unknown."""
+    # Read which engine and model the chat has active.
     try:
         metadata = _read_json(_RUNTIME_METADATA_FILE)
         active = metadata.get("active") if isinstance(metadata, dict) else None
@@ -162,6 +160,7 @@ def _runtime_target() -> RewriterTarget | None:
     except (OSError, ValueError):
         engine_settings = {}
 
+    # Build the endpoint for each supported engine.
     if engine == "ollama-service":
         try:
             port = int(engine_settings.get("ollama-service_port") or 20003)
@@ -195,8 +194,9 @@ def _runtime_target() -> RewriterTarget | None:
     return None
 
 
+# Extract the JSON object from a model reply that may wrap it in prose or code fences. Raise
+# ValueError when the reply holds no JSON object.
 def _parse_model_reply(content: Any) -> dict[str, Any]:
-    """Extract the JSON object from a model reply that may wrap it in prose or fences."""
     text = str(content or "").strip()
     start, end = text.find("{"), text.rfind("}")
     if start < 0 or end <= start:
@@ -207,7 +207,10 @@ def _parse_model_reply(content: Any) -> dict[str, Any]:
     return parsed
 
 
+# Ask the subagent model to rewrite one thought and return its cleaned list of search queries.
+# Raise on transport errors and on a malformed reply, so callers can fail open.
 async def _call_model(target: RewriterTarget, timeout_seconds: float, thought: str) -> list[str]:
+    # Send the system prompt and the thought; no environment proxies, key only when the target has one.
     payload: dict[str, Any] = {
         "model": target.model,
         "stream": False,
@@ -221,12 +224,16 @@ async def _call_model(target: RewriterTarget, timeout_seconds: float, thought: s
         response = await client.post(target.url, json=payload)
         response.raise_for_status()
         data = response.json()
+
+    # Pull the message text out of the flavor-specific response shape.
     if target.flavor == "ollama":
         content = ((data.get("message") or {}).get("content")) if isinstance(data, dict) else None
     else:
         choices = data.get("choices") if isinstance(data, dict) else None
         message = (choices[0].get("message") if choices else None) or {}
         content = message.get("content")
+
+    # Validate the JSON reply and keep only non-empty string queries with collapsed whitespace.
     parsed = _parse_model_reply(content)
     raw_queries = parsed.get("queries")
     if not isinstance(raw_queries, list):
@@ -239,16 +246,26 @@ async def _call_model(target: RewriterTarget, timeout_seconds: float, thought: s
     return queries
 
 
+# Rewrite one conversational thought into a search query and return (query_to_search,
+# rewritten_flag). Models routinely write conversational requests into the search field instead of
+# effective query terms; when enabled, the query is treated as raw intent and rewritten by a
+# local subagent model. Design constraints:
+# - Fail-open: any error, timeout or malformed reply returns the input unchanged, so the rewriter
+#   never breaks a search that would have worked without it.
+# - Heuristic gate: in heuristic mode only conversational-looking strings pay the rewrite latency.
+# - TTL cache: identical thoughts are rewritten once.
 async def rewrite_query(query: str) -> tuple[str, bool]:
-    """Rewrite one thought; returns (query_to_search, rewritten_flag). Fail-open."""
     global _warned_no_target
     config = RewriterConfigSnapshot()
     text = " ".join(str(query or "").split())
+
+    # Skip when disabled, empty, or (in heuristic mode) not conversational.
     if not config.enabled or not text:
         return text or query, False
     if config.mode == "heuristic" and not looks_conversational(text, config.markers):
         return text, False
 
+    # Resolve the active model; without one the query passes through (warn once).
     target = _runtime_target()
     if target is None:
         if not _warned_no_target:
@@ -260,12 +277,14 @@ async def rewrite_query(query: str) -> tuple[str, bool]:
             )
         return text, False
 
+    # Serve a fresh cached rewrite when there is one.
     cache_key = (target, text)
     async with _cache_lock:
         cached = _cache.get(cache_key)
         if cached and cached[1] > time.monotonic():
             return cached[0][0], cached[2]
 
+    # Ask the model, failing open to the original query.
     started = time.perf_counter()
     try:
         rewritten = (await _call_model(target, config.timeout_seconds, text))[: config.max_queries]
@@ -287,6 +306,7 @@ async def rewrite_query(query: str) -> tuple[str, bool]:
         )
         return text, False
 
+    # Cache the rewrite and use its first variant.
     async with _cache_lock:
         _cache[cache_key] = (rewritten, time.monotonic() + _CACHE_TTL_SECONDS, True)
     logger.info(
@@ -294,28 +314,35 @@ async def rewrite_query(query: str) -> tuple[str, bool]:
         text[:80], rewritten, target.flavor, target.model,
         time.perf_counter() - started,
     )
+
     # The first clean variant replaces the thought; multi-variant fan-out for a
     # single incoming query is handled by expanded_queries() at the call site.
     return rewritten[0], True
 
 
+# Rewrite a whole query list concurrently and return (queries, any_rewritten).
 async def rewrite_queries(queries: list[str]) -> tuple[list[str], bool]:
-    """Rewrite a whole query list concurrently; returns (queries, any_rewritten)."""
     if not queries:
         return queries, False
     results = await asyncio.gather(*(rewrite_query(q) for q in queries))
     return [item[0] for item in results], any(item[1] for item in results)
 
 
+# Return all rewritten variants of a query (including a single variant) for fan-out, or None when
+# the rewrite is skipped, approved unchanged, or fails. Follows the same gate, cache and fail-open
+# rules as rewrite_query.
 async def expanded_queries(query: str) -> list[str] | None:
-    """Return rewritten variants, including a single variant, or None on skip/failure."""
     global _warned_no_target
     config = RewriterConfigSnapshot()
     text = " ".join(str(query or "").split())
+
+    # Skip when disabled, empty, or (in heuristic mode) not conversational.
     if not config.enabled or not text:
         return None
     if config.mode == "heuristic" and not looks_conversational(text, config.markers):
         return None
+
+    # Resolve the active model; without one there is nothing to expand (warn once).
     target = _runtime_target()
     if target is None:
         if not _warned_no_target:
@@ -324,11 +351,15 @@ async def expanded_queries(query: str) -> list[str] | None:
                 "query rewriter enabled but no model to call — queries pass through unchanged",
             )
         return None
+
+    # Serve a fresh cached rewrite when there is one.
     cache_key = (target, text)
     async with _cache_lock:
         cached = _cache.get(cache_key)
         if cached and cached[1] > time.monotonic():
             return list(cached[0])
+
+    # Ask the model, failing open (None) on any error.
     try:
         rewritten = (await _call_model(target, config.timeout_seconds, text))[: config.max_queries]
     except Exception as exc:  # noqa: BLE001 — fail-open is the contract
@@ -339,9 +370,12 @@ async def expanded_queries(query: str) -> list[str] | None:
         return None
     if not rewritten:
         return None
+
     # Approval (single variant equal to the input): no fan-out, the query stands.
     if len(rewritten) == 1 and rewritten[0] == text:
         return None
+
+    # Cache and return all variants.
     async with _cache_lock:
         _cache[cache_key] = (rewritten, time.monotonic() + _CACHE_TTL_SECONDS, True)
     logger.info("query rewriter fan-out: %r -> %r", text[:80], rewritten)

@@ -1,7 +1,5 @@
 # Copyright NEXTGGTECH. Elastic License 2.0.
 
-"""Strict, deterministic preparation of advanced web-search plans."""
-
 from __future__ import annotations
 
 import datetime as dt
@@ -18,6 +16,7 @@ from core.query.operators import (
 from core.search.query_dates import resolve_query_dates
 
 
+# Maximum number of queries and maximum words per query, by vertical.
 VERTICAL_QUERY_LIMITS = {
     "web": 3,
     "shopping": 3,
@@ -30,14 +29,24 @@ VERTICAL_WORD_LIMITS = {
     "academic": 8,
     "onion": 7,
 }
+
+# Limits of an advanced plan: queries per batch, characters of a compiled query, characters of the
+# UI-only call description.
 ADVANCED_BATCH_LIMIT = 3
 COMPILED_QUERY_LIMIT = 512
 DESCRIPTION_LIMIT = 80
+
+# Allowed effort levels, and the verticals that are always available (onion needs Tor enabled).
 _EFFORTS = ("low", "medium", "high")
 _BASE_VERTICALS = ("web", "academic", "shopping")
+
+# Operator keys, and the operator specs that take a plain list or a list of alternative groups.
 _OPERATOR_KEYS = tuple(SEARCH_OPERATOR_BY_KEY)
 _LIST_SPECS = tuple(spec for spec in SEARCH_OPERATOR_SPECS if spec.value_kind == "list")
 _GROUP_SPECS = tuple(spec for spec in SEARCH_OPERATOR_SPECS if spec.value_kind == "groups")
+
+# Patterns: whitespace runs, a fully qualified domain name (at most 253 characters, labels of at most
+# 63), and a file extension of 1-12 letters or digits.
 _SPACE_RE = re.compile(r"\s+")
 _DOMAIN_RE = re.compile(
     r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
@@ -46,18 +55,22 @@ _DOMAIN_RE = re.compile(
 )
 _FILETYPE_RE = re.compile(r"^[a-z0-9]{1,12}$", re.IGNORECASE)
 
-class PlanValidationError(ValueError):
-    """One or more structural problems in an advanced search plan."""
 
+# Error raised for one or more structural problems in an advanced search plan; issues holds the
+# {path, message} entries.
+class PlanValidationError(ValueError):
+    # Keep the issue list and raise with the fixed INVALID_SEARCH_PLAN code.
     def __init__(self, issues: list[dict[str, str]]):
         self.issues = issues
         super().__init__("INVALID_SEARCH_PLAN")
 
 
+# Collapse all whitespace (including newlines) to single spaces and trim the text.
 def _clean_text(value: Any) -> str:
     return _SPACE_RE.sub(" ", str(value or "").replace("\r", " ").replace("\n", " ")).strip()
 
 
+# Build the JSON Schema of a non-empty string with a length limit and an optional word limit.
 def _string_schema(
     description: str,
     *,
@@ -78,8 +91,13 @@ def _string_schema(
     return schema
 
 
+# Build the JSON Schema of the advanced search tool arguments: a required call_description, one
+# property per vertical (a query string or an array of them, with per-vertical word limits) and an
+# effort level. The onion vertical is included only when Tor is enabled.
 def build_advanced_search_schema(*, tor_enabled: bool = False) -> dict[str, Any]:
     verticals = [*_BASE_VERTICALS, *(("onion",) if tor_enabled else ())]
+
+    # Model-facing guidance on when each vertical must (or must not) be used.
     vertical_descriptions = {
         "web": (
             "Official, independent, community, reporting, measurement, and general web evidence. "
@@ -96,6 +114,8 @@ def build_advanced_search_schema(*, tor_enabled: bool = False) -> dict[str, Any]
         ),
         "onion": "Censorship-resistant onion sources over Tor when explicitly required.",
     }
+
+    # One schema property per vertical, each accepting a single query string or an array of them.
     vertical_properties: dict[str, Any] = {}
     for vertical in verticals:
         word_limit = VERTICAL_WORD_LIMITS[vertical]
@@ -122,6 +142,8 @@ def build_advanced_search_schema(*, tor_enabled: bool = False) -> dict[str, Any]
                 f"strings. The {word_limit}-word limit applies separately to each string."
             ),
         }
+
+    # Assemble the object schema around the call description, the verticals and the effort.
     return {
         "type": "object",
         "additionalProperties": False,
@@ -151,10 +173,13 @@ def build_advanced_search_schema(*, tor_enabled: bool = False) -> dict[str, Any]
     }
 
 
+# Record one validation problem at a JSON path.
 def _issue(issues: list[dict[str, str]], path: str, message: str) -> None:
     issues.append({"path": path, "message": message})
 
 
+# Reduce a URL or host to a bare IDNA-encoded domain without "www." and any port or path. Return an
+# empty string when the result is not a fully qualified domain.
 def _normalize_domain(value: str) -> str:
     raw = _clean_text(value).lower()
     if "://" in raw:
@@ -170,6 +195,9 @@ def _normalize_domain(value: str) -> str:
     return raw if _DOMAIN_RE.fullmatch(raw) else ""
 
 
+# Validate and normalize one list-valued operator: check the item count, text and length limits,
+# apply the spec's normalizer (domain or file extension) and drop case-insensitive duplicates.
+# Problems are appended to issues and the offending items are skipped.
 def _normalize_list(
     operators: dict[str, Any], spec: SearchOperatorSpec, path: str,
     issues: list[dict[str, str]],
@@ -182,6 +210,8 @@ def _normalize_list(
         return []
     if len(value) > spec.max_items:
         _issue(issues, path, f"must contain at most {spec.max_items} items")
+
+    # Check every item up to the limit; skip invalid ones and duplicates.
     output: list[str] = []
     seen: set[str] = set()
     for index, item in enumerate(value[:spec.max_items]):
@@ -196,6 +226,8 @@ def _normalize_list(
         if len(text) > spec.max_length:
             _issue(issues, item_path, f"must be at most {spec.max_length} characters")
             continue
+
+        # Apply the spec's normalizer.
         if spec.normalizer == "domain":
             text = _normalize_domain(text)
             if not text:
@@ -206,6 +238,8 @@ def _normalize_list(
             if not _FILETYPE_RE.fullmatch(text):
                 _issue(issues, item_path, "must be a file extension containing only letters or digits")
                 continue
+
+        # Keep the first occurrence of each case-insensitive value.
         marker = text.casefold()
         if marker not in seen:
             seen.add(marker)
@@ -213,6 +247,8 @@ def _normalize_list(
     return output
 
 
+# Validate a YYYY-MM-DD date value and return it in ISO form; an empty value gives an empty
+# string, and an invalid one records an issue and gives an empty string.
 def _normalize_date(value: Any, path: str, issues: list[dict[str, str]]) -> str:
     if value in (None, ""):
         return ""
@@ -228,6 +264,9 @@ def _normalize_date(value: Any, path: str, issues: list[dict[str, str]]) -> str:
     return parsed.isoformat()
 
 
+# Validate and normalize a group-valued operator (a list of alternative groups): each group needs
+# two to group_max_items distinct non-empty alternatives, and duplicate groups are dropped.
+# Problems are appended to issues and the offending items or groups are skipped.
 def _normalize_groups(
     operators: dict[str, Any], spec: SearchOperatorSpec, path: str,
     issues: list[dict[str, str]],
@@ -240,6 +279,8 @@ def _normalize_groups(
         return []
     if len(value) > spec.max_items:
         _issue(issues, path, f"must contain at most {spec.max_items} groups")
+
+    # Check every group up to the limit.
     output: list[list[str]] = []
     seen_groups: set[tuple[str, ...]] = set()
     for group_index, raw_group in enumerate(value[:spec.max_items]):
@@ -255,6 +296,8 @@ def _normalize_groups(
                 group_path,
                 f"must contain at most {spec.group_max_items} alternatives",
             )
+
+        # Collect the distinct, valid alternatives of this group.
         group: list[str] = []
         seen: set[str] = set()
         for item_index, item in enumerate(raw_group[:spec.group_max_items]):
@@ -273,6 +316,8 @@ def _normalize_groups(
             if marker not in seen:
                 seen.add(marker)
                 group.append(text)
+
+        # A group needs two distinct alternatives; skip groups already seen.
         if len(group) < 2:
             _issue(issues, group_path, "must contain two distinct alternatives")
             continue
@@ -283,15 +328,19 @@ def _normalize_groups(
     return output
 
 
+# Return the cleaned text wrapped in double quotes, with embedded quotes removed.
 def _quoted(value: str) -> str:
     return f'"{_clean_text(value).replace(chr(34), "")}"'
 
 
+# Return the cleaned text, quoted when it contains a space so it stays one search term.
 def _operator_value(value: str) -> str:
     clean = _clean_text(value).replace('"', "")
     return _quoted(clean) if " " in clean else clean
 
 
+# Join the rendered values with OR inside parentheses (a single value is returned bare, no values
+# give an empty string).
 def _or_group(values: list[str], render) -> str:
     rendered = [render(value) for value in values]
     if not rendered:
@@ -299,6 +348,8 @@ def _or_group(values: list[str], render) -> str:
     return rendered[0] if len(rendered) == 1 else f"({' OR '.join(rendered)})"
 
 
+# Compile one normalized operator value into its Google-style query text: a string for single-part
+# operators, a list of strings for operators that contribute several parts, or an empty string.
 def _compile_operator(spec: SearchOperatorSpec, value: Any) -> str | list[str]:
     if spec.value_kind == "date":
         return f"{spec.prefix}{value}" if value else ""
@@ -318,6 +369,8 @@ def _compile_operator(spec: SearchOperatorSpec, value: Any) -> str | list[str]:
     return ""
 
 
+# Compile the query text (with its year hint resolved by the query config) and the operators into
+# the canonical query string; return it with the time limit derived from the text, if any.
 def _compile_query(text: str, operators: dict[str, Any], qcfg: object) -> tuple[str, str | None]:
     clean_text, timelimit = resolve_query_dates(text, qcfg)
     parts = [clean_text]
@@ -330,6 +383,10 @@ def _compile_query(text: str, operators: dict[str, Any], qcfg: object) -> tuple[
     return " ".join(part for part in parts if part), timelimit
 
 
+# Validate and deterministically normalize one advanced search plan, or raise PlanValidationError
+# with every problem found. Return the canonical arguments (what the model effectively asked for),
+# the search request (description, effort and the prepared queries with their operators, compiled
+# query and time limit) and any warnings.
 def prepare_advanced_search(
     arguments: Any,
     *,
@@ -340,17 +397,18 @@ def prepare_advanced_search(
     allow_multiple_queries: bool = True,
     max_queries: int = ADVANCED_BATCH_LIMIT,
 ) -> dict[str, Any]:
-    """Validate and normalize one advanced plan, or raise PlanValidationError."""
-
     issues: list[dict[str, str]] = []
     if not isinstance(arguments, dict):
         raise PlanValidationError([{"path": "$", "message": "must be an object"}])
+
+    # Reject unknown top-level keys.
     allowed_verticals = [*_BASE_VERTICALS, *(("onion",) if tor_enabled else ())]
     allowed_root_keys = {"call_description", "effort", *allowed_verticals}
     unknown_root = sorted(set(arguments) - allowed_root_keys)
     for key in unknown_root:
         _issue(issues, f"$.{key}", "is not allowed in advanced mode")
 
+    # Validate the UI-only call description.
     raw_description = arguments.get("call_description")
     if not isinstance(raw_description, str):
         _issue(issues, "$.call_description", "must be a string")
@@ -364,6 +422,7 @@ def prepare_advanced_search(
             f"must be at most {DESCRIPTION_LIMIT} characters",
         )
 
+    # Validate the effort level; an invalid one is reported and replaced by medium.
     effort_value = arguments.get("effort", "medium")
     if not isinstance(effort_value, str):
         _issue(issues, "$.effort", "must be a string")
@@ -372,6 +431,7 @@ def prepare_advanced_search(
         _issue(issues, "$.effort", "must be one of low, medium, high")
         effort = "medium"
 
+    # Flatten the vertical properties into (vertical, raw query, JSON path) entries, expanding arrays.
     raw_queries: list[tuple[str, Any, str]] = []
     saw_vertical = False
     for key, raw_value in arguments.items():
@@ -400,6 +460,8 @@ def prepare_advanced_search(
         vertical_names = ", ".join(allowed_verticals)
         _issue(issues, "$", f"must include a query in one of: {vertical_names}")
 
+    # Enforce the batch rules: a single query when batching is off, one query at high effort (extra
+    # queries are dropped with a warning), and the maximum batch size otherwise.
     warnings: list[dict[str, str]] = []
     if not allow_multiple_queries and len(raw_queries) > 1:
         _issue(
@@ -426,8 +488,10 @@ def prepare_advanced_search(
             batch_message,
         )
 
+    # Prepare each query: unwrap its text and operators, validate them, and compile the final query.
     prepared_queries: list[dict[str, Any]] = []
     for vertical, raw_query, base_path in raw_queries:
+        # A query is a plain string, or (when allowed) an object with text and operators.
         structured_query = isinstance(raw_query, dict)
         if isinstance(raw_query, str):
             raw_text = raw_query
@@ -448,6 +512,8 @@ def prepare_advanced_search(
             _issue(issues, base_path, "must be a string")
             continue
 
+        # Validate the query text: non-empty, within the length limit and, for structured queries,
+        # free of operators (those belong in the operators object).
         if not isinstance(raw_text, str):
             _issue(issues, f"{base_path}.text", "must be a string")
         text = _clean_text(raw_text) if isinstance(raw_text, str) else ""
@@ -460,6 +526,7 @@ def prepare_advanced_search(
         elif structured_query and has_search_operators(text):
             _issue(issues, f"{base_path}.text", "must not contain recognized search operators")
 
+        # Enforce the per-vertical word limit, listing the numbered words so the model can trim them.
         if enforce_word_limits and text:
             words = text.split()
             word_count = len(words)
@@ -480,6 +547,7 @@ def prepare_advanced_search(
                     ),
                 )
 
+        # Validate the operators object and normalize each operator by its kind.
         if raw_operators in (None, ""):
             raw_operators = {}
         if not isinstance(raw_operators, dict):
@@ -501,6 +569,8 @@ def prepare_advanced_search(
             )
             if groups:
                 normalized_operators[spec.key] = groups
+
+        # Date bounds must be valid and ordered.
         after = _normalize_date(raw_operators.get("after"), f"{base_path}.operators.after", issues)
         before = _normalize_date(raw_operators.get("before"), f"{base_path}.operators.before", issues)
         if after:
@@ -510,6 +580,7 @@ def prepare_advanced_search(
         if after and before and after >= before:
             _issue(issues, f"{base_path}.operators", "after must be earlier than before")
 
+        # Compile the final query and keep it within the length limit.
         compiled_query, timelimit = _compile_query(text, normalized_operators, query_config)
         if len(compiled_query) > COMPILED_QUERY_LIMIT:
             _issue(
@@ -518,6 +589,7 @@ def prepare_advanced_search(
                 f"compiled query must be at most {COMPILED_QUERY_LIMIT} characters",
             )
 
+        # Record the prepared query.
         canonical_item: dict[str, Any] = {
             "vertical": vertical,
             "text": text,
@@ -535,6 +607,9 @@ def prepare_advanced_search(
 
     if issues:
         raise PlanValidationError(issues)
+
+    # Rebuild the canonical arguments from the compiled queries: one string per vertical, or an
+    # array when a vertical has several queries.
     canonical_arguments: dict[str, Any] = {"call_description": description}
     for query in prepared_queries:
         vertical = str(query.get("vertical") or "")
@@ -548,6 +623,7 @@ def prepare_advanced_search(
             canonical_arguments[vertical] = [existing, model_query]
     canonical_arguments["effort"] = effort
 
+    # Build the search request handed to the search pipeline.
     search_request: dict[str, Any] = {
         "schema_mode": "advanced",
         "description": description,

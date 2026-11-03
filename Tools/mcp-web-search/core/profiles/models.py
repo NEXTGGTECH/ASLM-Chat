@@ -48,14 +48,16 @@ class ProfileHint:
 # and overrides them while confidence is still low.
 @dataclass(frozen=True, slots=True)
 class DomainOverride:
-    required_method: str = ""      # force this fetch method (e.g. METHOD_BROWSER)
-    parsing_mode: str = ""         # e.g. "nextjs_rsc"
+    # Fetch method forced for the domain (e.g. METHOD_BROWSER).
+    required_method: str = ""
+    # Special page parsing mode (e.g. "nextjs_rsc").
+    parsing_mode: str = ""
     note: str = ""
 
 
 # Point-in-time view of learned domain trust, loaded once per search so triage scoring
 # stays I/O-free. penalties holds POSITIVE magnitudes (triage subtracts them, already
-# capped at write-out); proven lists domains with enough recent successful parses to be
+# capped when the snapshot is built); proven lists domains with enough recent successful parses to be
 # exempt from the unproven-TLD strict parse bar.
 @dataclass(frozen=True, slots=True)
 class ReputationSnapshot:

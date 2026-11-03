@@ -11,10 +11,12 @@ from .source_cache import CachedPage, SourceCache, canonicalize_url, content_has
 # Server root is two levels up from this file (core/cache/__init__.py).
 _CACHE_PATH = Path(__file__).resolve().parents[2] / "_cache" / "source_cache.db"
 
+# Lazily created page cache shared by every caller of get_page_cache().
 _page_cache: SourceCache | None = None
 
 
-# Shared SourceCache singleton for read_page (decoupled from the search pipeline).
+# Return the shared SourceCache singleton for read_page (decoupled from the search pipeline).
+# The TTL comes from the page_ttl_seconds cache setting.
 def get_page_cache() -> SourceCache:
     global _page_cache
     if _page_cache is None:
