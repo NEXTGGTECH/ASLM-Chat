@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 
+# System prompt used when the model only has to generate a short chat title.
 CHAT_TITLE_INSTRUCTIONS = """Mandatory rules for chat-title generation.
 TASK: You MUST generate exactly one title of 2-5 words describing the user's topic.
 LANGUAGE: You MUST use the same language the user writes in.
@@ -14,6 +15,7 @@ OUTPUT: You MUST return only the title on one plain-text line. Markdown, markup,
 """
 
 
+# Baseline instructions of every chat: tool use, file editing and communication style.
 BASE_INSTRUCTIONS = """You are an assistant that completes tasks using the tools provided in this conversation.
 
 Mandatory tool use:
@@ -59,6 +61,7 @@ Communication style rules:
 """
 
 
+# Web research instructions for models that think before answering.
 THINKING_SEARCH_INSTRUCTIONS = """Web research:
 - Search when a factual task needs external evidence; use specialized connected tools for tasks they support.
 - Read the supplied web_search schema. Normally send one focused query. Use a small batch only for independent questions.
@@ -69,6 +72,7 @@ THINKING_SEARCH_INSTRUCTIONS = """Web research:
 """
 
 
+# Web lookup instructions for the instant (no-thinking) mode, with a small search and read budget.
 INSTANT_SEARCH_INSTRUCTIONS = """Instant/no-thinking web lookup rules:
 - Use the supplied web_search schema: query is one focused string or up to three independent strings; description is a short UI label. Optional operators apply to all queries. Effort is fixed internally to low.
 - Use at most two searches and two page reads. Follow up only for a concrete gap, then answer from the collected evidence.
@@ -77,6 +81,7 @@ INSTANT_SEARCH_INSTRUCTIONS = """Instant/no-thinking web lookup rules:
 """
 
 
+# Closing part of the baseline prompt: citation handle rules and sandbox error handling rules.
 FINAL_INSTRUCTIONS = """Citation rules:
 - Cite only source handles available in the current answer/tool result context.
 - Do not reuse, quote, or continue citation handles from previous assistant messages; old handles are not available to the renderer and may be stripped instead of becoming links.
@@ -95,9 +100,10 @@ Sandbox agent behavior rules:
 """
 
 
+# Return whether generation runs in the instant (no-thinking) mode, resolved from the normalized
+# reasoning controls. The think level wins over the think flag; with neither set the model has no
+# reasoning controls and uses the instant mode.
 def is_instant_generation(think_value: Any, think_level_value: Any) -> bool:
-    """Resolve the backend generation mode from normalized reasoning controls."""
-
     disabled_values = {"", "0", "false", "off", "no", "none", "disabled"}
     if think_level_value is not None:
         return str(think_level_value).strip().lower() in disabled_values
@@ -105,13 +111,14 @@ def is_instant_generation(think_value: Any, think_level_value: Any) -> bool:
         if isinstance(think_value, bool):
             return not think_value
         return str(think_value).strip().lower() in disabled_values
+
     # Models without reasoning controls use the instant contract.
     return True
 
 
+# Return the complete baseline prompt for the selected generation mode: base, search and final
+# instructions joined by blank lines, with the search part chosen by the mode.
 def get_system_prompt(*, instant_mode: bool = False) -> str:
-    """Return the complete baseline prompt for the selected generation mode."""
-
     search_instructions = INSTANT_SEARCH_INSTRUCTIONS if instant_mode else THINKING_SEARCH_INSTRUCTIONS
     return "\n\n".join(
         section.strip()
