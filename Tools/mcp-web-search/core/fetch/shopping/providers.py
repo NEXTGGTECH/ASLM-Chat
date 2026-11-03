@@ -7,30 +7,40 @@ from typing import Callable
 from urllib.parse import quote, quote_plus
 
 
+# One shopping source: the lane it serves, how to build its search URL, how to fetch it
+# (`methods` in order of preference) and its failure policy (after `failure_threshold` failures it
+# sits out for `cooldown_sec`).
 @dataclass(frozen=True, slots=True)
 class ShoppingProvider:
     name: str
+    # Lane the provider serves: "primary" or "secondary".
     lane: str
+    # Build the search URL from the query.
     url_builder: Callable[[str], str]
+    # Currency assumed for prices that carry no currency marker.
     default_currency: str = ""
     methods: tuple[str, ...] = ("curl_cffi",)
     timeout_sec: float = 5.0
     cooldown_sec: float = 60.0
     failure_threshold: int = 2
+    # Ranking weight among providers of the same lane (higher is tried first).
     weight: float = 1.0
     notes: str = ""
     enabled: bool = True
     tags: tuple[str, ...] = field(default_factory=tuple)
 
 
+# URL-encode a query for a query-string value (spaces become "+").
 def _q(query: str) -> str:
     return quote_plus(query)
 
 
+# URL-encode a query for a path segment (everything escaped, including "/").
 def _path_q(query: str) -> str:
     return quote(query.strip(), safe="")
 
 
+# Every wired shopping provider, with the probe findings behind its settings in `notes`.
 PROVIDERS: tuple[ShoppingProvider, ...] = (
     ShoppingProvider(
         name="pricerunner",
@@ -139,13 +149,14 @@ PROVIDERS: tuple[ShoppingProvider, ...] = (
 )
 
 
+# Provider names per language (two-letter code) for each lane, in the order they are tried. Unknown
+# languages fall back to "en".
 PRIMARY_ROUTE_ORDER: dict[str, tuple[str, ...]] = {
     "ru": ("yandex_market", "ek_ua", "pricerunner"),
     "zh": ("chinandex", "aliexpress", "pricerunner"),
     "ja": ("kakaku", "pricerunner"),
     "en": ("pricerunner",),
 }
-
 SECONDARY_ROUTE_ORDER: dict[str, tuple[str, ...]] = {
     "ru": ("ek_ua", "chinandex", "aliexpress", "kakaku", "bing_shopping", "geizhals", "yandex_market"),
     "zh": ("aliexpress", "bing_shopping", "kakaku", "geizhals", "ek_ua", "yandex_market", "chinandex"),
@@ -154,11 +165,13 @@ SECONDARY_ROUTE_ORDER: dict[str, tuple[str, ...]] = {
 }
 
 
+# Reduce a language tag such as "ru-RU" to its lowercase primary subtag ("en" when empty).
 def _normalize_language(language: str | None) -> str:
     value = (language or "en").strip().lower()
     return value.split("-", 1)[0] or "en"
 
 
+# Return the provider names routed for a lane and language, or an empty tuple for an unknown lane.
 def _route_order_for_lane(lane: str, language: str | None) -> tuple[str, ...]:
     lang = _normalize_language(language)
     if lane == "primary":
@@ -168,6 +181,9 @@ def _route_order_for_lane(lane: str, language: str | None) -> tuple[str, ...]:
     return ()
 
 
+# Return the enabled providers for a lane in try order: first the language's routed providers
+# (re-labelled to this lane when they natively belong to the other one), then the remaining
+# providers of the lane by descending weight. A lane without a route is ordered by weight only.
 def providers_for_lane(lane: str, *, language: str | None = None) -> list[ShoppingProvider]:
     providers = [provider for provider in PROVIDERS if provider.enabled]
     route_order = _route_order_for_lane(lane, language)
@@ -175,12 +191,15 @@ def providers_for_lane(lane: str, *, language: str | None = None) -> list[Shoppi
         same_lane = [provider for provider in providers if provider.lane == lane]
         return sorted(same_lane, key=lambda provider: provider.weight, reverse=True)
 
+    # Routed providers first, in route order.
     by_name = {provider.name: provider for provider in providers}
     routed = [
         provider if provider.lane == lane else replace(provider, lane=lane)
         for name in route_order
         if (provider := by_name.get(name)) is not None
     ]
+
+    # Then the lane's remaining providers by weight.
     routed_names = {provider.name for provider in routed}
     rest = [
         provider

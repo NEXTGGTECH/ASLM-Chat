@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
+# One product offer normalized from any shopping provider.
 @dataclass(slots=True)
 class ShoppingProduct:
     id: str
@@ -29,6 +30,7 @@ class ShoppingProduct:
     meta: dict[str, Any] = field(default_factory=dict)
 
 
+# Telemetry for one provider fetch (method, timing, HTTP status, byte and product counts, errors).
 @dataclass(slots=True)
 class ShoppingProviderAttempt:
     provider: str
@@ -45,6 +47,8 @@ class ShoppingProviderAttempt:
     cooldown_sec: float = 0.0
 
 
+# Outcome of one shopping search: the merged products, the lane mix used, per-provider attempts,
+# provider cooldown state, timings and exchange rates, and whether the deadline cut it short.
 @dataclass(slots=True)
 class ShoppingSearchResult:
     query: str
