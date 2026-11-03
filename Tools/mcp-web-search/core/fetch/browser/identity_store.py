@@ -1,22 +1,5 @@
 # Copyright NEXTGGTECH. Elastic License 2.0.
 
-"""Persistent, family-keyed browser identity store.
-
-Holds the *earned* browser state — Playwright storageState (cookies + localStorage
-+ IndexedDB snapshot) — keyed by engine family, layered over the static personality
-from Stage A (UA/platform/locale, which is generated, not stored).
-
-Design (per the warm-browser contract, 2026-06-15):
-  * SQLite on disk, modelled on profiles/runtime_profiles.py — the warm daemon is the
-    primary writer (idle/recycle checkpoints); engine request builders read locally on
-    the hot path with no IPC; MCP-side Set-Cookie capture writes under the same lock.
-  * N most-recent *good* generations are kept per family. Memory/age recycle restores
-    the latest; a captcha/burn rotates to an older good generation (a poisoned state is
-    never the only backup), falling back to None → seed when none remain.
-  * Cookies are family-bound: callers ask for a family's cookies and only replay them
-    through that family's transport (mixing families is an anti-signal).
-"""
-
 from __future__ import annotations
 
 import json
@@ -38,8 +21,11 @@ _MAX_GENERATIONS = 5
 # them only for the session; we keep them across searches for continuity but let them age
 # out if not refreshed, so a stale session token isn't replayed forever. The clock is each
 # cookie's `updated` time, so any re-capture refreshes it.
-_SESSION_COOKIE_TTL = 6 * 3600.0  # 6 hours
+_SESSION_COOKIE_TTL = 6 * 3600.0
 
+# SQLite schema, executed statement by statement on startup: browser storageState generations
+# per family, cookies earned over HTTP per owner engine, and cookies imported from the user's
+# real browser per family.
 _SCHEMA_SQL = """
 PRAGMA journal_mode=WAL;
 
@@ -92,29 +78,44 @@ def _domain_matches(cookie_domain: str, host: str) -> bool:
     return h == cd or h.endswith("." + cd) or cd.endswith("." + h)
 
 
-# Persistent per-family storageState store with generational good/burn backups.
+# Persistent, family-keyed browser identity store: the earned browser state (Playwright
+# storageState with cookies, localStorage and IndexedDB snapshot) kept in SQLite, layered over
+# the generated, non-stored static personality (UA, platform, locale).
+# - The warm daemon is the primary writer (idle and recycle checkpoints); engine request builders
+#   read locally on the hot path with no IPC; MCP-side Set-Cookie capture writes under the same lock.
+# - The N most recent good generations are kept per family. A memory or age recycle restores the
+#   latest; a captcha burn rotates to an older good generation (a poisoned state is never the only
+#   backup), falling back to None (the seed) when none remain.
+# - Cookies are family-bound: callers ask for a family's cookies and replay them only through that
+#   family's transport, because mixing families is an anti-bot signal.
 class IdentityStore:
-
+    # Open (creating if needed) the SQLite database at db_path and ensure the schema exists.
+    # At least one generation is always retained per family.
     def __init__(self, db_path: str, *, max_generations: int = _MAX_GENERATIONS) -> None:
         self._db_path = db_path
         self._max_generations = max(1, int(max_generations))
+
+        # Each thread gets its own connection; the lock serializes all writers.
         self._local = threading.local()
         self._write_lock = threading.Lock()
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
-    # Per-thread persistent SQLite connection (WAL; readers never block the writer).
+    # Return the per-thread persistent SQLite connection (WAL; readers never block the writer).
     def _get_conn(self) -> sqlite3.Connection:
         conn = getattr(self._local, "conn", None)
         if conn is None:
             conn = sqlite3.connect(self._db_path, check_same_thread=False, timeout=10)
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA journal_size_limit=8388608")  # 8 MiB — truncate -wal after checkpoint
+
+            # Cap the WAL file at 8 MiB so it is truncated after a checkpoint.
+            conn.execute("PRAGMA journal_size_limit=8388608")
             conn.execute("PRAGMA busy_timeout=5000")
             self._local.conn = conn
         return conn
 
+    # Create the tables and indexes by running each statement of the schema script.
     def _init_db(self) -> None:
         with self._write_lock:
             conn = self._get_conn()
@@ -127,12 +128,16 @@ class IdentityStore:
     # good=False marks a checkpoint that should not be restored as-is (e.g. burned).
     def checkpoint(self, family: str, state: dict[str, Any], *, good: bool = True) -> int:
         family = (family or "").strip() or "default"
+
+        # Serialize the state; a state that cannot be encoded is skipped (-1) instead of raising.
         try:
             blob = json.dumps(state, ensure_ascii=False, default=str)
         except (TypeError, ValueError) as exc:
             logger.warning("identity_store: cannot serialise state for %r: %s", family, exc)
             return -1
         now = time.time()
+
+        # Insert the next generation number and prune old ones in a single transaction.
         with self._write_lock:
             conn = self._get_conn()
             try:
@@ -172,7 +177,8 @@ class IdentityStore:
                 [(family, g) for g in doomed],
             )
 
-    # Most-recent generation with the given good flag, as a parsed storageState dict.
+    # Return the most recent generation of a family as a parsed storageState dict; with
+    # good_only, burned generations are skipped. None when there is none or it is unreadable.
     def _fetch_state(self, family: str, *, good_only: bool) -> Optional[dict[str, Any]]:
         family = (family or "").strip() or "default"
         sql = "SELECT state FROM identity_generations WHERE family = ?"
@@ -222,7 +228,7 @@ class IdentityStore:
                 return None
         return self.latest_good(family)
 
-    # Cookies from the family's latest good state, optionally narrowed to a host.
+    # Return the cookies from the family's latest good state, optionally narrowed to a host.
     def cookies_for(self, family: str, *, host: str = "") -> list[dict[str, Any]]:
         state = self.latest_good(family)
         if not state:
@@ -232,7 +238,7 @@ class IdentityStore:
             return list(cookies)
         return [c for c in cookies if _domain_matches(str(c.get("domain", "")), host)]
 
-    # A ready "k=v; k2=v2" Cookie header for a host from the family's identity, or "".
+    # Return a ready "k=v; k2=v2" Cookie header for a host from the family's identity, or "".
     def cookie_header_for(self, family: str, host: str) -> str:
         pairs = [
             f"{c.get('name')}={c.get('value')}"
@@ -241,15 +247,15 @@ class IdentityStore:
         ]
         return "; ".join(pairs)
 
-    # ── HTTP-side cookie accumulation (Stage B transport half) ────────────────────────
-    # Separate from the browser storageState generations above: these are cookies an HTTP
-    # SERP engine earns itself (consent/region/session), keyed by the engine that owns the
-    # identity (e.g. "startpage"). The transport replays them on later requests and writes
-    # back captured Set-Cookie, so a logical engine accumulates one coherent cookie history
-    # across searches and restarts — the same continuity the warm browser gives, over HTTP.
+    # HTTP-side cookie accumulation
 
     # Merge captured Set-Cookie header lines for a host into the owner's cookie history.
     # A cookie with Max-Age<=0 (a deletion) removes the stored entry instead of adding it.
+    # This layer is separate from the browser storageState generations above: these are cookies
+    # an HTTP SERP engine earns itself (consent, region, session), keyed by the engine that owns
+    # the identity (e.g. "startpage"). The transport replays them on later requests and writes
+    # back captured Set-Cookie, so a logical engine accumulates one coherent cookie history
+    # across searches and restarts, the same continuity the warm browser gives, over HTTP.
     def merge_set_cookie(self, owner: str, host: str, set_cookie_headers: list[str]) -> None:
         owner = (owner or "").strip()
         if not owner or not set_cookie_headers:
@@ -257,6 +263,8 @@ class IdentityStore:
         now = time.time()
         upserts: list[tuple[str, str, str, str, float, float]] = []
         deletes: list[tuple[str, str, str]] = []
+
+        # Parse every header into upserts (with an absolute expiry) or deletes (Max-Age<=0).
         for raw in set_cookie_headers:
             try:
                 jar: SimpleCookie = SimpleCookie()
@@ -276,10 +284,13 @@ class IdentityStore:
                         continue
                     expires = now + age if age is not None else 0.0
                 else:
+                    # Session cookie: expires 0 means it ages out by the sliding session TTL.
                     expires = 0.0
                 upserts.append((owner, domain, name, morsel.value, expires, now))
         if not upserts and not deletes:
             return
+
+        # Apply the deletes and upserts in one transaction.
         with self._write_lock:
             conn = self._get_conn()
             try:
@@ -298,7 +309,7 @@ class IdentityStore:
             except sqlite3.DatabaseError as exc:
                 logger.warning("identity_store: cookie merge failed for %r: %s", owner, exc)
 
-    # The owner's non-expired cookies for a host as {name: value} (newest write wins).
+    # Return the owner's non-expired cookies for a host as {name: value} (newest write wins).
     def http_cookies_map(self, owner: str, host: str) -> dict[str, str]:
         owner = (owner or "").strip()
         if not owner or not host:
@@ -317,15 +328,17 @@ class IdentityStore:
         for row in rows:
             expires = row["expires"]
             if expires:
-                if expires < now:  # explicit expiry passed
+                # An explicit expiry that has passed.
+                if expires < now:
                     continue
-            elif (now - float(row["updated"])) > _SESSION_COOKIE_TTL:  # stale session cookie
+            elif (now - float(row["updated"])) > _SESSION_COOKIE_TTL:
+                # A session cookie that was not refreshed within the sliding TTL.
                 continue
             if _domain_matches(str(row["domain"]), host):
                 out[str(row["name"])] = str(row["value"])
         return out
 
-    # A ready "k=v; ..." Cookie header for a host from the owner's HTTP cookie history.
+    # Return a ready "k=v; ..." Cookie header for a host from the owner's HTTP cookie history.
     def http_cookie_header(self, owner: str, host: str) -> str:
         return "; ".join(f"{n}={v}" for n, v in self.http_cookies_map(owner, host).items())
 
@@ -336,6 +349,8 @@ class IdentityStore:
         owner = (owner or "").strip()
         if not owner or not host:
             return 0
+
+        # Read the owner's cookies and pick those whose domain matches the host.
         try:
             rows = self._get_conn().execute(
                 "SELECT domain, name FROM http_cookies WHERE owner = ?", (owner,)
@@ -350,6 +365,8 @@ class IdentityStore:
         ]
         if not doomed:
             return 0
+
+        # Delete them in one transaction and report how many were removed.
         with self._write_lock:
             conn = self._get_conn()
             try:
@@ -363,16 +380,17 @@ class IdentityStore:
                 return 0
         return len(doomed)
 
-    # ── Imported-browser cookie layer (opt-in profile import) ─────────────────────────
-    # A third, family-keyed layer, distinct from the warm-browser generations (rotated) and
-    # the per-engine http_cookies (self-earned). These are cookies imported wholesale from the
-    # user's REAL browser (chromium ← Chrome/Edge/Brave, firefox ← Firefox). Replayed by the
-    # transport for that family and used to seed the warm browser. A re-import replaces the
-    # family's set so stale sessions don't accumulate; disabling the feature clears it.
+    # Imported browser cookies
 
-    # Replace (or, with replace=False, merge) a family's imported cookies. `cookies` is a list
-    # of dicts/objects exposing domain/name/value(/path/expires/secure). Within one batch the
-    # FIRST occurrence of a (domain,name) wins, so callers pass default-browser cookies first.
+    # Replace (or, with replace=False, merge) a family's imported cookies and return how many
+    # were stored. `cookies` is a list of dicts/objects exposing domain/name/value(/path/expires/
+    # secure). Within one batch the FIRST occurrence of a (domain,name) wins, so callers pass
+    # default-browser cookies first. This is a third, family-keyed layer, distinct from the
+    # rotated warm-browser generations and the self-earned per-engine http_cookies: the cookies
+    # are imported wholesale from the user's REAL browser (chromium from Chrome/Edge/Brave,
+    # firefox from Firefox), replayed by the transport for that family and used to seed the warm
+    # browser. A re-import replaces the family's set so stale sessions do not accumulate, and
+    # disabling the feature clears it.
     def import_cookies(
         self, family: str, cookies: list[Any], *, source: str = "", replace: bool = True
     ) -> int:
@@ -380,6 +398,8 @@ class IdentityStore:
         now = time.time()
         seen: set[tuple[str, str]] = set()
         rows: list[tuple[str, str, str, str, str, float, int, str, float]] = []
+
+        # Normalize the cookies into rows, skipping nameless ones and duplicates.
         for c in cookies:
             domain = str(_attr(c, "domain") or "").strip()
             name = str(_attr(c, "name") or "").strip()
@@ -402,6 +422,8 @@ class IdentityStore:
                     now,
                 )
             )
+
+        # Write the batch in one transaction, clearing the family's old set first when replacing.
         with self._write_lock:
             conn = self._get_conn()
             try:
@@ -420,8 +442,8 @@ class IdentityStore:
                 return 0
         return len(rows)
 
-    # The family's non-expired imported cookies, host-filtered, in storageState cookie shape
-    # (name/value/domain/path/secure) for seeding a Playwright context.
+    # Return the family's non-expired imported cookies, host-filtered, in storageState cookie
+    # shape (name/value/domain/path/secure) for seeding a Playwright context.
     def imported_cookies_for(self, family: str, *, host: str = "") -> list[dict[str, Any]]:
         rows = self._imported_rows(family)
         out: list[dict[str, Any]] = []
@@ -439,7 +461,7 @@ class IdentityStore:
             )
         return out
 
-    # The family's non-expired imported cookies for a host as {name: value} (transport replay).
+    # Return the family's non-expired imported cookies for a host as {name: value} (transport replay).
     def imported_cookies_map(self, family: str, host: str) -> dict[str, str]:
         if not host:
             return {}
@@ -449,7 +471,8 @@ class IdentityStore:
                 out[str(row["name"])] = str(row["value"])
         return out
 
-    # Non-expired imported rows for a family (expires>0 in the past → dropped; 0 = session, kept).
+    # Return the non-expired imported rows for a family (expires>0 in the past is dropped;
+    # 0 means a session cookie and is kept).
     def _imported_rows(self, family: str) -> list[sqlite3.Row]:
         family = (family or "").strip() or "default"
         now = time.time()
@@ -480,7 +503,8 @@ class IdentityStore:
             except sqlite3.DatabaseError as exc:
                 logger.warning("identity_store: clear_imported failed: %s", exc)
 
-    # Most-recent import time across all families (0 when nothing imported) — the refresh clock.
+    # Return the seconds since the most recent import across all families (infinity when nothing
+    # is imported or the read fails); callers use it as the refresh clock.
     def imported_age_seconds(self) -> float:
         try:
             row = self._get_conn().execute(
@@ -500,16 +524,19 @@ def _attr(obj: Any, key: str) -> Any:
     return getattr(obj, key, None)
 
 
+# Process-wide IdentityStore singleton and the lock guarding its lazy creation.
 _store: Optional[IdentityStore] = None
 _store_lock = threading.Lock()
 
+# Location of the identity database inside the web search _cache directory.
 _DB_PATH = Path(__file__).resolve().parents[3] / "_cache" / "browser_identity.db"
 
 
-# Lazily-initialised process-wide IdentityStore singleton.
+# Return the lazily-initialised process-wide IdentityStore singleton.
 def get_identity_store() -> IdentityStore:
     global _store
     if _store is None:
+        # Double-checked locking: re-test under the lock so only one thread creates the store.
         with _store_lock:
             if _store is None:
                 _store = IdentityStore(str(_DB_PATH))

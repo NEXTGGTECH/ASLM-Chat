@@ -1,23 +1,5 @@
 # Copyright NEXTGGTECH. Elastic License 2.0.
 
-"""Persistent, supervised warm-browser daemon (chromium / cloakbrowser only).
-
-Keeps one stealth Chromium warm in-process and serves page fetches over a small HTTP
-API, so callers pay the cold-start cost once. Chromium-only by design — it is the sole
-browser backend in web search.
-
-Supervision (the part the original throwaway prototype lacked):
-  * one identity context seeded from the IdentityStore on launch (earned cookies /
-    storageState carry across restarts);
-  * idle checkpoints — every checkpoint_interval, if no fetch is in flight and the
-    state is dirty, export storageState back to the store;
-  * recycle on request-count / age / RSS of the browser process tree, each preceded by
-    a forced checkpoint; a burn (blocked streak) rotates identity instead of restoring.
-
-Run:
-  python -m core.fetch.browser.daemon --port 20010
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -31,10 +13,12 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 from urllib.parse import unquote, urlparse
 
+# Make the web search root importable when the daemon runs as a standalone module.
 _ROOT = Path(__file__).resolve().parents[3]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+# Force UTF-8 on stdout so non-ASCII page text in console output cannot raise encoding errors.
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
@@ -47,6 +31,7 @@ from core.logging_setup import setup_logging
 
 logger = logging.getLogger("core.fetch.browser.daemon")
 
+# Minimum visible text the page wait expects, and minimum HTML size of a usable scrape.
 _MIN_TEXT_CHARS = 200
 _MIN_HTML_CHARS = 200
 
@@ -55,13 +40,18 @@ _MIN_HTML_CHARS = 200
 # title() and page.close() are not, and a pathological page (infinite script, beforeunload
 # dialog, wedged renderer) can otherwise hang them indefinitely while holding the fetch
 # lock — stalling the whole daemon. These caps guarantee the lock is released and the
-# browser recycled instead of sleeping forever on a dead crawl.
-_EXTRACT_TIMEOUT = 15.0   # content + evaluate + title combined
-_CLOSE_TIMEOUT = 5.0      # closing one page
-_TEARDOWN_TIMEOUT = 10.0  # closing the context/browser during recycle/shutdown
+# browser recycled instead of sleeping forever on a dead crawl. The extract cap covers
+# content + evaluate + title combined, the close cap covers closing one page, and the
+# teardown cap covers closing the context/browser during recycle/shutdown.
+_EXTRACT_TIMEOUT = 15.0
+_CLOSE_TIMEOUT = 5.0
+_TEARDOWN_TIMEOUT = 10.0
+
 # Consecutive blocked fetches that flip a recycle from "restore" to "rotate identity".
 _BURN_STREAK = 3
 
+
+# Fetch results
 
 # Why the warm browser was torn down — drives whether identity is restored or rotated.
 class RecycleReason:
@@ -75,7 +65,8 @@ class RecycleReason:
 @dataclass
 class ScrapeResult:
     url: str
-    status: str = "error"      # ok | blocked | timeout | error
+    # One of: ok | blocked | timeout | error.
+    status: str = "error"
     ok: bool = False
     title: str = ""
     html: str = ""
@@ -85,7 +76,10 @@ class ScrapeResult:
     error: str = ""
 
 
-# Parse a proxy URL into the cloakbrowser shape.
+# Process helpers
+
+# Validate a proxy URL for cloakbrowser: return it unchanged when it has a scheme and a host,
+# otherwise None.
 def _parse_proxy(proxy_url: str | None) -> Optional[str]:
     if not proxy_url:
         return None
@@ -95,7 +89,8 @@ def _parse_proxy(proxy_url: str | None) -> Optional[str]:
     return proxy_url
 
 
-# Resident memory of this process plus its children (the chromium tree), in MB.
+# Return the resident memory of this process plus its children (the chromium tree), in MB.
+# Returns 0.0 when psutil is missing or the measurement fails, which disables the RSS recycle.
 def _process_tree_rss_mb() -> float:
     try:
         import psutil
@@ -108,6 +103,7 @@ def _process_tree_rss_mb() -> float:
             try:
                 total += child.memory_info().rss
             except Exception:  # noqa: BLE001
+                # A child can exit between listing and measuring; skip it.
                 continue
         return total / (1024 * 1024)
     except Exception as exc:  # noqa: BLE001
@@ -115,10 +111,20 @@ def _process_tree_rss_mb() -> float:
         return 0.0
 
 
+# Warm browser
+
 # One warm Chromium with its identity context, recycle policy and checkpoint discipline.
+# Supervision:
+# - one identity context seeded from the IdentityStore on launch (earned cookies /
+#   storageState carry across restarts);
+# - idle checkpoints: every checkpoint_interval, if no fetch is in flight and the state is
+#   dirty, storageState is exported back to the store;
+# - recycle on request count, age or RSS of the browser process tree, each preceded by a
+#   forced checkpoint; a burn (blocked streak) rotates identity instead of restoring it.
 class WarmChromium:
     name = "chromium"
 
+    # Store the launch, recycle and checkpoint settings; the browser itself starts lazily.
     def __init__(
         self,
         *,
@@ -135,6 +141,7 @@ class WarmChromium:
         nav_timeout: float = 30.0,
         wait: float = 3.0,
     ) -> None:
+        # Launch and recycle settings, clamped to sane minimums.
         self._identity = identity
         self._family = family
         self.headless = headless
@@ -148,6 +155,9 @@ class WarmChromium:
         self.nav_timeout = max(1.0, float(nav_timeout))
         self.wait = max(0.0, float(wait))
 
+        # Runtime state of the current browser generation. The lock serializes fetches with
+        # recycles and checkpoints; _dirty marks state changed since the last checkpoint and
+        # _wedged marks a hung page/close that forces a clean respawn.
         self._lock = asyncio.Lock()
         self._browser: Any | None = None
         self._context: Any | None = None
@@ -158,12 +168,12 @@ class WarmChromium:
         self._total = 0
         self._recycles = 0
         self._blocked_streak = 0
-        self._dirty = False              # state changed since last checkpoint
+        self._dirty = False
         self._inflight = 0
-        self._wedged = False             # a page/close hung → force a clean respawn
+        self._wedged = False
         self._checkpoint_task: asyncio.Task | None = None
 
-    # ── lifecycle ────────────────────────────────────────────────────────────────
+    # Lifecycle
 
     # Launch chromium and open a context seeded with the family's latest good identity.
     async def _open(self) -> None:
@@ -182,16 +192,19 @@ class WarmChromium:
         except Exception:  # noqa: BLE001 — fall back to the default context if seeding fails
             context = await browser.new_context()
 
+        # Close the context and then the browser of this generation.
         async def _close() -> None:
             # Bound both closes: a wedged browser must not make teardown hang forever (that
             # would defeat the recycle path it is supposed to enable).
             try:
                 await asyncio.wait_for(context.close(), timeout=_TEARDOWN_TIMEOUT)
             except Exception:  # noqa: BLE001
+                # Teardown is best-effort; the browser close below still runs.
                 pass
             try:
                 await asyncio.wait_for(browser.close(), timeout=_TEARDOWN_TIMEOUT)
             except Exception:  # noqa: BLE001
+                # A browser that cannot close in time is abandoned; the next launch starts fresh.
                 pass
 
         self._browser, self._context, self._teardown = browser, context, _close
@@ -199,7 +212,7 @@ class WarmChromium:
         self._requests = 0
         self._dirty = False
 
-    # Launch if down.
+    # Launch the browser if it is not running.
     async def _ensure(self) -> None:
         if self._browser is None:
             await self._open()
@@ -224,6 +237,7 @@ class WarmChromium:
             try:
                 await self._teardown()
             except Exception:  # noqa: BLE001
+                # A failed teardown still drops the references so the next fetch relaunches.
                 pass
         self._browser = self._context = self._teardown = None
 
@@ -254,7 +268,7 @@ class WarmChromium:
         self._blocked_streak = 0
         await self._open()
 
-    # ── fetch ────────────────────────────────────────────────────────────────────
+    # Fetching
 
     # Open a page, navigate, wait for content to settle, and scrape it.
     async def _scrape(self, url: str, *, wait: float, nav_timeout: float) -> ScrapeResult:
@@ -270,8 +284,8 @@ class WarmChromium:
                 except Exception:  # noqa: BLE001
                     await asyncio.sleep(min(wait, 1.5))
 
-            # content()/evaluate()/title() have no native timeout — cap them so a wedged
-            # renderer can't hold the fetch lock indefinitely.
+            # Read the page HTML, visible text and title. These calls have no native timeout,
+            # so the caller caps them to keep a wedged renderer from holding the fetch lock.
             async def _extract() -> tuple[str, str, str]:
                 html = await page.content()
                 text = await page.evaluate("document.body ? document.body.innerText : ''") or ""
@@ -288,6 +302,7 @@ class WarmChromium:
             except Exception:  # noqa: BLE001
                 self._wedged = True
 
+        # Classify the scrape: too little HTML, an anti-bot page, or a usable result.
         if len(html) < _MIN_HTML_CHARS:
             return ScrapeResult(url=url, status="error", error="insufficient HTML")
         if is_antibot(html):
@@ -299,11 +314,14 @@ class WarmChromium:
                     nav_timeout: float | None = None) -> ScrapeResult:
         t0 = time.perf_counter()
         async with self._lock:
+            # Recycle before the fetch when a threshold was crossed, then make sure a browser runs.
             reason = self._recycle_reason()
             if reason is not None:
                 await self._recycle(reason)
             await self._ensure()
             self._inflight += 1
+
+            # Scrape the page; a timeout or crash becomes an error result instead of an exception.
             try:
                 result = await self._scrape(
                     url,
@@ -317,6 +335,7 @@ class WarmChromium:
                 result = ScrapeResult(url=url, status="error", error=f"{type(exc).__name__}: {exc}")
             finally:
                 self._inflight -= 1
+
                 # A hung page/close left the browser in an unknown state — tear it down now
                 # (bounded) so the next fetch respawns clean instead of inheriting the wedge.
                 # A wedge is a page fault, NOT a poisoned identity: the cookies/storage are
@@ -327,6 +346,8 @@ class WarmChromium:
                 if self._wedged:
                     self._wedged = False
                     await self._shutdown_browser(checkpoint=True, good=True)
+
+            # Update the recycle counters; only consecutive blocked results build a burn streak.
             self._requests += 1
             self._total += 1
             self._last_used = time.monotonic()
@@ -335,7 +356,7 @@ class WarmChromium:
         result.ms = round((time.perf_counter() - t0) * 1000, 1)
         return result
 
-    # ── supervision ────────────────────────────────────────────────────────────────
+    # Supervision
 
     # Eagerly warm the browser and start the idle-checkpoint loop.
     async def start(self) -> None:
@@ -353,20 +374,22 @@ class WarmChromium:
                         if self._inflight == 0 and self._dirty:
                             await self._checkpoint(good=True)
         except asyncio.CancelledError:
+            # stop() cancels the loop; cancellation is the normal way out.
             pass
 
-    # Final checkpoint, stop the loop, tear the browser down.
+    # Stop the checkpoint loop, then take a final checkpoint and tear the browser down.
     async def stop(self) -> None:
         if self._checkpoint_task is not None:
             self._checkpoint_task.cancel()
             try:
                 await self._checkpoint_task
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                # The loop is being shut down; its cancellation or last error is irrelevant now.
                 pass
         async with self._lock:
             await self._shutdown_browser(checkpoint=True, good=True)
 
-    # Runtime snapshot for /health.
+    # Return the runtime snapshot served by /health.
     def health(self) -> dict[str, Any]:
         now = time.monotonic()
         return {
@@ -385,9 +408,12 @@ class WarmChromium:
         }
 
 
-# ── HTTP API ──────────────────────────────────────────────────────────────────────
+# HTTP API
 
+# Small HTTP server around one warm Chromium, so callers pay the browser cold-start cost
+# once. Chromium-only by design: it is the sole browser backend in web search.
 class BrowserDaemon:
+    # Create the warm browser from the command line settings; nothing launches until start().
     def __init__(self, args: argparse.Namespace) -> None:
         self.browser = WarmChromium(
             identity=get_identity_store(),
@@ -407,6 +433,7 @@ class BrowserDaemon:
         self._started_at = time.monotonic()
         self._idle_task: asyncio.Task | None = None
 
+    # Warm the browser and, when an idle limit is set, start the idle shutdown monitor.
     async def start(self) -> None:
         logger.info("daemon starting chromium ...")
         await self.browser.start()
@@ -426,8 +453,10 @@ class BrowserDaemon:
                     self._stop_event.set()
                     return
         except asyncio.CancelledError:
+            # stop() cancels the monitor; cancellation is the normal way out.
             pass
 
+    # Stop the idle monitor and shut the warm browser down.
     async def stop(self) -> None:
         if self._idle_task is not None:
             self._idle_task.cancel()
@@ -455,13 +484,16 @@ class BrowserDaemon:
             payload.pop("html", None)
         return web.json_response(payload, status=200 if result.ok else 502)
 
+    # GET /health -> runtime snapshot of the warm browser.
     async def handle_health(self, _request: web.Request) -> web.Response:
         return web.json_response({"engines": [self.browser.health()]})
 
+    # POST /shutdown -> ask the serve loop to stop.
     async def handle_shutdown(self, _request: web.Request) -> web.Response:
         self._stop_event.set()
         return web.json_response({"stopping": True})
 
+    # Build the aiohttp application with the fetch, health and shutdown routes.
     def make_app(self) -> web.Application:
         app = web.Application(client_max_size=16 * 1024 * 1024)
         app.add_routes([
@@ -472,20 +504,29 @@ class BrowserDaemon:
         return app
 
 
+# Entry point
+
+# Run the daemon: warm the browser, serve the HTTP API until a shutdown request, idle timeout
+# or Ctrl+C, then stop cleanly.
 async def _serve(args: argparse.Namespace) -> None:
-    setup_logging()  # the daemon is windowless when autostarted — logs must go to a file
+    # The daemon is windowless when autostarted — logs must go to a file.
+    setup_logging()
+
     # Reap browser temp profiles orphaned by earlier killed/crashed daemons before launching
     # our own (off the event loop — rmtree over many dirs can stall).
     try:
         await asyncio.get_running_loop().run_in_executor(None, sweep_stale_browser_temp)
     except Exception as exc:  # noqa: BLE001 — janitor must never block startup
         logger.debug("temp janitor at startup failed: %s", exc)
+
+    # Warm the browser before the port opens, so the first fetch does not pay the launch cost.
     daemon = BrowserDaemon(args)
     idle = f"idle-shutdown={args.idle_shutdown_sec:.0f}s" if args.idle_shutdown_sec > 0 else "eternal"
     logger.info("warm browser daemon: chromium headless=%s proxy=%s %s",
                 args.headless, "yes" if args.proxy else "no", idle)
     await daemon.start()
 
+    # Serve until the stop event fires, then stop the browser and the server.
     runner = web.AppRunner(daemon.make_app())
     await runner.setup()
     site = web.TCPSite(runner, args.host, args.port)
@@ -494,6 +535,7 @@ async def _serve(args: argparse.Namespace) -> None:
     try:
         await daemon._stop_event.wait()
     except (KeyboardInterrupt, asyncio.CancelledError):
+        # Ctrl+C and task cancellation are normal stop signals; cleanup runs below.
         pass
     finally:
         logger.info("daemon stopping ...")
@@ -501,6 +543,7 @@ async def _serve(args: argparse.Namespace) -> None:
         await runner.cleanup()
 
 
+# Parse the command line; defaults come from the browser section of the search config.
 def _parse_args() -> argparse.Namespace:
     from core.config import load_search_config
 
@@ -525,6 +568,7 @@ def _parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+# Run: python -m core.fetch.browser.daemon --port 20010
 if __name__ == "__main__":
     from core.runtime import run_fast
 

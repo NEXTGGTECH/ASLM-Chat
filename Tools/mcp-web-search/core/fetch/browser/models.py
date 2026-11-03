@@ -1,12 +1,5 @@
 # Copyright NEXTGGTECH. Elastic License 2.0.
 
-"""Shared data shapes for the warm-browser layer.
-
-BrowserFetch is the single outcome type every caller depends on. Mirrors the
-daemon's wire payload (core/fetch/browser/daemon.py ScrapeResult) so the HTTP client
-can build one from a JSON body verbatim.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -21,7 +14,10 @@ STATUS_ERROR = "error"
 STATUS_UNAVAILABLE = "unavailable"
 
 
-# Outcome of one page fetch through the warm browser daemon.
+# Outcome of one page fetch through the warm browser daemon. It is the single outcome type
+# every caller depends on and mirrors the daemon's wire payload (daemon.py ScrapeResult), so
+# the HTTP client can build one from a JSON body verbatim. The engine field names the browser
+# that served the page (chromium for the warm daemon); status holds one of the STATUS_* values.
 @dataclass(slots=True)
 class BrowserFetch:
     url: str
@@ -29,7 +25,7 @@ class BrowserFetch:
     html: str = ""
     text: str = ""
     title: str = ""
-    engine: str = ""          # chromium (warm daemon)
+    engine: str = ""
     backend: str = "warm"
     ms: float = 0.0
     error: str = ""

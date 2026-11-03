@@ -1,25 +1,5 @@
 # Copyright NEXTGGTECH. Elastic License 2.0.
 
-"""Reaper for orphaned browser temp profiles.
-
-Each ``chromium.launch()`` (cloakbrowser → playwright) spins up a throwaway
-user-data-dir under the system temp dir — ``playwright_chromiumdev_profile-*``,
-plus ``playwright-artifacts-*`` and Chromium's own ``scoped_dir*``. Playwright
-removes them on a clean ``browser.close()``, but a force-killed or crashed daemon
-(Windows pythonw kill, RSS-recycle crash, idle teardown that never runs) leaks the
-whole profile — each one ~120+ files of stale disk cache that never goes away.
-
-Over a long-lived deployment those orphans pile into the "million broken cache
-files" the temp dir fills with. The daemon owns the browser lifecycle, so it sweeps
-them on startup and after each recycle.
-
-Safety: only dirs whose mtime is older than ``max_age_sec`` are touched, and the age
-threshold is kept above the daemon's idle-shutdown window so a *live* profile is
-never a candidate (it is either freshly written or the daemon has already exited).
-Removal is best-effort per dir — a still-locked dir (held by a running browser) makes
-rmtree raise, and we skip it rather than deleting files out from under it.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -42,16 +22,28 @@ _LEAK_PREFIXES = (
 _MAX_AGE_SEC = 3600.0
 
 
-# Remove orphaned browser temp profiles older than max_age_sec. Returns the count reaped.
+# Remove orphaned browser temp profiles older than max_age_sec and return the count reaped.
+# Every chromium launch (cloakbrowser, playwright) creates a throwaway user-data-dir under the
+# system temp dir. Playwright removes it on a clean close, but a force-killed or crashed daemon
+# leaks the whole profile (~120+ files of stale disk cache), and over a long-lived deployment
+# those orphans pile up. The daemon owns the browser lifecycle, so it sweeps on startup.
+# Safety: only dirs whose mtime is older than max_age_sec are touched, and the default age is
+# kept above the daemon's idle-shutdown window, so a live profile is never a candidate. Removal
+# is best-effort per dir: a still-locked dir makes rmtree raise and is skipped rather than
+# deleted out from under a running browser.
 def sweep_stale_browser_temp(max_age_sec: float = _MAX_AGE_SEC) -> int:
     root = Path(tempfile.gettempdir())
     now = time.time()
     reaped = 0
+
+    # List the temp dir; if it cannot be read there is nothing to sweep.
     try:
         entries = list(root.iterdir())
     except OSError as exc:
         logger.debug("temp janitor: cannot list %s: %s", root, exc)
         return 0
+
+    # Reap every leaked browser dir that is old enough.
     for entry in entries:
         name = entry.name
         if not entry.is_dir() or not name.startswith(_LEAK_PREFIXES):
@@ -59,11 +51,16 @@ def sweep_stale_browser_temp(max_age_sec: float = _MAX_AGE_SEC) -> int:
         try:
             age = now - entry.stat().st_mtime
         except OSError:
+            # The dir vanished or is unreadable; leave it alone.
             continue
+
+        # Too fresh: it could belong to a live browser.
         if age < max_age_sec:
-            continue  # too fresh — could belong to a live browser
+            continue
+
+        # rmtree raises if any file is locked (a live profile), in which case the dir is skipped.
         try:
-            shutil.rmtree(entry)  # raises if any file is locked (live profile) → skip
+            shutil.rmtree(entry)
         except OSError as exc:
             logger.debug("temp janitor: skip locked/partial %s: %s", name, exc)
             continue
