@@ -18,30 +18,30 @@ def _title_chunks(*parts: str):
     return iter([{"message": {"role": "assistant", "content": part}} for part in parts])
 
 
-# Engine module resolution.
+# Engine module resolution
 
-
-# Engine aliases resolve to their adapter modules.
+# Verify that engine aliases resolve to their adapter modules.
 def test_engine_aliases_resolve_to_adapter_modules():
     assert llm_api._get_engine_module("ollama").__name__ == "API.ollama"
     assert llm_api._get_engine_module("gemini").__name__ == "API.google_genai"
     assert llm_api._get_engine_module("lm-studio").__name__ == "API.lms"
 
 
-# Unknown engines fail with a clear error.
+# Verify that an unknown engine fails with an "Unsupported LLM engine" ValueError.
 def test_unknown_engine_raises_value_error():
     with pytest.raises(ValueError, match="Unsupported LLM engine"):
         llm_api._get_engine_module("not-an-engine")
 
 
-# Call dispatching.
+# Call dispatching
 
-
-# generate forwards model, messages, and kwargs to the adapter.
+# Verify that generate forwards the model name, messages and keyword arguments to the adapter module and returns
+# its chunks.
 def test_generate_forwards_to_adapter_module():
     adapter = SimpleNamespace()
     captured = {}
 
+    # Record the received arguments and return one assistant chunk.
     def fake_generate(model_name, messages, **kwargs):
         captured["model_name"] = model_name
         captured["messages"] = messages
@@ -60,7 +60,7 @@ def test_generate_forwards_to_adapter_module():
     assert captured["kwargs"] == {"stream": True}
 
 
-# Adapters without generate fail with an explicit error.
+# Verify that an adapter without a generate function fails with a NotImplementedError that names it.
 def test_generate_raises_for_missing_adapter_function():
     adapter = SimpleNamespace()
 
@@ -69,7 +69,7 @@ def test_generate_raises_for_missing_adapter_function():
             llm_api.generate("ollama", "m", [])
 
 
-# prepare_runtime matches the adapter's signature arity.
+# Verify that prepare_runtime passes the engine only to adapters whose prepare_runtime accepts an argument.
 def test_prepare_runtime_matches_adapter_signature():
     calls = []
     zero_arg = SimpleNamespace()
@@ -85,13 +85,13 @@ def test_prepare_runtime_matches_adapter_signature():
     assert calls == ["zero", "openai"]
 
 
-# Adapters without prepare_runtime are simply skipped.
+# Verify that prepare_runtime does nothing, and does not fail, for an adapter without prepare_runtime.
 def test_prepare_runtime_is_noop_without_adapter_support():
     with patch.object(llm_api, "_get_engine_module", return_value=SimpleNamespace()):
         llm_api.prepare_runtime("lms")
 
 
-# cleanup_runtime calls the adapter cleanup when present.
+# Verify that cleanup_runtime runs when the adapter provides a cleanup function.
 def test_cleanup_runtime_calls_adapter_cleanup():
     adapter = SimpleNamespace()
     adapter.cleanup_runtime = lambda: None
@@ -100,17 +100,18 @@ def test_cleanup_runtime_calls_adapter_cleanup():
         llm_api.cleanup_runtime("ollama")
 
 
-# reload_model fails explicitly when the adapter lacks support.
+# Verify that reload_model raises a NotImplementedError that names it when the adapter lacks support.
 def test_reload_model_raises_without_support():
     with patch.object(llm_api, "_get_engine_module", return_value=SimpleNamespace()):
         with pytest.raises(NotImplementedError, match="reload_model"):
             llm_api.reload_model("openai", "m")
 
 
-# Aborting without an engine signals every loaded adapter.
+# Verify that aborting without an engine signals every registered adapter module.
 def test_abort_generation_signals_all_engines(monkeypatch):
     aborted = []
 
+    # Return a fake adapter that records the module name when it is aborted.
     def fake_import(name):
         adapter = SimpleNamespace()
         adapter.abort_generation = lambda: aborted.append(name)
@@ -127,18 +128,18 @@ def test_abort_generation_signals_all_engines(monkeypatch):
     assert sorted(aborted) == ["API.ollama", "API.openai"]
 
 
-# Chat title generation.
+# Chat title generation
 
-
-# Empty user messages never reach the model.
+# Verify that a blank user message gives an empty title without calling the model.
 def test_generate_chat_title_returns_empty_for_empty_message():
     assert llm_api.generate_chat_title("ollama", "m", "   ") == ""
 
 
-# Plain models use the short output limit and the capped context.
+# Verify that a model without thinking support is called once with the short output limit and the capped context.
 def test_generate_chat_title_plain_model_uses_output_limit(monkeypatch):
     calls = []
 
+    # Record the request and return one title chunk.
     def fake_generate(**kwargs):
         calls.append(kwargs)
         return _title_chunks("My Great Title")
@@ -153,7 +154,7 @@ def test_generate_chat_title_plain_model_uses_output_limit(monkeypatch):
     assert calls[0]["options"] == {"num_ctx": 4096, "num_predict": 32}
 
 
-# Reasoning blocks are stripped from the title text.
+# Verify that think blocks are removed from the generated title text.
 def test_generate_chat_title_strips_reasoning_blocks(monkeypatch):
     monkeypatch.setattr(
         llm_api, "generate", lambda **kwargs: _title_chunks("<think>secret plan</think>Clean Title")
@@ -163,10 +164,11 @@ def test_generate_chat_title_strips_reasoning_blocks(monkeypatch):
     assert llm_api.generate_chat_title("ollama", "m", "hello") == "Clean Title"
 
 
-# Error output is discarded and the next strategy wins.
+# Verify that an error marker in the first attempt's output is discarded and the title comes from the retry.
 def test_generate_chat_title_drops_error_output_and_falls_back(monkeypatch):
     calls = []
 
+    # Record the request; the first call returns an error marker, later calls a valid title.
     def fake_generate(**kwargs):
         calls.append(kwargs)
         if len(calls) == 1:
@@ -181,10 +183,12 @@ def test_generate_chat_title_drops_error_output_and_falls_back(monkeypatch):
     assert len(calls) == 2
 
 
-# Toggle models disable thinking on the first attempt.
+# Verify that a model with a thinking toggle is first asked with thinking disabled, and that a valid answer ends
+# the attempts.
 def test_generate_chat_title_disables_thinking_first_for_toggle_models(monkeypatch):
     calls = []
 
+    # Record the request and return one title chunk.
     def fake_generate(**kwargs):
         calls.append(kwargs)
         return _title_chunks("Toggled Title")
@@ -200,10 +204,12 @@ def test_generate_chat_title_disables_thinking_first_for_toggle_models(monkeypat
     assert calls[0]["think"] is False
 
 
-# A failed first attempt retries with the lowest advertised level.
+# Verify that after a failed first attempt with thinking disabled the title request is retried with the lowest
+# advertised think level.
 def test_generate_chat_title_retries_with_think_level(monkeypatch):
     calls = []
 
+    # Record the request; the first call fails, later calls return a valid title.
     def fake_generate(**kwargs):
         calls.append(kwargs)
         if len(calls) == 1:
@@ -227,10 +233,12 @@ def test_generate_chat_title_retries_with_think_level(monkeypatch):
     assert calls[1]["think_level"] == "low"
 
 
-# OpenAI models use the advertised token parameter name.
+# Verify that a non-Ollama engine limits the title length with the token parameter the model advertises
+# (max_completion_tokens) instead of num_predict.
 def test_generate_chat_title_uses_openai_token_parameter(monkeypatch):
     calls = []
 
+    # Record the request and return one title chunk.
     def fake_generate(**kwargs):
         calls.append(kwargs)
         return _title_chunks("OpenAI Title")
@@ -245,10 +253,11 @@ def test_generate_chat_title_uses_openai_token_parameter(monkeypatch):
     assert calls[0]["options"] == {"max_completion_tokens": 32}
 
 
-# The Ollama context window is capped for title generation.
+# Verify that the Ollama context window is capped at 4096 for title generation even for a huge model context.
 def test_generate_chat_title_caps_context_for_ollama(monkeypatch):
     calls = []
 
+    # Record the request and return one title chunk.
     def fake_generate(**kwargs):
         calls.append(kwargs)
         return _title_chunks("Capped")

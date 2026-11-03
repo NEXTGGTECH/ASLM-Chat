@@ -15,7 +15,7 @@ pytestmark = [pytest.mark.unit]
 
 # Ensure Ollama-only thinking parameters are normalized before request dispatch.
 class OllamaOptionMappingTests(SimpleTestCase):
-    # Test prepare chat kwargs maps think level into think.
+    # Verify that a think_level replaces the boolean think flag and is removed from the chat kwargs.
     def test_prepare_chat_kwargs_maps_think_level_into_think(self):
         payload = _prepare_chat_kwargs(
             {
@@ -30,7 +30,8 @@ class OllamaOptionMappingTests(SimpleTestCase):
         self.assertEqual(payload["think"], "high")
         self.assertEqual(payload["options"]["temperature"], 0.7)
 
-    # Test prepare chat kwargs drops runtime options unsupported by current Ollama.
+    # Verify that chat kwargs drop the runtime options current Ollama no longer supports (mirostat, numa, tfs_z)
+    # and keep the supported ones.
     def test_prepare_chat_kwargs_drops_runtime_options_unsupported_by_current_ollama(self):
         payload = _prepare_chat_kwargs(
             {
@@ -50,7 +51,7 @@ class OllamaOptionMappingTests(SimpleTestCase):
         self.assertNotIn("numa", payload["options"])
         self.assertNotIn("tfs_z", payload["options"])
 
-    # Test prepare chat kwargs ignores LM Studio only internal keys.
+    # Verify that chat kwargs drop the keys used only by the LM Studio engine and keep think and options.
     def test_prepare_chat_kwargs_ignores_lms_only_internal_keys(self):
         payload = _prepare_chat_kwargs(
             {
@@ -71,9 +72,8 @@ class OllamaOptionMappingTests(SimpleTestCase):
         self.assertEqual(payload["think"], True)
         self.assertEqual(payload["options"]["temperature"], 0.7)
 
-    # Test prepare runtime passes requested engine to managed service.
+    # Verify that preparing the runtime starts the managed Ollama service for the requested engine.
     @patch("API.ollama._get_ollama_service_module")
-    # Verify prepare runtime passes requested engine to managed service.
     def test_prepare_runtime_passes_requested_engine_to_managed_service(self, mock_get_service):
         mock_service = Mock()
         mock_get_service.return_value = mock_service
@@ -82,7 +82,8 @@ class OllamaOptionMappingTests(SimpleTestCase):
 
         mock_service.start_ollama.assert_called_once_with(engine="ollama-service")
 
-    # Test the fixed local Ollama client never trusts system proxy settings.
+    # Verify that the local Ollama client connects to the configured loopback port and ignores proxy settings from
+    # the environment.
     @patch("API.ollama.ollama.Client")
     @patch("API.ollama.settings.get", return_value=20003)
     def test_ollama_client_disables_environment_proxy(self, _mock_port, mock_client):
@@ -95,9 +96,11 @@ class OllamaOptionMappingTests(SimpleTestCase):
             trust_env=False,
         )
 
+
 # Ensure Ollama tool support follows Ollama model metadata.
 class OllamaModelInfoTests(SimpleTestCase):
-    # Test an explicit Ollama capabilities list without tools disables tool support.
+    # Verify that an explicit capabilities list without tools disables tool support even when the template has
+    # tool markers.
     def test_ollama_capabilities_without_tools_disable_tool_support(self):
         payload = _extract_ollama_model_info({
             "capabilities": ["completion"],
@@ -106,7 +109,7 @@ class OllamaModelInfoTests(SimpleTestCase):
 
         self.assertFalse(payload["supports_tool_calling"])
 
-    # Test Ollama's tools capability enables support without template markers.
+    # Verify that the tools capability enables tool support even without tool markers in the template.
     def test_ollama_tools_capability_enables_tool_support(self):
         payload = _extract_ollama_model_info({
             "capabilities": ["completion", "tools"],
@@ -115,7 +118,8 @@ class OllamaModelInfoTests(SimpleTestCase):
 
         self.assertTrue(payload["supports_tool_calling"])
 
-    # Test old/custom Ollama responses can still infer tools from the template.
+    # Verify that without a capabilities list tool support is inferred from the template: absent without tool
+    # markers, present with them.
     def test_ollama_tool_template_fallback_when_capabilities_are_missing(self):
         payload = _extract_ollama_model_info({
             "template": "{{ if .Messages }}{{ end }}",
