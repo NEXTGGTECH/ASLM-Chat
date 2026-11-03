@@ -15,6 +15,7 @@ from Tools.system_prompts import CHAT_TITLE_INSTRUCTIONS
 
 logger = logging.getLogger(__name__)
 
+# Map every accepted engine name or alias to the adapter module that implements it.
 ENGINE_MODULES = {
     "ollama": "API.ollama",
     "ollama-service": "API.ollama",
@@ -28,12 +29,19 @@ ENGINE_MODULES = {
     "gemini": "API.google_genai",
 }
 
+# Chat title generation limits: characters of the user message sent as the source, output tokens
+# for a plain attempt and for an attempt that may spend tokens on reasoning, the context window
+# cap for Ollama, and the maximum length of the stored title in characters.
 CHAT_TITLE_SOURCE_LIMIT = 2048
 CHAT_TITLE_OUTPUT_LIMIT = 32
 CHAT_TITLE_REASONING_OUTPUT_LIMIT = 1024
 CHAT_TITLE_CONTEXT_LIMIT = 4096
 CHAT_TITLE_LENGTH_LIMIT = 255
+
+# Reasoning levels ordered from the cheapest to the most expensive; the title uses the lowest one offered.
 REASONING_LEVEL_ORDER = ("minimal", "low", "medium", "high", "xhigh")
+
+# Opening and closing tags that wrap reasoning text inside generated content.
 REASONING_TAG_PAIRS = (
     ("<think>", "</think>"),
     ("<thinking>", "</thinking>"),
@@ -41,10 +49,11 @@ REASONING_TAG_PAIRS = (
 )
 
 
-# Resolve the engine adapter module.
-def _get_engine_module(engine: str | None) -> ModuleType:
-    """Load the adapter module for the selected LLM engine."""
+# Engine dispatch
 
+# Resolve the engine name to its canonical form and import the matching adapter module.
+# Raise ValueError for an unknown engine and ImportError when the module cannot be loaded.
+def _get_engine_module(engine: str | None) -> ModuleType:
     canonical_engine = settings.normalize_engine_name(engine)
     module_name = ENGINE_MODULES.get(canonical_engine)
 
@@ -58,10 +67,8 @@ def _get_engine_module(engine: str | None) -> ModuleType:
         raise ImportError(f"Failed to load engine module {module_name}: {exc}") from exc
 
 
-# List models exposed by one engine.
+# Prepare the engine runtime and return the list of models exposed by the selected engine.
 def get_models(engine: str | None) -> Any:
-    """Return the list of models exposed by the selected engine."""
-
     prepare_runtime(engine)
     module = _get_engine_module(engine)
     if hasattr(module, "get_models"):
@@ -70,10 +77,8 @@ def get_models(engine: str | None) -> Any:
     raise NotImplementedError(f"Engine {engine} does not implement get_models")
 
 
-# Download a model through one engine.
+# Prepare the engine runtime and download (pull) a model through the selected engine adapter.
 def download_model(engine: str | None, model_name: str, **kwargs: Any) -> Any:
-    """Download or pull a model through the selected engine adapter."""
-
     prepare_runtime(engine)
     module = _get_engine_module(engine)
     if hasattr(module, "download_model"):
@@ -82,10 +87,9 @@ def download_model(engine: str | None, model_name: str, **kwargs: Any) -> Any:
     raise NotImplementedError(f"Engine {engine} does not implement download_model")
 
 
-# Generate a response through one engine.
+# Generate a chat response through the selected engine adapter. Unlike get_models, it does not
+# prepare the runtime first.
 def generate(engine: str | None, model_name: str, messages: list[dict[str, Any]], **kwargs: Any) -> Any:
-    """Generate a chat response through the selected engine adapter."""
-
     module = _get_engine_module(engine)
     if hasattr(module, "generate"):
         return module.generate(model_name, messages, **kwargs)
@@ -93,7 +97,10 @@ def generate(engine: str | None, model_name: str, messages: list[dict[str, Any]]
     raise NotImplementedError(f"Engine {engine} does not implement generate")
 
 
-# Return visible content from one normalized adapter chunk.
+# Chat titles
+
+# Return visible content from one normalized adapter chunk, which may be a dict or an object
+# with a message attribute. Missing content gives an empty string.
 def _extract_chat_title_chunk(chunk: Any) -> str:
     raw_message = chunk.get("message", {}) if isinstance(chunk, dict) else getattr(chunk, "message", {})
     if isinstance(raw_message, dict):
@@ -104,6 +111,8 @@ def _extract_chat_title_chunk(chunk: Any) -> str:
 # Clean one generated title before it is persisted or returned in a header.
 def _sanitize_chat_title(title: str) -> str:
     cleaned = str(title or "")
+
+    # Cut out reasoning blocks case-insensitively; an unclosed opening tag drops everything after it.
     for start_tag, end_tag in REASONING_TAG_PAIRS:
         while True:
             start_index = cleaned.lower().find(start_tag)
@@ -115,28 +124,33 @@ def _sanitize_chat_title(title: str) -> str:
                 break
             cleaned = cleaned[:start_index] + cleaned[end_index + len(end_tag):]
 
+    # Drop control tokens such as <|im_end|>, collapse whitespace and trim quotes, backticks and hashes.
     cleaned = re.sub(r"<\|[^>]+\|>", "", cleaned)
     cleaned = " ".join(cleaned.split()).strip(" `\"'“”‘’#")
+
+    # An engine error message is not a title, so the caller falls back to its default title.
     if cleaned.lower().startswith("[error during generation:"):
         return ""
     return cleaned[:CHAT_TITLE_LENGTH_LIMIT].rstrip()
 
 
-# Generate a title through the selected model without touching chat history.
+# Generate a chat title from the first user message through the selected model without touching chat
+# history. Return an empty string when no attempt produced a usable title, so the caller uses its
+# fallback title.
 def generate_chat_title(
     engine: str | None,
     model_name: str,
     user_message: str,
     model_info: dict[str, Any] | None = None,
 ) -> str:
-    """Return a generated title or an empty string when the fallback should be used."""
-
     source = str(user_message or "").strip()[:CHAT_TITLE_SOURCE_LIMIT]
     if not source:
         return ""
 
     canonical_engine = settings.normalize_engine_name(engine)
     model_info = model_info if isinstance(model_info, dict) else {}
+
+    # Read the thinking capabilities of the model; a model with a toggle or levels supports thinking.
     supports_think_toggle = bool(model_info.get("supports_think_toggle", False))
     supports_think_level = bool(model_info.get("supports_think_level", False))
     supports_thinking = bool(
@@ -144,6 +158,8 @@ def generate_chat_title(
         or supports_think_toggle
         or supports_think_level
     )
+
+    # Pick the cheapest advertised reasoning level, used when thinking cannot simply be switched off.
     advertised_levels = [
         str(level).strip().lower()
         for level in model_info.get("think_level_options", [])
@@ -155,6 +171,9 @@ def generate_chat_title(
     )
     reasoning_level = lowest_level if supports_think_level or canonical_engine == "google-genai" else None
 
+    # Plan the attempts as (disable thinking, reasoning level, output token limit). A model that can
+    # switch thinking off first tries a short answer without thinking; a model that always thinks gets
+    # a larger budget so its reasoning does not eat the title; other models retry with a larger budget.
     attempts: list[tuple[bool, str | None, int]] = []
     if supports_thinking and supports_think_toggle:
         attempts.append((True, None, CHAT_TITLE_OUTPUT_LIMIT))
@@ -165,6 +184,7 @@ def generate_chat_title(
         attempts.append((False, None, CHAT_TITLE_OUTPUT_LIMIT))
         attempts.append((False, reasoning_level, CHAT_TITLE_REASONING_OUTPUT_LIMIT))
 
+    # Build the title prompt and the set of request parameters the model advertises.
     messages = [
         {"role": "system", "content": CHAT_TITLE_INSTRUCTIONS},
         {"role": "user", "content": source},
@@ -175,8 +195,12 @@ def generate_chat_title(
         if str(name).strip()
     }
 
+    # Try each attempt until one yields a non-empty sanitized title.
     for disable_thinking, think_level, output_limit in attempts:
         options: dict[str, Any]
+
+        # Express the output limit in the option name that the engine understands; Ollama also gets
+        # a context window capped by the title limit.
         if settings.is_ollama_engine(canonical_engine):
             context_length = model_info.get("context_length", CHAT_TITLE_CONTEXT_LIMIT)
             try:
@@ -196,6 +220,8 @@ def generate_chat_title(
             )
             options = {token_option: output_limit}
 
+        # Build the generation request and add the thinking control, which google-genai takes inside
+        # the options and the other engines take as separate keyword arguments.
         generate_kwargs: dict[str, Any] = {
             "engine": canonical_engine,
             "model_name": model_name,
@@ -217,6 +243,8 @@ def generate_chat_title(
                 generate_kwargs["think_level_param_name"] = str(
                     model_info.get("think_level_param_name", "think_level") or "think_level"
                 )
+
+        # Stream the answer and join the visible parts; a failed attempt moves on to the next one.
         try:
             visible_parts = [
                 _extract_chat_title_chunk(chunk)
@@ -233,10 +261,11 @@ def generate_chat_title(
     return ""
 
 
-# Abort active generation for one engine or all loaded engines.
-def abort_generation(engine: str | None = None, *, generation_id: str | None = None) -> None:
-    """Signal the active generation for one engine or every loaded adapter."""
+# Generation control and model metadata
 
+# Abort active tool executions and signal the active generation of one engine, or of every
+# adapter module that can be imported when no engine is given.
+def abort_generation(engine: str | None = None, *, generation_id: str | None = None) -> None:
     tool_registry.abort_active_tools(generation_id)
     if engine is None:
         module_names = {module_name for module_name in ENGINE_MODULES.values()}
@@ -244,6 +273,7 @@ def abort_generation(engine: str | None = None, *, generation_id: str | None = N
             try:
                 module = importlib.import_module(module_name)
             except ImportError:
+                # An adapter that cannot be imported has no running generation to abort.
                 continue
 
             abort = getattr(module, "abort_generation", None)
@@ -257,10 +287,9 @@ def abort_generation(engine: str | None = None, *, generation_id: str | None = N
         abort()
 
 
-# Read model metadata from one engine.
+# Prepare the engine runtime and return the model metadata (capabilities, defaults, limits) exposed
+# by the selected engine.
 def get_model_settings(engine: str | None, model_name: str) -> Any:
-    """Return model metadata exposed by the selected engine."""
-
     prepare_runtime(engine)
     module = _get_engine_module(engine)
     if hasattr(module, "get_model_settings"):
@@ -269,10 +298,9 @@ def get_model_settings(engine: str | None, model_name: str) -> Any:
     raise NotImplementedError(f"Engine {engine} does not implement get_model_settings")
 
 
-# Reload one model when the adapter supports it.
+# Reload the selected model through its adapter. Raise NotImplementedError when the engine does not
+# support explicit reloads.
 def reload_model(engine: str | None, model_name: str) -> None:
-    """Reload the selected model when the engine supports explicit reloads."""
-
     module = _get_engine_module(engine)
     reload_func = getattr(module, "reload_model", None)
     if callable(reload_func):
@@ -282,10 +310,12 @@ def reload_model(engine: str | None, model_name: str) -> None:
     raise NotImplementedError(f"Engine {engine} does not implement reload_model")
 
 
-# Prepare one engine runtime before use.
-def prepare_runtime(engine: str | None) -> None:
-    """Prepare the selected engine runtime before it is used."""
+# Runtime lifecycle
 
+# Prepare the selected engine runtime before it is used. Adapters declare prepare_runtime with or
+# without an engine parameter, so the signature decides how it is called; an adapter without the
+# function needs no preparation.
+def prepare_runtime(engine: str | None) -> None:
     module = _get_engine_module(engine)
     prepare = getattr(module, "prepare_runtime", None)
     if not callable(prepare):
@@ -294,6 +324,7 @@ def prepare_runtime(engine: str | None) -> None:
     try:
         parameter_count = len(inspect.signature(prepare).parameters)
     except (TypeError, ValueError):
+        # The signature of some callables cannot be inspected; call without the engine argument.
         parameter_count = 0
 
     if parameter_count >= 1:
@@ -303,20 +334,18 @@ def prepare_runtime(engine: str | None) -> None:
     prepare()
 
 
-# Clean up one engine runtime.
+# Release the runtime resources of the selected engine. An adapter without cleanup_runtime has
+# nothing to release.
 def cleanup_runtime(engine: str | None) -> None:
-    """Release runtime resources for the selected engine."""
-
     module = _get_engine_module(engine)
     cleanup = getattr(module, "cleanup_runtime", None)
     if callable(cleanup):
         cleanup()
 
 
-# Prepare every enabled engine runtime.
+# Start or warm up each engine that is enabled in settings. A failure is logged and does not stop
+# the remaining engines.
 def prepare_enabled_runtimes() -> None:
-    """Start or warm up each engine that is enabled in settings."""
-
     for engine_id in settings.get_enabled_engine_ids():
         try:
             prepare_runtime(engine_id)
@@ -324,10 +353,9 @@ def prepare_enabled_runtimes() -> None:
             logger.warning("Failed to prepare enabled engine %s: %s", engine_id, exc)
 
 
-# Release runtimes for engines that are no longer enabled.
+# Stop managed runtimes of the engines that are not enabled in settings. A failure is logged and
+# does not stop the remaining engines.
 def cleanup_disabled_runtimes() -> None:
-    """Stop managed runtimes for engines that were disabled in settings."""
-
     enabled_engine_ids = set(settings.get_enabled_engine_ids())
     for engine_id in settings.ENGINE_IDS:
         if engine_id in enabled_engine_ids:
@@ -338,18 +366,16 @@ def cleanup_disabled_runtimes() -> None:
             logger.warning("Failed to clean up disabled engine %s: %s", engine_id, exc)
 
 
-# Align managed runtimes with the current enabled-engine flags.
+# Align managed runtimes with the current enabled-engine flags: prepare the enabled engines and
+# release the resources of the disabled ones.
 def sync_enabled_engine_runtimes() -> None:
-    """Prepare all enabled engines and release resources for disabled ones."""
-
     prepare_enabled_runtimes()
     cleanup_disabled_runtimes()
 
 
-# Switch runtime ownership between engines.
+# Keep enabled engine runtimes in sync when the selected engine changes. The engines themselves are
+# ignored: the enabled-engine flags in settings decide which runtimes run.
 def handle_engine_transition(previous_engine: str | None, next_engine: str | None) -> None:
-    """Keep enabled engine runtimes in sync when settings change."""
-
     del previous_engine, next_engine
     try:
         sync_enabled_engine_runtimes()

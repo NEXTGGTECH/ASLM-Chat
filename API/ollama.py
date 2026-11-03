@@ -1,4 +1,4 @@
-﻿# Copyright NEXTGGTECH. Elastic License 2.0.
+# Copyright NEXTGGTECH. Elastic License 2.0.
 
 from __future__ import annotations
 
@@ -15,18 +15,21 @@ from Settings import settings
 
 logger = logging.getLogger(__name__)
 
-# Track adapter cancellation state.
+# Cancellation flag of the adapter: set by abort_generation(), polled between streamed chunks and
+# tool rounds, and cleared when a new generation starts.
 _abort_event = threading.Event()
 
 
-# Stop the active Ollama generation.
+# Request cancellation of the active Ollama generation; the streaming loops notice it on the next chunk.
 def abort_generation() -> None:
-    """Signal the active Ollama generation to stop."""
-
     _abort_event.set()
 
 
+# Option keys that the Ollama chat API expects at the top level of the request instead of inside
+# the nested options dict.
 OLLAMA_TOP_LEVEL_CHAT_KEYS = {"format", "keep_alive", "logprobs", "top_logprobs"}
+
+# ASLM-Chat request keys that only drive the adapter and must never be forwarded to client.chat.
 OLLAMA_INTERNAL_CHAT_KEYS = {
     "system",
     "prompt",
@@ -42,6 +45,8 @@ OLLAMA_INTERNAL_CHAT_KEYS = {
     "sync_operation_defaults",
     "engine",
 }
+
+# Option keys the bundled Ollama runtime no longer accepts; they are dropped from requests.
 OLLAMA_UNSUPPORTED_OPTION_KEYS = {
     "embedding_only",
     "f16_kv",
@@ -56,65 +61,67 @@ OLLAMA_UNSUPPORTED_OPTION_KEYS = {
     "use_mlock",
     "vocab_only",
 }
+
+# Default cap on tool-calling rounds per generation; the tool context may override it.
 MAX_TOOL_ROUNDS = 100
+
+# Readiness retry for SDK calls while the managed runtime is still warming up: attempt count and
+# the base delay in seconds, which is multiplied by the attempt number.
 RUNTIME_REQUEST_ATTEMPTS = 4
 RUNTIME_RETRY_DELAY_SECONDS = 0.5
+
+# Sets of dropped option names that were already reported, so each set is logged only once; the lock
+# guards the registry across request threads.
 _unsupported_options_lock = threading.Lock()
 _reported_unsupported_option_sets: set[tuple[str, ...]] = set()
 
 
-# Import the managed Ollama service module lazily.
-def _get_ollama_service_module():
-    """Import the managed Ollama service module lazily."""
+# Runtime lifecycle
 
+# Import the managed Ollama service module lazily; return None when it is unavailable. The module name
+# contains a hyphen, so it can only be loaded through importlib.
+def _get_ollama_service_module():
     try:
         return importlib.import_module("Services.ollama-service")
     except ImportError as exc:
         logger.warning("[Ollama API] Could not import Services.ollama-service: %s", exc)
         return None
 
-# Start the managed Ollama runtime.
-def prepare_runtime(engine: str | None = None) -> None:
-    """Ensure the managed Ollama runtime is running before requests."""
 
+# Start the managed Ollama runtime (through the Ollama service module) so it is running before requests.
+def prepare_runtime(engine: str | None = None) -> None:
     ollama_service = _get_ollama_service_module()
     if ollama_service is not None:
         ollama_service.start_ollama(engine=engine)
 
-# Stop the managed Ollama runtime.
-def cleanup_runtime() -> None:
-    """Stop the managed Ollama runtime when the engine is deselected."""
 
+# Stop the managed Ollama runtime when the engine is deselected.
+def cleanup_runtime() -> None:
     ollama_service = _get_ollama_service_module()
     if ollama_service is not None:
         ollama_service.stop_ollama()
 
 
-# Print one shared runtime event.
-def _print_runtime_event(message: str) -> None:
-    """Emit one ASLM-Chat runtime event into the shared console."""
+# Logging helpers
 
+# Print one adapter runtime event into the shared console with the ASLM-Chat prefix.
+def _print_runtime_event(message: str) -> None:
     print(f"[ASLM-Chat] {message}", flush=True)
 
 
-# Check whether debug logging is enabled.
+# Return whether debug-or-higher Ollama adapter events should be printed.
 def _is_debug_logging_enabled() -> bool:
-    """Return whether debug-or-higher Ollama adapter events should be printed."""
-
     return settings.is_console_debug_enabled()
 
 
-# Check whether trace logging is enabled.
+# Return whether trace-level adapter events should be printed.
 def _is_trace_logging_enabled() -> bool:
-    """Return whether trace-level adapter events should be printed."""
-
     return settings.is_console_trace_enabled()
 
 
-# Render one compact debug preview.
+# Return a compact one-line preview of a value for adapter diagnostics: non-strings are rendered as
+# JSON when possible, whitespace is collapsed and the text is cut to limit characters with an ellipsis.
 def _preview_jsonish(value: Any, limit: int = 240) -> str:
-    """Return a compact one-line preview for adapter diagnostics."""
-
     if isinstance(value, str):
         rendered = value
     else:
@@ -123,6 +130,7 @@ def _preview_jsonish(value: Any, limit: int = 240) -> str:
 
             rendered = json.dumps(value, ensure_ascii=False, sort_keys=True)
         except TypeError:
+            # Values that JSON cannot encode fall back to their plain string form.
             rendered = str(value)
 
     rendered = " ".join(str(rendered or "").split())
@@ -131,37 +139,35 @@ def _preview_jsonish(value: Any, limit: int = 240) -> str:
     return f"{rendered[:max(0, limit - 3)].rstrip()}..."
 
 
-# Validate one forwarded runtime option.
+# Return whether an option name can be forwarded to the current Ollama chat API, which is true for
+# any non-empty name that is not listed in OLLAMA_UNSUPPORTED_OPTION_KEYS.
 def is_supported_runtime_option_key(option_name: Any) -> bool:
-    """Return whether the option can be forwarded to the current Ollama chat API."""
-
     normalized = str(option_name or "").strip()
     return bool(normalized) and normalized not in OLLAMA_UNSUPPORTED_OPTION_KEYS
 
 
-# Summarize requested tool aliases.
+# Return a readable comma-separated list of the tool aliases requested by the model, or "none".
 def _summarize_tool_names(tool_calls: list[dict[str, Any]]) -> str:
-    """Return a readable summary of tool aliases requested by the model."""
-
     names = [str(tool_call.get("name", "") or "").strip() for tool_call in tool_calls]
     names = [name for name in names if name]
     return ", ".join(names) if names else "none"
 
 
-# Create the Ollama client.
-def get_client() -> ollama.Client:
-    """Create an Ollama client using the configured local service port."""
+# Client and models
 
+# Create an Ollama client for the managed local service on the configured port.
+def get_client() -> ollama.Client:
     port = settings.get("ollama-service_port", 30002)
     host = f"http://127.0.0.1:{port}"
+
     # This client only ever talks to the managed loopback service. Do not let
     # HTTPX reinterpret a Windows system proxy as a route to local Ollama.
     return ollama.Client(host=host, trust_env=False)
 
-# Run one Ollama SDK call with a short readiness retry.
-def _call_with_runtime_retry(operation: Any, description: str) -> Any:
-    """Run an Ollama operation after giving the managed runtime time to answer."""
 
+# Run one Ollama SDK call and retry it a few times with a growing delay, giving the managed runtime
+# time to answer while it warms up. The last error is raised once the attempts are exhausted.
+def _call_with_runtime_retry(operation: Any, description: str) -> Any:
     last_error: Exception | None = None
     for attempt in range(1, RUNTIME_REQUEST_ATTEMPTS + 1):
         try:
@@ -184,10 +190,10 @@ def _call_with_runtime_retry(operation: Any, description: str) -> Any:
         raise last_error
     raise RuntimeError(f"Ollama operation failed: {description}")
 
-# List local Ollama models.
-def get_models() -> list[dict[str, Any]]:
-    """Return the locally available Ollama models."""
 
+# Return the locally available Ollama models, or an empty list when listing fails. The SDK answer may
+# be a dict or an object with a models attribute.
+def get_models() -> list[dict[str, Any]]:
     client = get_client()
     try:
         response = _call_with_runtime_retry(client.list, "list models")
@@ -200,10 +206,10 @@ def get_models() -> list[dict[str, Any]]:
 
     return getattr(response, "models", []) or []
 
-# Pull one model from Ollama.
-def download_model(model_name: str, **kwargs: Any) -> Any:
-    """Pull a model from Ollama."""
 
+# Pull a model from Ollama and return the SDK result; with stream=True in kwargs it is a progress
+# iterator. Failures are logged and re-raised.
+def download_model(model_name: str, **kwargs: Any) -> Any:
     client = get_client()
     stream = kwargs.get("stream", False)
 
@@ -213,10 +219,9 @@ def download_model(model_name: str, **kwargs: Any) -> Any:
         logger.error("[Ollama API] Error downloading model %s: %s", model_name, exc)
         raise
 
-# Read one model's settings.
-def get_model_settings(model_name: str) -> Any:
-    """Return metadata and Modelfile-style settings for an Ollama model."""
 
+# Return the metadata and Modelfile-style settings of an Ollama model. Failures are logged and re-raised.
+def get_model_settings(model_name: str) -> Any:
     client = get_client()
     try:
         return _call_with_runtime_retry(lambda: client.show(model_name), f"show model {model_name}")
@@ -225,11 +230,11 @@ def get_model_settings(model_name: str) -> Any:
         raise
 
 
-# Normalize Ollama payloads.
-# Read one SDK field.
-def _get_field(value: Any, *names: str, default: Any = None) -> Any:
-    """Return the first matching field from dict-like or attribute objects."""
+# Payload normalization
 
+# Return the first of the given field names found on a dict or an attribute object, or the default
+# when none is present. SDK results can be either shape.
+def _get_field(value: Any, *names: str, default: Any = None) -> Any:
     for name in names:
         if isinstance(value, dict) and name in value:
             return value.get(name)
@@ -238,10 +243,10 @@ def _get_field(value: Any, *names: str, default: Any = None) -> Any:
 
     return default
 
-# Normalize one tool call.
-def _normalize_tool_call(raw_call: Any) -> dict[str, Any] | None:
-    """Convert an Ollama tool-call payload into a predictable dictionary."""
 
+# Convert an Ollama tool-call payload into a {"name", "arguments"} dict, or None when it has no name.
+# Missing arguments become an empty dict and non-dict arguments are wrapped as {"value": ...}.
+def _normalize_tool_call(raw_call: Any) -> dict[str, Any] | None:
     raw_function = _get_field(raw_call, "function", default=raw_call)
     name = str(_get_field(raw_function, "name", default="") or "").strip()
     if not name:
@@ -257,10 +262,9 @@ def _normalize_tool_call(raw_call: Any) -> dict[str, Any] | None:
 
     return {"name": name, "arguments": arguments}
 
-# Merge streamed tool calls.
-def _merge_tool_calls(existing: list[dict[str, Any]], incoming: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Merge streamed tool-call chunks without duplicating entries."""
 
+# Merge streamed tool calls into the already collected ones, skipping entries that are already present.
+def _merge_tool_calls(existing: list[dict[str, Any]], incoming: list[dict[str, Any]]) -> list[dict[str, Any]]:
     merged = list(existing)
     for item in incoming:
         if item not in merged:
@@ -268,10 +272,10 @@ def _merge_tool_calls(existing: list[dict[str, Any]], incoming: list[dict[str, A
 
     return merged
 
-# Normalize one assistant message.
-def _normalize_message(raw_message: Any) -> dict[str, Any]:
-    """Convert an Ollama message object into a JSON-compatible dictionary."""
 
+# Convert an Ollama message object (or None) into a JSON-compatible assistant message dict with
+# optional thinking text and function-style tool calls.
+def _normalize_message(raw_message: Any) -> dict[str, Any]:
     if raw_message is None:
         return {"role": "assistant", "content": ""}
 
@@ -285,6 +289,7 @@ def _normalize_message(raw_message: Any) -> dict[str, Any]:
         normalized_message["thinking"] = thinking
 
     normalized_calls = []
+
     # Normalize incoming tool calls into the same function-call shape used by
     # the other adapters so the shared tool loop can stay provider-agnostic.
     for raw_call in tool_calls:
@@ -305,11 +310,11 @@ def _normalize_message(raw_message: Any) -> dict[str, Any]:
     return normalized_message
 
 
-# Prepare request payloads.
-# Drop unsupported request options.
-def _sanitize_request_options(options: Any) -> tuple[Any, list[str]]:
-    """Drop Ollama options that the bundled runtime no longer accepts."""
+# Request preparation
 
+# Drop the options that the bundled Ollama runtime no longer accepts. Return the cleaned options and
+# the names of the dropped keys; options that are not a dict are returned untouched.
+def _sanitize_request_options(options: Any) -> tuple[Any, list[str]]:
     if not isinstance(options, dict):
         return options, []
 
@@ -325,10 +330,9 @@ def _sanitize_request_options(options: Any) -> tuple[Any, list[str]]:
     return clean_options, dropped_options
 
 
-# Report dropped request options once.
+# Print one concise console summary of the removed unsupported options; each distinct set of names
+# is reported only once per process.
 def _report_dropped_options(dropped_options: list[str]) -> None:
-    """Log one concise summary when unsupported Ollama options are removed."""
-
     unique_dropped = tuple(sorted({str(key).strip() for key in dropped_options if str(key).strip()}))
     if not unique_dropped:
         return
@@ -343,10 +347,12 @@ def _report_dropped_options(dropped_options: list[str]) -> None:
         f"[{', '.join(unique_dropped)}]."
     )
 
-# Flatten chat options with metadata.
-def _prepare_chat_kwargs_with_metadata(kwargs: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
-    """Move supported top-level Ollama parameters out of nested options."""
 
+# Build the keyword arguments for client.chat from the request kwargs: remove adapter-only keys,
+# sanitize the nested options, hoist the options that belong at the top request level and fold
+# think/think_level into the single think value. Return the call kwargs and the dropped option names.
+def _prepare_chat_kwargs_with_metadata(kwargs: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    # Strip the keys that only drive the adapter.
     call_kwargs = {key: value for key, value in kwargs.items() if key not in OLLAMA_INTERNAL_CHAT_KEYS}
     options = call_kwargs.get("options")
     dropped_options: list[str] = []
@@ -363,6 +369,7 @@ def _prepare_chat_kwargs_with_metadata(kwargs: dict[str, Any]) -> tuple[dict[str
         if not options:
             call_kwargs.pop("options", None)
 
+    # Resolve the thinking mode.
     think = kwargs.get("think")
     think_level = kwargs.get("think_level")
     if think is not None:
@@ -378,28 +385,25 @@ def _prepare_chat_kwargs_with_metadata(kwargs: dict[str, Any]) -> tuple[dict[str
     return call_kwargs, dropped_options
 
 
-# Flatten chat options only.
+# Compatibility wrapper around _prepare_chat_kwargs_with_metadata that returns only the call kwargs
+# and discards the list of dropped options.
 def _prepare_chat_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
-    """Compatibility wrapper that returns only the Ollama call kwargs."""
-
     call_kwargs, _ = _prepare_chat_kwargs_with_metadata(kwargs)
     return call_kwargs
 
 
-# Stream tool-aware conversations.
-# Build one tool message.
+# Tool-aware streaming
+
+# Build a tool message that can be fed back into Ollama. When content is an image dict (it has
+# _image_b64), the message uses Ollama's images field so the model receives the image visually.
+# With a tool_event, the alias, server and display details are attached for the UI.
 def _build_tool_message(
     tool_name: str,
     content: str | dict[str, Any],
     tool_event: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Build a tool message payload that can be fed back into Ollama.
-
-    When *content* is an image dict (has ``_image_b64``), the message uses
-    Ollama's ``images`` field so the model receives the image visually.
-    """
-
     if isinstance(content, dict) and "_image_b64" in content:
+        # Image result: the text part only names the image, the pixels travel in the images field.
         image_path = content.get("_path", "image")
         _model_content, tool_extras = tool_registry.split_tool_result_payload(content)
         payload = {
@@ -411,6 +415,7 @@ def _build_tool_message(
         }
         payload.update(tool_extras)
     else:
+        # Text result: the model-facing content is split from the extras kept for the UI.
         model_content, tool_extras = tool_registry.split_tool_result_payload(content)
         payload = {
             "role": "tool",
@@ -420,6 +425,7 @@ def _build_tool_message(
         }
         payload.update(tool_extras)
 
+    # Attach the alias, server and display details of the invocation, with the tool name as fallback.
     if tool_event:
         payload.update(
             {
@@ -436,13 +442,15 @@ def _build_tool_message(
 
     return payload
 
-# Build one tool event.
+
+# Serialize one tool invocation so the UI can render it during streaming.
 def _build_tool_event(tool_lookup: dict[str, dict[str, Any]], tool_call: dict[str, Any]) -> dict[str, Any]:
-    """Serialize one tool invocation so the UI can render it during streaming."""
     return tool_registry.build_tool_event(tool_lookup, tool_call)
 
 
-# Stream one model round.
+# Stream one Ollama round as a generator: yield {"message": ...} chunks for the UI while the model
+# answers and return the assembled assistant message (content, thinking and tool calls) as the
+# generator result. When no chunk had visible text, the final message is yielded once at the end.
 def _stream_round(
     client: ollama.Client,
     model_name: str,
@@ -450,8 +458,6 @@ def _stream_round(
     base_kwargs: dict[str, Any],
     tools: list[dict[str, Any]] | None = None,
 ):
-    """Stream one Ollama round and return the assembled assistant message."""
-
     assistant_message: dict[str, Any] = {"role": "assistant", "content": ""}
     thinking_buffer = ""
     tool_calls: list[dict[str, Any]] = []
@@ -475,7 +481,7 @@ def _stream_round(
         ]
         incoming_tool_calls = [tool_call for tool_call in incoming_tool_calls if tool_call]
 
-        # Keep the final message while streaming visible chunks.
+        # Accumulate the chunk into the final message and merge any tool calls it carries.
         if thinking_part:
             thinking_buffer += thinking_part
         if content_part:
@@ -483,6 +489,7 @@ def _stream_round(
         if incoming_tool_calls:
             tool_calls = _merge_tool_calls(tool_calls, incoming_tool_calls)
 
+        # Forward only chunks that carry visible text or thinking to the UI.
         if thinking_part or content_part:
             yielded_visible_chunk = True
             chunk_payload = {"role": "assistant", "content": content_part}
@@ -490,6 +497,7 @@ def _stream_round(
                 chunk_payload["thinking"] = thinking_part
             yield {"message": chunk_payload}
 
+    # Finish the assembled assistant message with the collected thinking and tool calls.
     if thinking_buffer:
         assistant_message["thinking"] = thinking_buffer
     if tool_calls:
@@ -503,17 +511,23 @@ def _stream_round(
 
     return assistant_message
 
-# Drain one streamed round.
-def _yield_stream_round(round_stream):
-    """Yield every chunk from a round stream and return the final assistant message."""
 
+# Re-yield every chunk of a _stream_round generator and return its final assistant message, or an
+# empty assistant message when the generator returned nothing.
+def _yield_stream_round(round_stream):
     while True:
         try:
             yield next(round_stream)
         except StopIteration as stop:
             return stop.value or {"role": "assistant", "content": ""}
 
-# Run the tool loop.
+
+# Resolve local tools through Ollama tool calling with streaming output. The generator yields UI chunks
+# ("message"), the canonical assistant messages ("transcript_message"), "tool_events" and
+# "tool_result" items. Each round streams one model answer, runs the tool calls it requested (with
+# cooldown, duplicate and quota guards) and feeds the results back, until the model answers without
+# tools, the round limit is reached or the loop is cancelled. Repeated blocked or cancelled results
+# force one final tool-free answer.
 def _run_tool_loop(
     client: ollama.Client,
     model_name: str,
@@ -522,8 +536,7 @@ def _run_tool_loop(
     tool_server_ids: list[str],
     tool_context: dict[str, Any],
 ):
-    """Resolve local tools through Ollama tool-calling with streaming output."""
-
+    # Build the tool definitions for the selected servers; without tools this is a plain streamed round.
     tools, tool_lookup = tool_registry.build_ollama_tools(
         tool_server_ids,
         engine="ollama-service",
@@ -539,6 +552,7 @@ def _run_tool_loop(
         yield from _yield_stream_round(_stream_round(client, model_name, messages, base_kwargs))
         return
 
+    # Report the prepared loop in the debug console.
     if _is_debug_logging_enabled():
         _print_runtime_event(
             "Tool loop prepared: "
@@ -550,6 +564,9 @@ def _run_tool_loop(
         if _is_trace_logging_enabled():
             _print_runtime_event(f"Tool loop base options: {_preview_jsonish(base_kwargs, limit=320)}")
 
+    # Loop state: a copy of the conversation extended with the available-tools prompt, per-generation
+    # tool guards (quota counters, seen call signatures, blocked-result streak) and the tracking of
+    # servers whose tools the request requires, with the number of reminders still allowed.
     conversation = [dict(message) for message in messages]
     conversation = tool_registry.with_available_tools_prompt(conversation, tool_lookup)
     tool_quota_counters: dict[str, int] = {}
@@ -559,6 +576,7 @@ def _run_tool_loop(
     satisfied_tool_server_ids: set[str] = set()
     required_nudges_left = tool_registry.MAX_REQUIRED_TOOL_NUDGES if required_tool_server_ids else 0
 
+    # Run model rounds until the model stops calling tools or the round limit is reached.
     max_tool_rounds = tool_registry.tool_round_limit_from_context(tool_context, MAX_TOOL_ROUNDS)
     for round_index in range(max_tool_rounds):
         round_started_at = time.perf_counter()
@@ -576,12 +594,15 @@ def _run_tool_loop(
         tool_calls = tool_registry.prepare_tool_calls(tool_lookup, tool_calls)
         tool_calls = tool_registry.limit_tool_calls_from_context(tool_context, tool_calls, tool_lookup)
 
+        # Store the assistant message with its canonical tool calls in the conversation and the transcript.
         canonical_assistant_message = tool_registry.canonicalize_transcript_tool_calls(
             assistant_message, tool_calls
         )
         conversation[-1] = canonical_assistant_message
         yield {"transcript_message": canonical_assistant_message}
 
+        # No tool calls: the model answered. Remind it of required tools that were not used yet,
+        # otherwise finish the loop.
         if not tool_calls:
             unmet_tool_server_ids = [
                 server_id for server_id in required_tool_server_ids
@@ -608,11 +629,13 @@ def _run_tool_loop(
                 )
             return
 
+        # Remember which required tool servers this round touches.
         for tool_call in tool_calls:
             satisfied_server_id = tool_registry.tool_server_id_for_alias(tool_lookup, tool_call["name"])
             if satisfied_server_id:
                 satisfied_tool_server_ids.add(satisfied_server_id)
 
+        # Report the requested tool calls in the debug console.
         if _is_debug_logging_enabled():
             _print_runtime_event(
                 "Tool round requested: "
@@ -626,11 +649,14 @@ def _run_tool_loop(
                     f"Tool round payload: {_preview_jsonish(tool_calls, limit=420)}"
                 )
 
+        # Announce the round's tool events to the UI; each alias gets its call index so that several
+        # calls of the same tool stay distinguishable.
         tool_events = [_build_tool_event(tool_lookup, tool_call) for tool_call in tool_calls]
         for _i, _ev in enumerate(tool_events):
             _ev["alias"] = f"{_ev['alias']}__{_i}"
         yield {"tool_events": tool_events}
 
+        # Execute the round's tool calls one by one.
         cancelled_tool_result_seen = False
         for tool_call_index, (tool_call, tool_event) in enumerate(zip(tool_calls, tool_events), start=1):
             if _is_debug_logging_enabled():
@@ -643,6 +669,7 @@ def _run_tool_loop(
                     f"tool={tool_event.get('tool_id')}"
                 )
 
+            # Build the per-call context and log the request.
             call_context = dict(tool_context or {})
             call_context.update(
                 {
@@ -662,6 +689,8 @@ def _run_tool_loop(
                 context=call_context,
             )
 
+            # Resolve the result: a preflight error, a cooldown, a duplicate-call or a quota error
+            # short-circuits the call, otherwise the tool runs and its cooldown is recorded.
             preflight_error = tool_call.get("preflight_error_result")
             if preflight_error is not None:
                 tool_result = preflight_error
@@ -701,6 +730,8 @@ def _run_tool_loop(
                                 tool_call.get("arguments") or {},
                                 context=call_context,
                             )
+
+            # Track cancelled and blocked results; they decide whether a final answer is forced.
             cancelled_tool_result_seen = (
                 cancelled_tool_result_seen
                 or tool_registry.is_tool_execution_cancelled(tool_result)
@@ -745,6 +776,8 @@ def _run_tool_loop(
                 )
             yield {"tool_result": ui_tool_message}
 
+        # Stop on user cancellation; after a cancelled tool or two blocked results in a row, ask
+        # the model for one final answer without tools instead of looping further.
         if cancelled_tool_result_seen and _abort_event.is_set():
             return
         if cancelled_tool_result_seen or consecutive_blocked_tool_results >= 2:
@@ -764,29 +797,32 @@ def _run_tool_loop(
             yield {"transcript_message": assistant_message}
             return
 
+        # Compact the conversation when it grows too large before the next round.
         conversation = tool_registry.maybe_compact_tool_conversation(
             tool_context, conversation, provider_format="standard"
         )
 
+    # The round limit was exhausted without a final answer.
     yield {"message": {"content": "[Error during generation: tool loop exceeded the safety limit.]"}}
 
 
-# Guard local iterators with abort handling.
-# Iterate until cancellation is requested.
-def _iter_with_abort(iterator):
-    """Yield iterator chunks until a cancellation request arrives."""
+# Generation
 
+# Yield the chunks of an iterator until a cancellation request arrives.
+def _iter_with_abort(iterator):
     for chunk in iterator:
         if _abort_event.is_set():
             break
         yield chunk
 
 
-# Generate an Ollama response.
+# Generate a chat response through Ollama and return a chunk iterator. Legacy tool_id/tool_server_id
+# inputs are folded into one tool server id list; with tools selected the local tool loop streams the
+# answer, otherwise the client stream is returned directly with cancellation support. Errors are
+# logged and re-raised.
 def generate(model_name: str, messages: list[dict[str, Any]], **kwargs: Any) -> Any:
-    """Generate a chat response through Ollama."""
-
     client = get_client()
+
     # Normalize legacy single-id tool inputs into one shared list format.
     raw_ids = kwargs.pop("tool_server_ids", None) or kwargs.pop("tool_server_id", None) or kwargs.pop("tool_id", None)
     if isinstance(raw_ids, str):
@@ -798,6 +834,7 @@ def generate(model_name: str, messages: list[dict[str, Any]], **kwargs: Any) -> 
     tool_context = dict(kwargs.pop("tool_context", {}) or {})
 
     try:
+        # Reset cancellation left over from a previous generation and build the chat call kwargs.
         _abort_event.clear()
         call_kwargs, dropped_options = _prepare_chat_kwargs_with_metadata(kwargs)
         _report_dropped_options(dropped_options)
