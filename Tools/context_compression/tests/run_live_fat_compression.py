@@ -7,6 +7,7 @@ import os
 import sys
 from pathlib import Path
 
+# Make the project root (Settings, API packages) and the Tools directory importable when the script runs directly.
 ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -17,9 +18,11 @@ if str(TOOLS) not in sys.path:
 
 # Point Settings at the compression engine port before importing API modules.
 def _configure_runtime() -> tuple[str, int]:
+    # Read the engine and port from the environment, with local defaults.
     port = int(os.environ.get("COMPRESSION_PORT", os.environ.get("OLLAMA_PORT", "20004")))
     engine = os.environ.get("COMPRESSION_ENGINE", "ollama-service").strip() or "ollama-service"
 
+    # Import lazily, after sys.path is prepared, and override the engine endpoint in the loaded settings.
     from Settings import settings as settings_module
 
     snapshot = settings_module.load_settings()
@@ -30,10 +33,13 @@ def _configure_runtime() -> tuple[str, int]:
     elif engine in ("openai", "openai-api"):
         # Any OpenAI-compatible local server (LM Studio serves this on its port).
         snapshot["openai_url"] = os.environ.get("COMPRESSION_OPENAI_URL", f"127.0.0.1:{port}/v1")
+
+    # Store the patched snapshot in the settings cache so API modules imported next use this endpoint.
     settings_module._store_settings_cache(snapshot, settings_module._get_settings_mtime_ns())
     return engine, port
 
 
+# Configure the engine endpoint at import time, before the API modules below are imported.
 ENGINE, _RUNTIME_PORT = _configure_runtime()
 
 from context_compression.history_compressor import (
@@ -51,6 +57,7 @@ from context_compression.tests.cache_chat_utils import (
 
 from API import llm_api
 
+# Lowercased substrings that mark a summary field value as raw tool or search output.
 RAW_NOISE_MARKERS = (
     "citation rules",
     "cite search evidence",
@@ -61,11 +68,13 @@ RAW_NOISE_MARKERS = (
     "exit_code",
 )
 
+# Lowercased assistant openers that count as navigation filler in source memory.
 NAV_PREFIXES = (
     "assistant: now let me",
     "assistant: let me ",
 )
 
+# Substrings that reveal a source-code fragment mistaken for a file path.
 FALSE_PATH_MARKERS = (r"\n ", "=", "readlines", "open(", ".strip", ".match", ".Draw", ".Add")
 
 
@@ -109,6 +118,7 @@ def _bad_source_memory(items: list[str]) -> list[str]:
 
 # Choose a local model name from the active engine, preferring smaller local tags.
 def _pick_model(engine: str) -> str:
+    # Collect model names from dict-shaped and object-shaped list entries.
     models = llm_api.get_models(engine)
     names: list[str] = []
     for item in models:
@@ -121,6 +131,7 @@ def _pick_model(engine: str) -> str:
     if not names:
         raise RuntimeError(f"No models from engine {engine!r}")
 
+    # Pick the first name matching a preferred family in order, then any non-cloud model, then the first one.
     preferred = [
         "gpt-oss:20b",
         "gpt-oss",
@@ -161,6 +172,8 @@ def _chunk_visible_text(chunk: object) -> str:
 
 # Build a non-streaming summarize callback for the compression prompt.
 def _summarize_with_model(engine: str, model_name: str):
+    # Send the prompt to the model with temperature 0 and return the concatenated visible reply text;
+    # an empty reply raises RuntimeError.
     def _call(prompt_messages: list[dict[str, str]]) -> str:
         chunks = llm_api.generate(
             engine=engine,
@@ -185,12 +198,14 @@ def _summarize_with_model(engine: str, model_name: str):
 
 # Summarize sanitization metrics for one compression payload.
 def _report(label: str, payload: dict) -> dict[str, int | list[str]]:
+    # Read the list fields defensively, as a model payload may contain wrong types.
     artifacts = payload.get("artifacts") if isinstance(payload.get("artifacts"), dict) else {}
     files = artifacts.get("files") if isinstance(artifacts.get("files"), list) else []
     key_facts = payload.get("key_facts") if isinstance(payload.get("key_facts"), list) else []
     source_memory = payload.get("source_memory") if isinstance(payload.get("source_memory"), list) else []
     short_facts = [fact for fact in key_facts if len(str(fact)) < 15]
 
+    # Counts and sanitization problems; key facts shorter than 15 chars are listed as suspicious.
     report = {
         "label": label,
         "work_summary_chars": len(str(payload.get("work_summary") or "")),
@@ -211,6 +226,7 @@ def main() -> None:
     port = _RUNTIME_PORT
     engine = ENGINE
 
+    # Load the largest chat from the cache database and choose the model (COMPRESSION_MODEL or auto-picked).
     db_path = resolve_cache_db_path()
     if not db_path.exists():
         raise SystemExit(f"Database not found: {db_path}")
@@ -225,6 +241,7 @@ def main() -> None:
     print("chat:", fat["id"], fat["title"], "chars=", fat["chars"], "entries=", len(entries))
     print("engine:", engine, "port:", port, "model:", model_name)
 
+    # Baseline run without a model: only the raw harvest.
     _summary_raw, raw_payload = build_structured_history_summary(
         overflow_entries=entries,
         recent_user_messages=recent,
@@ -236,6 +253,7 @@ def main() -> None:
     print("\n=== raw_only ===")
     print(json.dumps({k: v for k, v in raw_report.items() if k != "label"}, ensure_ascii=False, indent=2))
 
+    # Live run through the real model; model_parsed only checks the work summary for the fallback warning text.
     summarize = _summarize_with_model(engine, model_name)
     summary_text, payload = build_structured_history_summary(
         overflow_entries=entries,
@@ -254,6 +272,7 @@ def main() -> None:
     print("sample_key_facts:", (payload.get("key_facts") or [])[:3])
     print("sample_source_memory:", (payload.get("source_memory") or [])[:3])
 
+    # Save both reports and the summary payload as JSON.
     out_path = REPORTS_DIR / "live_fat_compression_report.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(
@@ -274,6 +293,8 @@ def main() -> None:
     )
     print("\nWrote:", out_path)
 
+    # Exit with an error when either run produced invalid or code-fragment file paths,
+    # or navigation filler in source memory.
     failures: list[str] = []
     for key in ("bad_files", "bad_source_memory"):
         for rep in (raw_report, model_report):
@@ -284,5 +305,6 @@ def main() -> None:
         raise SystemExit("Sanitization regressions:\n" + "\n".join(failures))
 
 
+# Run directly against a live local model: python run_live_fat_compression.py
 if __name__ == "__main__":
     main()

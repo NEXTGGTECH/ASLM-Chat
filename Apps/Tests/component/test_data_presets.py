@@ -13,12 +13,9 @@ from Apps.Data.ollama_presets import DEFAULT_OLLAMA_PRESET_CONFIG, activate_olla
 pytestmark = [pytest.mark.component]
 
 
-# Ollama preset tests.
-# Verify the Ollama preset lifecycle for one model.
+# Cover the per-model Ollama preset lifecycle helpers: state repair, sync, create, activate, rename, delete.
 class OllamaPresetTests(TestCase):
-    """Verify per-model Ollama preset lifecycle helpers."""
-
-    # Create the default preset when no saved state exists.
+    # Verify that ensuring the state of a model with no saved presets creates one active default preset.
     def test_ensure_state_creates_default_preset(self):
         presets, active_preset = ensure_ollama_preset_state("llama3")
 
@@ -28,7 +25,7 @@ class OllamaPresetTests(TestCase):
         self.assertEqual(active_preset.config["num_ctx"], DEFAULT_OLLAMA_PRESET_CONFIG["num_ctx"])
         self.assertEqual(active_preset.config["num_predict"], DEFAULT_OLLAMA_PRESET_CONFIG["num_predict"])
 
-    # Promote the default preset when saved state has no active preset.
+    # Verify that ensuring the state activates the default preset when no saved preset is active.
     def test_ensure_state_promotes_default_when_no_active_preset_exists(self):
         default = OllamaPreset.objects.create(
             model_name="llama3",
@@ -50,7 +47,8 @@ class OllamaPresetTests(TestCase):
         self.assertEqual(active_preset.id, default.id)
         self.assertEqual(sum(1 for preset in presets if preset.is_active), 1)
 
-    # Deactivate duplicate active presets to keep runtime state deterministic.
+    # Verify that ensuring the state keeps the default preset as the only active one and deactivates
+    # the other active preset.
     def test_ensure_state_keeps_only_one_active_preset(self):
         OllamaPreset.objects.create(
             model_name="llama3",
@@ -74,7 +72,8 @@ class OllamaPresetTests(TestCase):
         self.assertFalse(duplicate.is_active)
         self.assertEqual(sum(1 for preset in presets if preset.is_active), 1)
 
-    # Clone the default preset when the active config changes.
+    # Verify that syncing a changed config while the default preset is active keeps the default and
+    # saves the change as a new custom active preset.
     def test_sync_from_default_creates_custom_active_preset(self):
         payload = sync_active_ollama_preset(
             "llama3",
@@ -92,7 +91,8 @@ class OllamaPresetTests(TestCase):
         self.assertEqual(active.config["num_ctx"], 65536)
         self.assertEqual(active.config["think_level"], "high")
 
-    # Keep the default preset active when the config has not changed.
+    # Verify that syncing the unchanged default config keeps the default preset active and creates no
+    # custom preset.
     def test_sync_unchanged_default_config_does_not_create_custom_preset(self):
         payload = sync_active_ollama_preset("llama3", DEFAULT_OLLAMA_PRESET_CONFIG)
 
@@ -100,7 +100,8 @@ class OllamaPresetTests(TestCase):
         self.assertTrue(active.is_default)
         self.assertEqual(OllamaPreset.objects.filter(model_name="llama3").count(), 1)
 
-    # Update custom active presets in place.
+    # Verify that syncing a changed config while a custom preset is active updates that preset in place
+    # instead of creating another one.
     def test_sync_custom_active_preset_updates_in_place(self):
         created = create_ollama_preset(
             "llama3",
@@ -119,7 +120,7 @@ class OllamaPresetTests(TestCase):
         active = OllamaPreset.objects.get(id=payload["active_preset_id"])
         self.assertEqual(active.config["num_ctx"], 65536)
 
-    # Fall back to the default preset after deleting the active custom one.
+    # Verify that deleting the active custom preset makes the default preset active again.
     def test_delete_active_custom_preset_falls_back_to_default(self):
         created = create_ollama_preset(
             "llama3",
@@ -132,7 +133,7 @@ class OllamaPresetTests(TestCase):
         active = OllamaPreset.objects.get(model_name="llama3", is_active=True)
         self.assertTrue(active.is_default)
 
-    # Select a custom preset and deactivate the previous active one.
+    # Verify that activating a custom preset makes it the active record and deactivates the default one.
     def test_activate_preset_switches_active_record(self):
         default_payload = sync_active_ollama_preset("llama3", DEFAULT_OLLAMA_PRESET_CONFIG)
         custom = create_ollama_preset(
@@ -150,7 +151,7 @@ class OllamaPresetTests(TestCase):
         self.assertTrue(OllamaPreset.objects.get(id=custom_preset.id).is_active)
         self.assertEqual(len(custom["presets"]), 2)
 
-    # Reject unsafe operations against the default preset.
+    # Verify that renaming or deleting the default preset raises a ValueError.
     def test_default_preset_cannot_be_renamed_or_deleted(self):
         presets, default_preset = ensure_ollama_preset_state("llama3")
 
@@ -160,7 +161,7 @@ class OllamaPresetTests(TestCase):
             delete_ollama_preset("llama3", str(default_preset.id))
         self.assertEqual(len(presets), 1)
 
-    # Drop unsupported runtime keys before saving a preset.
+    # Verify that syncing a config drops the unsupported runtime keys and keeps the supported ones.
     def test_sync_drops_unsupported_runtime_keys_from_preset_config(self):
         payload = sync_active_ollama_preset(
             "llama3",
@@ -180,7 +181,8 @@ class OllamaPresetTests(TestCase):
         self.assertNotIn("numa", active.config)
         self.assertNotIn("vocab_only", active.config)
 
-    # Normalize compact configs and keep only supported runtime keys.
+    # Verify that normalizing a config drops empty list entries, unsupported keys and nested empty
+    # dicts, and keeps the supported values.
     def test_normalize_config_removes_empty_and_unsupported_values(self):
         payload = normalize_ollama_preset_config(
             {
@@ -198,12 +200,11 @@ class OllamaPresetTests(TestCase):
         self.assertNotIn("mirostat", payload)
         self.assertNotIn("nested", payload)
 
-# LM Studio preset tests.
-# Verify the LM Studio preset lifecycle for one model.
-class LmsPresetTests(TestCase):
-    """Verify per-model LM Studio preset lifecycle helpers."""
 
-    # Create the default preset from model defaults when no state exists.
+# Cover the per-model LM Studio preset lifecycle helpers: state repair, sync, create, activate, rename, delete.
+class LmsPresetTests(TestCase):
+    # Verify that ensuring the state of a model with no saved presets creates one active default preset
+    # built from the model defaults.
     @patch("Apps.Data.lms_presets.lms_api.get_model_settings")
     def test_ensure_state_creates_default_preset(self, mock_get_model_settings):
         mock_get_model_settings.return_value = {
@@ -217,7 +218,7 @@ class LmsPresetTests(TestCase):
         self.assertTrue(active_preset.is_active)
         self.assertEqual(active_preset.config["operation"]["temperature"], 0.7)
 
-    # Promote the default preset when no preset is active.
+    # Verify that ensuring the state activates the default preset when no saved preset is active.
     @patch("Apps.Data.lms_presets.lms_api.get_model_settings")
     def test_ensure_state_promotes_default_when_no_active_preset_exists(self, mock_get_model_settings):
         mock_get_model_settings.return_value = {
@@ -243,7 +244,8 @@ class LmsPresetTests(TestCase):
         self.assertEqual(active_preset.id, default.id)
         self.assertEqual(sum(1 for preset in presets if preset.is_active), 1)
 
-    # Clone the default preset when the active config changes.
+    # Verify that syncing a changed config while the default preset is active keeps the default and
+    # saves the change as a new custom active preset.
     @patch("Apps.Data.lms_presets.lms_api.get_model_settings")
     def test_sync_from_default_creates_custom_active_preset(self, mock_get_model_settings):
         mock_get_model_settings.return_value = {
@@ -262,7 +264,8 @@ class LmsPresetTests(TestCase):
         self.assertFalse(active.is_default)
         self.assertFalse(active.config["operation"]["think"])
 
-    # Keep the default preset when the config matches model defaults.
+    # Verify that syncing a config equal to the model defaults keeps the default preset active and
+    # creates no custom preset.
     @patch("Apps.Data.lms_presets.lms_api.get_model_settings")
     def test_sync_unchanged_default_config_does_not_create_custom_preset(self, mock_get_model_settings):
         mock_get_model_settings.return_value = {
@@ -275,7 +278,8 @@ class LmsPresetTests(TestCase):
         self.assertTrue(active.is_default)
         self.assertEqual(LmsPreset.objects.filter(model_name="qwen3").count(), 1)
 
-    # Update a custom active preset in place.
+    # Verify that syncing a changed config while a custom preset is active updates that preset in place
+    # instead of creating another one.
     @patch("Apps.Data.lms_presets.lms_api.get_model_settings")
     def test_sync_custom_active_preset_updates_in_place(self, mock_get_model_settings):
         mock_get_model_settings.return_value = {
@@ -298,7 +302,7 @@ class LmsPresetTests(TestCase):
         active = LmsPreset.objects.get(id=payload["active_preset_id"])
         self.assertEqual(active.config["operation"]["temperature"], 0.4)
 
-    # Fall back to the default preset after deleting the active custom one.
+    # Verify that deleting the active custom preset makes the default preset active again.
     @patch("Apps.Data.lms_presets.lms_api.get_model_settings")
     def test_delete_active_custom_preset_falls_back_to_default(self, mock_get_model_settings):
         mock_get_model_settings.return_value = {
@@ -315,7 +319,7 @@ class LmsPresetTests(TestCase):
         active = LmsPreset.objects.get(model_name="qwen3", is_active=True)
         self.assertTrue(active.is_default)
 
-    # Select a custom preset and deactivate the previous active one.
+    # Verify that activating a custom preset makes it the active record and deactivates the default one.
     @patch("Apps.Data.lms_presets.lms_api.get_model_settings")
     def test_activate_preset_switches_active_record(self, mock_get_model_settings):
         mock_get_model_settings.return_value = {
@@ -337,7 +341,7 @@ class LmsPresetTests(TestCase):
         self.assertTrue(LmsPreset.objects.get(id=custom_preset.id).is_active)
         self.assertEqual(len(custom["presets"]), 2)
 
-    # Reject unsafe operations against the default preset.
+    # Verify that renaming or deleting the default preset raises a ValueError.
     @patch("Apps.Data.lms_presets.lms_api.get_model_settings")
     def test_default_preset_cannot_be_renamed_or_deleted(self, mock_get_model_settings):
         mock_get_model_settings.return_value = {
@@ -351,7 +355,8 @@ class LmsPresetTests(TestCase):
             delete_lms_preset("qwen3", str(default_preset.id))
         self.assertEqual(len(presets), 1)
 
-    # Normalize legacy top-level options into the operation block.
+    # Verify that normalizing a flat legacy config moves its top-level options into the operation block,
+    # drops empty list entries and drops the load block.
     def test_normalize_config_moves_top_level_options_into_operation(self):
         payload = normalize_lms_preset_config(
             {

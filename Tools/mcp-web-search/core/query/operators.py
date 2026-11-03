@@ -1,17 +1,19 @@
 # Copyright NEXTGGTECH. Elastic License 2.0.
 
-"""Single source of truth for every supported search operator."""
-
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
 from typing import Literal
 
+
+# Schema, validation, compilation and scoring metadata for one operator field. The specs below are
+# the single source of truth for every supported search operator. The fields are the operator key,
+# the kind of value it takes, a description, how it compiles into the query string, its query
+# prefix (if any), the item and length limits, the normalizer applied to values, and whether its
+# values count as content terms.
 @dataclass(frozen=True)
 class SearchOperatorSpec:
-    """Schema, validation, compilation, and scoring metadata for one operator field."""
-
     key: str
     value_kind: Literal["list", "groups", "date"]
     description: str
@@ -26,6 +28,7 @@ class SearchOperatorSpec:
     content_value: bool = False
 
 
+# All supported operators, in the order they are documented and compiled.
 SEARCH_OPERATOR_SPECS: tuple[SearchOperatorSpec, ...] = (
     SearchOperatorSpec(
         "exact_phrases", "list",
@@ -83,8 +86,12 @@ SEARCH_OPERATOR_SPECS: tuple[SearchOperatorSpec, ...] = (
         "date", prefix="before:"
     ),
 )
+
+# Lookup of the spec by operator key.
 SEARCH_OPERATOR_BY_KEY = {spec.key: spec for spec in SEARCH_OPERATOR_SPECS}
 
+# Query prefixes grouped by role: operators that do not carry content terms (the bare "-" exclusion
+# is left out), operators whose values are content terms, and the date bounds.
 NON_CONTENT_OPERATOR_PREFIXES = tuple(
     spec.prefix
     for spec in SEARCH_OPERATOR_SPECS
@@ -96,6 +103,9 @@ CONTENT_OPERATOR_PREFIXES = tuple(
 DATE_OPERATOR_PREFIXES = tuple(
     spec.prefix for spec in SEARCH_OPERATOR_SPECS if spec.value_kind == "date"
 )
+
+# Regex that detects an operator in a raw query (case-insensitive): a known prefix (optionally
+# negated), a quote, an OR keyword, or a minus-prefixed word, each at a word boundary.
 _RECOGNIZED_PREFIX_PATTERN = "|".join(
     re.escape(spec.prefix.lstrip("-"))
     for spec in SEARCH_OPERATOR_SPECS
@@ -108,5 +118,6 @@ SEARCH_OPERATOR_RE = re.compile(
 )
 
 
+# Return True when the query already contains any search operator (quotes, OR, minus, site:, ...).
 def has_search_operators(query: str) -> bool:
     return bool(SEARCH_OPERATOR_RE.search(str(query or "")))

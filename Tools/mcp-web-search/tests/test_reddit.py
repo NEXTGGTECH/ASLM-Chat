@@ -1,13 +1,12 @@
 # Copyright NEXTGGTECH. Elastic License 2.0.
 
-"""Reddit thread fetch: URL shaping, markdown shaping, and the page-first fallback chain."""
-
 from __future__ import annotations
 
 import asyncio
 
 import custom_domains.reddit as reddit
 
+# Reddit thread URL used by all tests.
 _THREAD = "https://www.reddit.com/r/codex/comments/1uaqzvk/again_we_are_here/"
 
 # Minimal but realistic listing payload: one post + one comment with a nested reply.
@@ -25,7 +24,8 @@ _LISTING = [
 ]
 
 
-# .json / page URLs honor a host override (so the old.reddit page path hits the right host).
+# Verify that the .json and thread page URLs honor a host override, so the old.reddit page path hits the
+# right host.
 def test_url_host_override():
     assert reddit.reddit_json_url(_THREAD).startswith("https://www.reddit.com/")
     assert reddit.reddit_json_url(_THREAD).endswith(".json?limit=50&depth=3")
@@ -35,16 +35,18 @@ def test_url_host_override():
     )
 
 
-# Markdown carries the post header plus nested comments with author/score.
+# Verify that the markdown carries the post header plus the comments with author and score, and that the
+# nested reply is indented one level deeper.
 def test_markdown_shape():
     md = reddit.reddit_data_to_markdown(_LISTING, _THREAD)
     assert "u/op" in md and "score: 251" in md
     assert "# Again! We are here" in md
     assert "[alice | +30] top comment" in md
-    assert "  [bob | +3] nested reply" in md  # nested one indent level deeper
+    assert "  [bob | +3] nested reply" in md
 
 
-# old.reddit inner_text: nav head is cut at the post title, footer at the about/blog block.
+# Verify that for the old.reddit inner text the navigation head is cut at the post title and the footer
+# at the about/blog block.
 def test_strip_old_reddit_nav_and_footer():
     raw = (
         "jump to content\nMY SUBREDDITS\nPOPULAR-ALL-USERS\nMORE »\n"
@@ -65,14 +67,17 @@ def test_strip_old_reddit_nav_and_footer():
     assert "advertising" not in text and "CONTINUE" not in text
 
 
-# The old.reddit page render goes first; when it succeeds the .json API is never touched.
+# Verify that the old.reddit page render goes first and, when it succeeds, the .json API is never
+# touched.
 def test_page_first_json_untouched(monkeypatch):
     page_urls: list[str] = []
 
+    # Record the requested page URL and return a rendered page.
     async def _page_ok(thread_url, _timeout):
         page_urls.append(thread_url)
         return "r/codex\npost body rendered from old.reddit"
 
+    # Fail the test if the .json API is called.
     def _curl_must_not_run(*_a, **_k):
         raise AssertionError(".json API must not be called when the page render succeeds")
 
@@ -84,13 +89,16 @@ def test_page_first_json_untouched(monkeypatch):
     assert page_urls and "old.reddit.com" in page_urls[0]
 
 
-# Page render failed (browser down / too short) → the .json API rung wins.
+# Verify that when the page render fails (browser down or content too short) the .json API rung wins
+# and its listing is turned into markdown.
 def test_fallback_json_api(monkeypatch):
+    # Return no page, as if the browser were down.
     async def _page_dead(*_a, **_k):
         return None
 
     json_urls: list[str] = []
 
+    # Record the requested .json URL and return the canned listing.
     def _curl_ok(json_url, _thread_url, _timeout):
         json_urls.append(json_url)
         return _LISTING
@@ -103,11 +111,14 @@ def test_fallback_json_api(monkeypatch):
     assert json_urls and json_urls[0].endswith(".json?limit=50&depth=3")
 
 
-# Both rungs blocked → explicit error marker (handler flips ok=False on it).
+# Verify that when both rungs fail the result is an explicit "Error:" marker, on which the handler sets
+# ok=False.
 def test_all_rungs_blocked(monkeypatch):
+    # Fail as if the browser daemon were unavailable.
     async def _page_dead(*_a, **_k):
         raise RuntimeError("browser daemon unavailable")
 
+    # Fail as if Reddit rejected the request with HTTP 429.
     def _curl_blocked(*_a, **_k):
         raise RuntimeError("HTTP Error 429")
 

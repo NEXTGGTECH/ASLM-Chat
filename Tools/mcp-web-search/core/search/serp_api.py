@@ -24,6 +24,7 @@ from ..engines import (
 from ..engines.models import EngineParseResult, EngineRequest
 from ..fetch.transport import AdaptiveTransport, TransportResponse
 
+# Parsers of the general-purpose engines that run when the caller does not pick a subset.
 DEFAULT_ENGINES = (
     GoogleParser,
     BraveParser,
@@ -36,8 +37,10 @@ DEFAULT_ENGINES = (
 
 # Protocol for transport backends accepted by SerpApi.
 class SerpTransport(Protocol):
+    # Send one engine request and return the transport response.
     async def fetch(self, request: EngineRequest) -> TransportResponse: ...
 
+    # Release the transport's connections.
     async def close(self) -> None: ...
 
 
@@ -110,6 +113,7 @@ def _parse_result_payload(
     response_bytes: int,
     transport: str,
 ) -> dict[str, Any]:
+    # Timings are rounded to 0.01 ms and coverage to three decimals; sources are cut to the limit.
     return {
         "engine": result.engine,
         "provider_family": provider_family,
@@ -130,7 +134,6 @@ def _parse_result_payload(
 
 # Run general-purpose engines concurrently through one pooled transport.
 class SerpApi:
-
     # Initialize the API with an optional pre-built transport and search limits.
     # engines selects which parsers run; callers (tiering/health) pass a subset.
     def __init__(
@@ -141,9 +144,12 @@ class SerpApi:
         source_limit: int = 3,
         engines: tuple[type, ...] = DEFAULT_ENGINES,
     ) -> None:
+        # Public limits and engine list, clamped to sane minimums; an empty engine list means all defaults.
         self.timeout_seconds = max(0.1, float(timeout_seconds))
         self.source_limit = max(1, int(source_limit))
         self.engines = tuple(engines) or DEFAULT_ENGINES
+
+        # Use the given transport (closed by its owner) or create one that close() will release.
         self._owns_transport = transport is None
         self._transport = transport or AdaptiveTransport(timeout_seconds=self.timeout_seconds)
 
@@ -175,6 +181,7 @@ class SerpApi:
         timelimit: str | None,
         blocked_retries: int = 0,
     ) -> dict[str, Any]:
+        # Measurements that end up in the payload; they keep their defaults when the fetch fails early.
         parser = parser_type()
         fetch_started = time.perf_counter()
         http_status: int | None = None
@@ -183,6 +190,8 @@ class SerpApi:
         fetch_ms = 0.0
         parse_ms = 0.0
         request: EngineRequest | None = None
+
+        # First attempt: optional warmup, then fetch and parse, all inside the engine timeout.
         try:
             async with asyncio.timeout(self.timeout_seconds):
                 # Warmup protocol (image engines): a token-hungry parser gets one
@@ -199,6 +208,8 @@ class SerpApi:
                         warmup_response = await self._transport.fetch(warmup_request)
                         if warmup_response.status < 400 and callable(capture_response):
                             capture_response(warmup_request, warmup_response.text())
+
+                # The real request; successful responses are also offered to the parser.
                 request = await _build_engine_request(
                     parser,
                     self._transport,
@@ -214,6 +225,8 @@ class SerpApi:
             http_status = response.status
             response_bytes = len(response.body)
             transport = response.transport
+
+            # HTTP errors become error results (403 and 429 mean BLOCKED); other responses are parsed.
             if response.status >= 400:
                 result = _error_parse_result(parser.name, f"HTTP {response.status}")
                 if response.status in {403, 429}:
@@ -223,10 +236,12 @@ class SerpApi:
                 result = parser.parse(response.text())
                 parse_ms = (time.perf_counter() - parse_started) * 1000
         except TimeoutError:
+            # The engine budget ran out: report a TIMEOUT result instead of raising.
             fetch_ms = (time.perf_counter() - fetch_started) * 1000
             result = _error_parse_result(parser.name, f"Timed out after {self.timeout_seconds:.1f}s")
             result.status = ParseStatus.TIMEOUT
         except Exception as exc:  # noqa: BLE001
+            # Any other failure of one engine becomes an error result and never sinks the search.
             fetch_ms = (time.perf_counter() - fetch_started) * 1000
             result = _error_parse_result(parser.name, f"{type(exc).__name__}: {exc}")
 
@@ -245,11 +260,15 @@ class SerpApi:
             and request is not None
         ):
             attempts += 1
+
+            # Drop both cookie jars (identity store and the transport's pooled clients) for the host.
             host = _host_of(request.url)
             _drop_identity_cookies(request)
             drop_clients = getattr(self._transport, "drop_identity_clients", None)
             if callable(drop_clients) and host:
                 drop_clients(host)
+
+            # Re-fetch with the identity cleared; a timeout or failure ends the retries.
             try:
                 async with asyncio.timeout(self.timeout_seconds):
                     request = await _build_engine_request(
@@ -260,18 +279,23 @@ class SerpApi:
                         safesearch=safesearch,
                         timelimit=timelimit,
                     )
+
                     # Naked fetch: no identity replay and no Set-Cookie capture, so the
                     # retry cannot inherit or persist the burned branch.
                     request = replace(request, identity_key="")
                     response = await self._transport.fetch(request)
                     request = replace(request, identity_key=parser_identity)
             except TimeoutError:
+                # Report the timeout and stop retrying.
                 result = _error_parse_result(parser.name, f"Timed out after {self.timeout_seconds:.1f}s")
                 result.status = ParseStatus.TIMEOUT
                 break
             except Exception as exc:  # noqa: BLE001
+                # Report the failure and stop retrying.
                 result = _error_parse_result(parser.name, f"{type(exc).__name__}: {exc}")
                 break
+
+            # Refresh the measurements and the result from the retry response, as for the first attempt.
             fetch_ms = (time.perf_counter() - fetch_started) * 1000
             http_status = response.status
             response_bytes = len(response.body)
@@ -286,6 +310,7 @@ class SerpApi:
                 parse_ms = (time.perf_counter() - parse_started) * 1000
             result.diagnostics.append(f"captcha retry {attempts}/{blocked_retries}")
 
+        # Serialize the final outcome.
         return _parse_result_payload(
             result,
             provider_family=str(getattr(parser, "provider_family", parser.name)),
@@ -320,6 +345,9 @@ class SerpApi:
         if not query:
             raise ValueError("query must not be empty")
 
+        # Shared state: the overall deadline, the buffer the engine tasks fill and the URLs already
+        # emitted as sources. The engine_* maps (keyed by engine name) override the query, timelimit,
+        # omitted operators and blocked-retry count per engine.
         deadline = self.timeout_seconds if deadline_seconds is None else max(0.1, float(deadline_seconds))
         queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
         seen: set[str] = set()
@@ -336,11 +364,15 @@ class SerpApi:
                 timelimit=engine_timelimit,
                 blocked_retries=int((engine_blocked_retries or {}).get(parser_type.name, 0)),
             )
+
+            # Annotate the payload with what was actually asked of this engine.
             payload["query"] = engine_query
             payload["timelimit"] = engine_timelimit
             payload["omitted_operators"] = list(
                 (engine_omitted_operators or {}).get(parser_type.name, ())
             )
+
+            # Emit each result as a new source, or as a vote when another engine already surfaced the URL.
             for rank, source in enumerate(payload["sources"], 1):
                 url = str(source.get("url") or "")
                 if not url:
@@ -374,6 +406,8 @@ class SerpApi:
                         },
                     }
                 )
+
+            # The engine status event always comes last for its engine.
             await queue.put({"type": "engine", "engine": payload["engine"], "payload": payload})
 
         # Drive all engines concurrently, then signal completion with a sentinel.
@@ -385,6 +419,7 @@ class SerpApi:
             finally:
                 await queue.put(None)
 
+        # Yield events as they arrive until the sentinel or the deadline.
         producer = asyncio.create_task(produce())
         try:
             async with asyncio.timeout(deadline):
@@ -397,6 +432,7 @@ class SerpApi:
             # Budget exhausted — stop pulling; whatever was buffered is the result.
             pass
         finally:
+            # Cancel engines still running and swallow their cancellation or failure.
             producer.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await producer
@@ -410,6 +446,7 @@ class SerpApi:
         safesearch: str = "moderate",
         timelimit: str | None = None,
     ) -> dict[str, Any]:
+        # Drain the stream and keep only each engine's final status payload.
         started = time.perf_counter()
         engine_results: dict[str, dict[str, Any]] = {}
         async for item in self.search_stream(
@@ -436,6 +473,7 @@ class SerpApi:
 _shared_transport: AdaptiveTransport | None = None
 
 
+# Return the shared transport, creating it on first use with the given timeout (later timeouts are ignored).
 def _get_transport(timeout_seconds: float) -> AdaptiveTransport:
     global _shared_transport
     if _shared_transport is None:

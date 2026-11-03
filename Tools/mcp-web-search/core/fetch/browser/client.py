@@ -1,16 +1,5 @@
 # Copyright NEXTGGTECH. Elastic License 2.0.
 
-"""Client seam for the warm-browser layer.
-
-Everything in the search pipeline depends only on this module's `browser_fetch`,
-`browser_available` and `shutdown_browser` — never on cloakbrowser or the daemon
-directly. This is the single universal browser API: callers hand it a URL and get a
-`BrowserFetch` back, with no knowledge of how the page was rendered.
-
-  fetch → HTTP POST to the persistent cloakbrowser daemon (chromium), autostarted
-          on the first call.
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -40,17 +29,27 @@ _SPAWN_WAIT = 25.0
 _SPAWN_THROTTLE = 30.0
 
 
-# Routes page fetches to the warm cloakbrowser daemon (autostarted on first use).
+# Routes page fetches to the persistent warm cloakbrowser daemon (chromium) over HTTP, and
+# autostarts that daemon on the first call. The search pipeline depends only on this module's
+# browser_fetch, browser_available and shutdown_browser, never on cloakbrowser or the daemon
+# directly: callers hand over a URL and get a BrowserFetch back.
 class BrowserClient:
-
+    # Resolve the browser config (the search config by default) and set up the daemon state.
     def __init__(self, cfg=None) -> None:
         self._cfg = cfg or load_search_config().browser
-        self._http: Any | None = None              # lazily-built httpx.AsyncClient
+
+        # Shared httpx.AsyncClient, built lazily on the first daemon call.
+        self._http: Any | None = None
+
+        # Cached result of the last /health probe and when it was taken.
         self._health_ok = False
         self._health_checked_at = 0.0
+
+        # Autostart bookkeeping: the lock serializes spawn attempts, the timestamp throttles
+        # them, and _spawned records whether this client launched the daemon itself.
         self._spawn_lock = asyncio.Lock()
         self._spawn_attempted_at = 0.0
-        self._spawned = False                      # did we launch the daemon ourselves?
+        self._spawned = False
 
     # The browser layer is usable when not disabled and the warm daemon is reachable.
     async def available(self) -> bool:
@@ -82,14 +81,19 @@ class BrowserClient:
     # Spawn the daemon (once, throttled) and poll until it answers or times out.
     async def _autostart(self) -> bool:
         async with self._spawn_lock:
-            if await self._probe():            # another caller won the race
+            # Another caller may have won the race and already started the daemon.
+            if await self._probe():
                 return True
+
+            # Throttle spawn attempts. Zero means no previous attempt, including just after
+            # an OS/WSL startup.
             now = time.monotonic()
-            # Zero means no previous attempt, including just after an OS/WSL startup.
             if self._spawn_attempted_at and now - self._spawn_attempted_at < _SPAWN_THROTTLE:
                 return False
             self._spawn_attempted_at = now
             self._spawn_process()
+
+            # Poll /health until the daemon answers or the wait runs out.
             deadline = time.monotonic() + _SPAWN_WAIT
             while time.monotonic() < deadline:
                 await asyncio.sleep(0.5)
@@ -110,6 +114,8 @@ class BrowserClient:
         kwargs: dict[str, Any] = {
             "cwd": str(root), "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL,
         }
+
+        # Detach the daemon from this process: no console window on Windows, a new session elsewhere.
         if sys.platform == "win32":
             pythonw = Path(executable).with_name("pythonw.exe")
             if pythonw.exists():
@@ -119,6 +125,8 @@ class BrowserClient:
             )
         else:
             kwargs["start_new_session"] = True
+
+        # A failed spawn only logs; the caller notices through the /health polling that follows.
         try:
             subprocess.Popen(
                 [executable, "-m", "core.fetch.browser.daemon", "--port", str(port)], **kwargs
@@ -162,6 +170,8 @@ class BrowserClient:
         if not await self._daemon_ready():
             return BrowserFetch(url=url, status=STATUS_UNAVAILABLE, backend="warm",
                                 error="daemon unreachable")
+
+        # Build the request body; the optional wait, timeout and family are sent only when set.
         payload: dict[str, Any] = {"url": url, "engine": self._cfg.engine}
         if wait_sec is not None:
             payload["wait_ms"] = int(max(0.0, wait_sec) * 1000)
@@ -169,6 +179,8 @@ class BrowserClient:
             payload["timeout_ms"] = int(max(0.1, nav_timeout) * 1000)
         if family:
             payload["family"] = family
+
+        # A transport failure marks the cached health as down so the next call re-probes.
         try:
             client = self._client()
             resp = await client.post(f"{self._cfg.daemon_url}/fetch", json=payload)
@@ -176,6 +188,8 @@ class BrowserClient:
             logger.debug("browser daemon fetch failed for %s: %s", url, exc)
             self._health_ok = False
             return BrowserFetch(url=url, status=STATUS_UNAVAILABLE, backend="warm", error=str(exc))
+
+        # The daemon answers with JSON even for failed scrapes; anything else is a bad response.
         try:
             body = resp.json()
         except Exception:  # noqa: BLE001
@@ -193,14 +207,16 @@ class BrowserClient:
             try:
                 await self._http.aclose()
             except Exception:  # noqa: BLE001
+                # Closing is best-effort during shutdown; the reference is dropped regardless.
                 pass
             self._http = None
 
 
+# Process-wide BrowserClient singleton, created on first use by get_browser_client.
 _client: Optional[BrowserClient] = None
 
 
-# Lazily-initialised process-wide BrowserClient singleton.
+# Return the lazily-initialised process-wide BrowserClient singleton.
 def get_browser_client() -> BrowserClient:
     global _client
     if _client is None:

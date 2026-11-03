@@ -10,10 +10,12 @@ from pathlib import Path
 from typing import Any
 
 
+# Project root, the persisted probe result file under Data, and the time limit of one docker probe.
 BASE_DIR = Path(__file__).resolve().parent.parent
 STATE_FILE = BASE_DIR / "Data" / "docker_status.json"
 _PROBE_TIMEOUT_SECONDS = 6
 
+# Serializes reads and writes of the state file between the probe thread and request threads.
 _state_lock = threading.Lock()
 
 
@@ -46,6 +48,7 @@ def get_status() -> dict[str, Any]:
         try:
             payload = json.loads(STATE_FILE.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
+            # No usable state yet: report Docker as unavailable.
             return {"available": False, "checked_at": None}
     if not isinstance(payload, dict):
         return {"available": False, "checked_at": None}

@@ -39,40 +39,38 @@ pytestmark = pytest.mark.skipif(
     reason=f"container '{config.CONTAINER_NAME}' is not running",
 )
 
+# Name of the task directory that is the only item the model-visible workspace may contain.
 TASK_DIR = config.DEFAULT_TASK_DIR
 
 
-# Privileges.
+# Privileges
 
-
-# The container must not run as root.
+# Verify that the container user is not root.
 def test_container_does_not_run_as_root() -> None:
     _rc, out = _docker_exec("id")
 
     assert "uid=0(root)" not in out, f"container runs as root: {out}"
 
 
-# Host mounts.
+# Host mounts
 
-
-# The Docker socket must not be visible inside the container.
+# Verify that the Docker socket is not visible inside the container.
 def test_docker_socket_is_not_exposed() -> None:
     rc, out = _docker_exec("ls -la /var/run/docker.sock 2>/dev/null || echo NOSOCK")
 
     assert rc != 0 or "NOSOCK" in out, "docker socket is accessible inside the container"
 
 
-# No extra host filesystem mount may be visible.
+# Verify that no host filesystem mount (/host or /mnt/host) is visible inside the container.
 def test_host_filesystem_is_not_mounted() -> None:
     _rc, out = _docker_exec("ls /host 2>/dev/null || ls /mnt/host 2>/dev/null || echo NOHOSTMOUNT")
 
     assert "NOHOSTMOUNT" in out, "host filesystem is mounted inside the container"
 
 
-# Workspace exposure.
+# Workspace exposure
 
-
-# The model-visible workspace must expose only the task directory.
+# Verify that /workspace lists only the task directory (and a .gitkeep file).
 def test_workspace_exposes_only_task_directory() -> None:
     rc, out = _docker_exec("ls /workspace/")
 
@@ -81,14 +79,14 @@ def test_workspace_exposes_only_task_directory() -> None:
     assert not items, f"/workspace exposes items beyond {TASK_DIR}/: {items}"
 
 
-# Project source must not be readable through the workspace mount.
+# Verify that the project source (/workspace/tools) is not readable through the workspace mount.
 def test_project_source_is_not_visible_via_workspace() -> None:
     rc, out = _docker_exec("ls /workspace/tools 2>/dev/null | head -5")
 
     assert not (rc == 0 and out.strip()), f"project source readable inside container: {out}"
 
 
-# Mounted project entrypoints must not be executable from the container.
+# Verify that the mcp-web-search entrypoint cannot be found or executed from inside the container.
 def test_project_bridge_is_not_executable_from_container() -> None:
     rc, out = _docker_exec(
         "test -f /workspace/tools/mcp-web-search/mcp-server.py && "
@@ -98,10 +96,9 @@ def test_project_bridge_is_not_executable_from_container() -> None:
     assert not (rc == 0 and out.strip()), "model can execute mounted project entrypoints"
 
 
-# Filesystem writes.
+# Filesystem writes
 
-
-# /etc must be read-only inside the container.
+# Verify that /etc is read-only inside the container; a leftover test file is removed afterwards.
 def test_etc_is_read_only() -> None:
     rc, out = _docker_exec("touch /etc/pwned_test 2>&1 || echo READONLY")
 
@@ -111,32 +108,33 @@ def test_etc_is_read_only() -> None:
         _docker_exec("rm -f /etc/pwned_test")
 
 
-# Environment.
+# Environment
 
-
-# No secret-looking environment variables may leak into the container.
+# Verify that no secret-looking environment variable (secret, token, password, api key) is set inside the
+# container.
 def test_no_secret_environment_variables() -> None:
     rc, out = _docker_exec("env | grep -iE 'secret|token|password|api_key|api_secret' || echo NONE")
 
     assert out == "NONE" or rc != 0, f"secret-looking env vars found: {out[:300]}"
 
 
-# /proc/self/root must not provide an escape hatch.
+# Verify that /proc/self/root cannot be used to list the root filesystem.
 def test_proc_self_root_escape_is_blocked() -> None:
     rc, out = _docker_exec("ls /proc/self/root/etc/ 2>/dev/null | head -3 || echo BLOCKED")
 
     assert "BLOCKED" in out or rc != 0, "/proc/self/root escape is possible"
 
 
-# Symlinks.
+# Symlinks
 
-
-# A symlink into the task directory must not read host files, neither through
-# the container shell nor through the host-side read() helper.
+# Verify that a symlink to /etc/passwd inside the task directory does not expose host files, neither
+# through the container shell nor through the host-side read() helper.
 def test_symlink_escape_via_task_directory_is_blocked() -> None:
+    # Arrange: recreate the symlink inside the task directory.
     _docker_exec(f"rm -f /workspace/{TASK_DIR}/__sym_test")
     _docker_exec(f"ln -s /etc/passwd /workspace/{TASK_DIR}/__sym_test")
     try:
+        # Act and assert: reading it through the container shell must not return the file content.
         rc, out = _docker_exec(f"cat /workspace/{TASK_DIR}/__sym_test 2>/dev/null | head -1 || echo BLOCKED")
 
         assert not (rc == 0 and "root:" in out), "symlink escape works through the container shell"
@@ -146,12 +144,14 @@ def test_symlink_escape_via_task_directory_is_blocked() -> None:
             read_result = workspace_read_symtest()
             assert "root:" not in read_result, "workspace read() follows symlink targets"
         except Exception:
+            # read() raising for the symlink is also acceptable: nothing is leaked in that case.
             pass
     finally:
         _docker_exec(f"rm -f /workspace/{TASK_DIR}/__sym_test")
 
 
-# Read the symlink target through the host-side workspace helper.
+# Read the __sym_test symlink in the task directory through the host-side workspace helper and return the
+# content, or an empty string when the result has none.
 def workspace_read_symtest() -> str:
     from sandbox import workspace
 

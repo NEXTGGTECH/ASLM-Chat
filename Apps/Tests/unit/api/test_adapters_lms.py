@@ -15,7 +15,7 @@ pytestmark = [pytest.mark.unit]
 
 # Cover LM Studio metadata normalization and capability fallback.
 class LmsAdapterTests(SimpleTestCase):
-    # Test native prediction options never forward unsupported raw config.
+    # Verify that native prediction options never forward the unsupported raw config but keep other options.
     def test_native_prediction_options_drop_raw_config(self):
         payload = _prepare_native_prediction_options(
             {"raw": {"fields": [{"key": "custom", "value": True}]}, "maxTokens": 32},
@@ -26,9 +26,9 @@ class LmsAdapterTests(SimpleTestCase):
         self.assertNotIn("raw", payload)
         self.assertEqual(payload["maxTokens"], 32)
 
-    # Test serialize model info reads nested info wrapper.
+    # Verify that serializing model info reads the fields from a nested info attribute of the wrapper object.
     def test_serialize_model_info_reads_nested_info_wrapper(self):
-        # Define info.
+        # Fake SDK info object that holds the model fields.
         class Info:
             model_key = "qwen3"
             display_name = "Qwen 3"
@@ -36,7 +36,7 @@ class LmsAdapterTests(SimpleTestCase):
             trained_for_tool_use = True
             max_context_length = 65536
 
-        # Define wrapper.
+        # Fake SDK model object that exposes the fields only through its info attribute.
         class Wrapper:
             info = Info()
 
@@ -47,28 +47,28 @@ class LmsAdapterTests(SimpleTestCase):
         self.assertTrue(payload["trainedForToolUse"])
         self.assertEqual(payload["maxContextLength"], 65536)
 
-    # Test get model settings uses loaded model info when direct lookup fails.
+    # Verify that get_model_settings falls back to the info of a loaded model when the direct model lookup fails.
     @patch("API.lms._get_catalog_model_info", return_value={})
     @patch("API.lms._close_client")
     @patch("API.lms._get_client")
-    # Verify get model settings uses loaded model info when direct lookup fails.
     def test_get_model_settings_uses_loaded_model_info_when_direct_lookup_fails(
         self,
         mock_get_client,
         _mock_close_client,
         _mock_catalog,
     ):
-        # Define loaded info.
+        # Fake SDK info object of a loaded model.
         class LoadedInfo:
             model_key = "qwen3"
             vision = True
             trained_for_tool_use = True
             max_context_length = 65536
 
-        # Define loaded model.
+        # Fake SDK loaded-model object that carries the info.
         class LoadedModel:
             info = LoadedInfo()
 
+        # Arrange: the direct lookup raises, so only the loaded-model list can supply the capabilities.
         client = Mock()
         client.llm.get_model_info.side_effect = RuntimeError("not loaded")
         client.list_loaded_models.return_value = [LoadedModel()]
@@ -80,6 +80,8 @@ class LmsAdapterTests(SimpleTestCase):
         self.assertTrue(payload["supports_tool_calling"])
         self.assertEqual(payload["context_length"], 65536)
 
+    # Verify that an unloaded model gets its capabilities, thinking support and context length from the LM Studio
+    # catalog without any SDK client being created.
     @patch("API.lms._get_client")
     @patch("API.lms._get_local_gpu_devices", return_value=[])
     @patch("API.lms._get_disk_model_operation_defaults", return_value={})
@@ -101,6 +103,9 @@ class LmsAdapterTests(SimpleTestCase):
         self.assertEqual(payload["context_length"], 262144)
         client.assert_not_called()
 
+    # Verify that the catalog lookup matches an llm model by its loaded instance id, its key or a variant name,
+    # returns an empty result for a short name that is ambiguous between two keys and queries the REST models
+    # endpoint.
     @patch("API.lms.urlopen_with_loopback_bypass")
     @patch("API.lms.settings.get_engine_url", return_value="http://localhost:1234/v1")
     def test_catalog_resolves_model_keys_and_loaded_instance_aliases(self, _url, request):
@@ -116,7 +121,8 @@ class LmsAdapterTests(SimpleTestCase):
         self.assertEqual(lms_api._get_catalog_model_info("model"), {})
         self.assertEqual(request.call_args.args[0].full_url, "http://localhost:1234/api/v1/models")
 
-    # Test prepare OpenAI prediction options keeps LM Studio custom values in extra body.
+    # Verify that OpenAI-compatible prediction options keep standard values at the top level, map the think level
+    # to reasoning_effort and move LM Studio custom values into extra_body.
     def test_prepare_openai_prediction_options_keeps_lms_custom_values_in_extra_body(self):
         payload = _prepare_openai_prediction_options(
             {

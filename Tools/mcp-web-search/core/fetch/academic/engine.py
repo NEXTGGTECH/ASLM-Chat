@@ -1,14 +1,5 @@
 # Copyright NEXTGGTECH. Elastic License 2.0.
 
-"""Academic vertical engine: fan out to keyless scholarly REST APIs under a hard budget.
-
-Mirrors the shopping engine's discipline — concurrent providers, one hard deadline per
-effort tier, whatever finished by the deadline is merged (the rest is cancelled, marked
-partial). Every provider soft-fails independently: a 4xx/timeout/parse miss drops that
-provider, never the search. Results are deduped across providers (DOI first, then a
-normalized title) so the same paper indexed by OpenAlex and Crossref counts once.
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -29,6 +20,7 @@ from .providers import AcademicProvider, ranked_providers
 EFFORT_LIMIT = {"low": 6, "medium": 10, "high": 16}
 EFFORT_HARD_TIMEOUT_MS = {"low": 3500, "medium": 6000, "high": 9000}
 
+# Default request headers for every provider call (polite contact UA, JSON or Atom accepted).
 _HEADERS = {
     "User-Agent": (
         "ASLM-Chat-academic/1.0 (mailto:aslm-chat@users.noreply.github.com) "
@@ -36,6 +28,8 @@ _HEADERS = {
     ),
     "Accept": "application/json, application/atom+xml;q=0.9, */*;q=0.5",
 }
+
+# Matches runs of non-alphanumerics; replaced with a space to normalize titles for dedup.
 _TITLE_NORM_RE = re.compile(r"[^a-z0-9]+")
 
 # Ranking diversity knobs. Consensus rewards cross-index agreement (quality signal, folded
@@ -53,7 +47,15 @@ def _min_interval(provider: AcademicProvider) -> float:
     return 1.0 / rps if rps > 0 else 0.0
 
 
+# Academic vertical engine: fans out to keyless scholarly REST APIs under a hard budget.
+# Mirrors the shopping engine's discipline: providers run concurrently under one hard deadline
+# per effort tier, and whatever finished by the deadline is merged (the rest is cancelled and
+# the result is marked partial). Every provider soft-fails independently: a 4xx, timeout or
+# parse miss drops that provider, never the search. Results are deduped across providers (DOI
+# first, then a normalized title) so the same paper indexed by OpenAlex and Crossref counts once.
 class AcademicSearchEngine:
+    # Run one academic search: fire the available providers concurrently, collect what finishes
+    # before the hard deadline, then rank and dedupe the papers into a result with attempt records.
     async def search(
         self,
         query: str,
@@ -62,12 +64,15 @@ class AcademicSearchEngine:
         limit: int | None = None,
         hard_timeout_ms: int | None = None,
     ) -> AcademicSearchResult:
+        # Resolve the effort tier into the result cap and the hard deadline. Providers are asked
+        # for a little more than the cap so dedup still fills it.
         started = time.perf_counter()
         effort = effort if effort in EFFORT_LIMIT else "medium"
         cap = limit if limit is not None else EFFORT_LIMIT[effort]
-        per_provider = max(3, cap)  # over-fetch a little so dedup still fills the cap
+        per_provider = max(3, cap)
         timeout_ms = hard_timeout_ms if hard_timeout_ms is not None else EFFORT_HARD_TIMEOUT_MS[effort]
 
+        # Per-search accumulators: attempt records, raw papers and the partial-result flag.
         health = get_provider_health()
         attempts: list[AcademicProviderAttempt] = []
         collected: list[AcademicPaper] = []
@@ -94,6 +99,7 @@ class AcademicSearchEngine:
                     error="paced (rps budget)",
                 ))
 
+        # Fire the selected providers concurrently and harvest completions until the deadline.
         timeout = httpx.Timeout(timeout_ms / 1000, connect=min(3.0, timeout_ms / 1000))
         async with httpx.AsyncClient(headers=_HEADERS, follow_redirects=True, timeout=timeout) as client:
             tasks = {
@@ -116,6 +122,8 @@ class AcademicSearchEngine:
                         papers, attempt = task.result()
                         attempts.append(attempt)
                         collected.extend(papers)
+
+                # Deadline reached: cancel the unfinished providers and mark the result partial.
                 if pending:
                     partial = True
                     partial_reason = "hard_timeout"
@@ -123,11 +131,13 @@ class AcademicSearchEngine:
                         task.cancel()
                     await asyncio.gather(*pending, return_exceptions=True)
             except asyncio.CancelledError:
+                # The caller cancelled the whole search: stop every provider task, then propagate.
                 for task in tasks:
                     task.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
                 raise
 
+        # Merge duplicates across providers, rank, and report timings plus per-provider health.
         papers = self._rank_and_dedupe(collected, cap)
         return AcademicSearchResult(
             query=query,
@@ -153,6 +163,7 @@ class AcademicSearchEngine:
     ) -> tuple[list[AcademicPaper], AcademicProviderAttempt]:
         url = provider.url_builder(query, limit)
         health = get_provider_health()
+
         # SerpApi google_scholar: the query/engine/key ride in params (the engine holds the
         # secret, not the provider). No key → not selected, but guard anyway.
         params = None
@@ -167,6 +178,8 @@ class AcademicSearchEngine:
                 )
             params = {"engine": "google_scholar", "q": query, "num": min(20, max(1, limit)),
                       "api_key": key, "output": "json", "hl": "en"}
+
+        # Fetch the page; arXiv calls go through the shared arXiv API slot (its own rate limit).
         started = time.perf_counter()
         try:
             if provider.name == "arxiv":
@@ -175,6 +188,8 @@ class AcademicSearchEngine:
             else:
                 resp = await client.get(url, params=params, headers=provider.headers())
             elapsed = int((time.perf_counter() - started) * 1000)
+
+            # A non-200 response counts against the provider's health and ends the attempt.
             if resp.status_code != 200:
                 health.record(provider.name, ok=False, status_code=resp.status_code)
                 return [], AcademicProviderAttempt(
@@ -182,6 +197,8 @@ class AcademicSearchEngine:
                     elapsed_ms=elapsed, status_code=resp.status_code,
                     error=f"http {resp.status_code}",
                 )
+
+            # Parse by response format: atom (arXiv), SerpApi JSON, scraped HTML, or per-provider JSON.
             if provider.fmt == "atom":
                 papers = parse_arxiv(resp.text)
             elif provider.fmt == "serpapi":
@@ -198,9 +215,12 @@ class AcademicSearchEngine:
                 papers = parse_scholar(resp.text)
             else:
                 papers = PARSERS[provider.name](resp.json())
+
+            # Drop untitled records and score the rest.
             papers = [p for p in papers if p.title]
             for p in papers:
                 p.confidence = self._score(p, provider)
+
             # A clean 200 (even with zero papers) is healthy — it resets the streak.
             health.record(provider.name, ok=True, status_code=200)
             return papers, AcademicProviderAttempt(
@@ -263,12 +283,14 @@ class AcademicSearchEngine:
             if tkey:
                 by_title[tkey] = ckey
 
+        # Consensus bonus: reward papers several providers agree on (capped at 3 extra sources).
         kept = [best[k] for k in order]
         for paper in kept:
             agree = len(paper.meta.get("also_in", []))
             if agree:
                 paper.confidence = round(paper.confidence + _CONSENSUS_BONUS * min(agree, 3), 4)
 
+        # Saturation: the Nth pick from one source loses N * _SOURCE_SATURATION in ordering only.
         seen: dict[str, int] = {}
         adjusted: list[tuple[float, AcademicPaper]] = []
         for paper in sorted(kept, key=lambda p: p.confidence, reverse=True):
@@ -278,6 +300,8 @@ class AcademicSearchEngine:
         adjusted.sort(key=lambda t: t[0], reverse=True)
         return [paper for _, paper in adjusted][:cap]
 
+    # Fill gaps in the kept paper (abstract, PDF, DOI, citations, open access) from a duplicate
+    # and record the duplicate's source in `meta["also_in"]`.
     @staticmethod
     def _backfill(keep: AcademicPaper, other: AcademicPaper) -> None:
         if not keep.abstract and other.abstract:
@@ -293,6 +317,7 @@ class AcademicSearchEngine:
             keep.meta.setdefault("also_in", []).append(other.source)
 
 
+# Run one academic search with a fresh engine (convenience entry point).
 async def search_academic(
     query: str, *, effort: str = "medium", limit: int | None = None
 ) -> AcademicSearchResult:

@@ -13,12 +13,14 @@ class AcademicPaper:
     id: str
     title: str
     url: str
-    source: str               # provider name (openalex/crossref/...)
+    # Provider name (openalex/crossref/...).
+    source: str
     source_domain: str
     authors: list[str] = field(default_factory=list)
     abstract: str = ""
     year: int | None = None
-    venue: str = ""           # journal / conference / repository
+    # Journal, conference or repository name.
+    venue: str = ""
     doi: str = ""
     pdf_url: str = ""
     open_access: bool = False
@@ -40,6 +42,8 @@ class AcademicProviderAttempt:
     error: str = ""
 
 
+# Outcome of one academic search: the ranked papers, the per-provider attempts, timings and
+# whether the hard deadline cut it short (`partial`, with the reason in `partial_reason`).
 @dataclass(slots=True)
 class AcademicSearchResult:
     query: str

@@ -7,6 +7,7 @@ import os
 import socket
 from urllib.parse import parse_qsl, urljoin, urlparse, urlunparse, urlencode
 
+# Query parameters that only carry tracking or referral data and are dropped by normalize_url.
 _TRACKING_PARAMS = frozenset({
     "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
     "utm_id", "fbclid", "gclid", "msclkid", "mc_cid", "mc_eid",
@@ -27,6 +28,7 @@ def normalize_url(url: str) -> str:
         return url
 
 
+# File extensions of binary or media assets that are never read as text, grouped by kind.
 _NON_TEXT_EXTS = frozenset({
     # Images
     ".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".bmp", ".tif", ".tiff",
@@ -43,13 +45,13 @@ _NON_TEXT_EXTS = frozenset({
     ".rtf", ".epub", ".sqlite", ".db", ".exe", ".dmg", ".msi", ".bin", ".dll", ".so",
 })
 
+# Content-type families (prefix match) and exact content types that never enter text extraction.
 _NON_TEXT_CONTENT_PREFIXES = (
     "image/",
     "video/",
     "audio/",
     "font/",
 )
-
 _NON_TEXT_CONTENT_TYPES = frozenset({
     "application/zip",
     "application/x-zip-compressed",
@@ -94,6 +96,8 @@ def is_non_text_content_type(content_type: str) -> bool:
     return ctype in _NON_TEXT_CONTENT_TYPES
 
 
+# SSRF guard settings: the only schemes a fetch may use, hostnames and name suffixes that
+# denote internal targets, and the maximum number of redirect hops per fetch.
 _FETCH_SCHEMES = frozenset({"http", "https"})
 _INTERNAL_HOSTS = frozenset({
     "localhost",
@@ -113,12 +117,12 @@ _INTERNAL_SUFFIXES = (
 _MAX_REDIRECTS = 5
 
 
-# Raised when a URL points at an SSRF-sensitive target.
+# Error raised when a URL points at an SSRF-sensitive target.
 class UnsafeFetchUrl(ValueError):
     pass
 
 
-# True when ASLM_WEB_ALLOW_PRIVATE_NET permits RFC1918 / link-local targets.
+# Return True when ASLM_WEB_ALLOW_PRIVATE_NET permits RFC1918 / link-local targets.
 def _private_fetch_allowed() -> bool:
     return os.environ.get("ASLM_WEB_ALLOW_PRIVATE_NET", "").strip().lower() in {
         "1",
@@ -128,7 +132,7 @@ def _private_fetch_allowed() -> bool:
     }
 
 
-# True when host is a literal IP address (v4 or v6).
+# Return True when host is a literal IP address (v4 or v6).
 def _host_is_ip_literal(host: str) -> bool:
     try:
         ipaddress.ip_address(host.strip("[]"))
@@ -137,7 +141,8 @@ def _host_is_ip_literal(host: str) -> bool:
         return False
 
 
-# True when IP is not globally routable (private, loopback, link-local, etc.).
+# Return True when the IP is not globally routable (private, loopback, link-local, etc.);
+# unparsable text counts as blocked.
 def _is_blocked_ip(ip_text: str) -> bool:
     try:
         ip = ipaddress.ip_address(ip_text)
@@ -158,7 +163,9 @@ def _resolve_host_ips(host: str) -> set[str]:
         raise UnsafeFetchUrl(f"could not resolve host {host!r}: {exc}") from exc
 
 
-# Validate a URL before an LLM-controlled web fetch (public HTTP/S only by default).
+# Validate a URL before an LLM-controlled web fetch (public HTTP/S only by default) and return
+# it unchanged. Raises UnsafeFetchUrl for other schemes, internal or single-label hosts, and
+# hosts that resolve to non-public addresses; allow_private skips the host checks.
 def validate_public_fetch_url(url: str, *, allow_private: bool | None = None) -> str:
     allow_private = _private_fetch_allowed() if allow_private is None else allow_private
     parsed = urlparse((url or "").strip())
@@ -172,12 +179,14 @@ def validate_public_fetch_url(url: str, *, allow_private: bool | None = None) ->
     if allow_private:
         return url
 
+    # Reject well-known internal names and dotless hosts before any DNS lookup.
     if host in _INTERNAL_HOSTS or any(host.endswith(suffix) for suffix in _INTERNAL_SUFFIXES):
         raise UnsafeFetchUrl(f"blocked internal host {host!r}")
 
     if not _host_is_ip_literal(host) and "." not in host:
         raise UnsafeFetchUrl(f"blocked single-label host {host!r}")
 
+    # Check every address the host maps to (or the literal IP itself) against the non-global ranges.
     ips = {host.strip("[]")} if _host_is_ip_literal(host) else _resolve_host_ips(host)
     blocked = sorted(ip for ip in ips if _is_blocked_ip(ip))
     if blocked:
@@ -186,7 +195,7 @@ def validate_public_fetch_url(url: str, *, allow_private: bool | None = None) ->
     return url
 
 
-# Resolve and validate one redirect Location header.
+# Resolve one redirect Location header against the current URL and validate the result.
 def validate_redirect_target(current_url: str, location: str, *, allow_private: bool | None = None) -> str:
     if not location:
         raise UnsafeFetchUrl("redirect without Location header")

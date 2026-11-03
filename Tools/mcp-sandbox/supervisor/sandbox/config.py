@@ -16,13 +16,13 @@ from pathlib import Path
 # Only SANDBOX_IN_CONTAINER and SANDBOX_CONFIG_FILE are read pre-load —
 # the first decides whether we load at all (container env wins), the second
 # tells us where to load from.
-
 IN_CONTAINER = os.getenv("SANDBOX_IN_CONTAINER", "").strip().lower() in {
     "1",
     "true",
     "yes",
 }
 
+# Location of sandbox.env (and its sandbox.json source), overridable through the environment.
 CONFIG_FILE_PATH = os.getenv(
     "SANDBOX_CONFIG_FILE",
     os.path.join(str(Path(__file__).resolve().parents[2]), "sandbox.env"),
@@ -42,9 +42,11 @@ def _load_sandbox_env(path: str) -> None:
                 if key and key not in os.environ:
                     os.environ[key] = value.strip()
     except OSError:
+        # A missing or unreadable env file is fine: the process environment and defaults apply.
         pass
 
 
+# Pull the host-side config into os.environ at import time, before any variable below is read.
 if not IN_CONTAINER:
     # Regenerate the ENV bridge before any sandbox-controlled variable is read.
     from sandbox.config_bridge import sync_sandbox_env
@@ -52,6 +54,7 @@ if not IN_CONTAINER:
     sync_sandbox_env(json_path=Path(CONFIG_FILE_PATH).with_suffix(".json"), env_path=Path(CONFIG_FILE_PATH))
     _load_sandbox_env(CONFIG_FILE_PATH)
 
+# Container identity: name, image (and where it comes from) and the prefix of snapshot images.
 CONTAINER_NAME = os.getenv("SANDBOX_CONTAINER_NAME", "aslm-chat-sandbox")
 SANDBOX_IMAGE = os.getenv("SANDBOX_IMAGE", "nggtlightkeeper/aslm-chat-sandbox:latest")
 SANDBOX_IMAGE_SOURCE = os.getenv("SANDBOX_IMAGE_SOURCE", "registry").strip().lower()
@@ -59,6 +62,9 @@ SNAPSHOT_IMAGE_PREFIX = os.getenv(
     "SANDBOX_SNAPSHOT_PREFIX",
     f"{CONTAINER_NAME}-snapshot",
 )
+
+# Workspace layout inside the container: the mount point, the default per-task subdirectory the model
+# works in, and the resulting model-visible working directory.
 CONTAINER_WORKSPACE = "/workspace"
 DEFAULT_TASK_DIR = os.getenv("SANDBOX_DEFAULT_TASK_DIR", "_sandbox")
 MODEL_WORKSPACE_CONTAINER = (
@@ -67,13 +73,17 @@ MODEL_WORKSPACE_CONTAINER = (
     else CONTAINER_WORKSPACE
 )
 
+# Unprivileged user that runs commands, and where the supervisor source and its virtualenv live
+# (inside the container, plus the host-side venv location).
 COMMAND_USER = os.getenv("SANDBOX_COMMAND_USER", "sandbox_user")
 SUPERVISOR_SRC = os.getenv("SANDBOX_SUPERVISOR_SRC", "/opt/sandbox-src")
 SUPERVISOR_VENV = os.getenv("SANDBOX_SUPERVISOR_VENV", "/opt/sandbox-venv")
 SUPERVISOR_VENV_HOST = os.getenv("SANDBOX_SUPERVISOR_VENV_HOST", "").strip()
 
+# Project root: the mcp-sandbox directory on the host, the baked supervisor source in the container.
+# The default workspace is the project root itself; the host workspace may be overridden by env.
 _PROJECT_ROOT = (
-    Path(__file__).resolve().parents[2]  # mcp-sandbox/
+    Path(__file__).resolve().parents[2]
     if not IN_CONTAINER
     else Path(SUPERVISOR_SRC)
 )
@@ -93,12 +103,16 @@ SUPERVISOR_SRC_HOST = os.getenv(
 ).strip()
 
 
-# Import and sharing settings.
+# Import and sharing settings
 
+# Raw os.pathsep-separated list of host directories the model may import files from.
 IMPORT_ROOTS_ENV = os.getenv("SANDBOX_IMPORT_ROOTS", "")
 
-# Execution limits.
 
+# Execution limits
+
+# Output budget per command (bytes) and the share of it kept from the head when truncating, the
+# background job directory, and the default and OCR timeouts (seconds).
 MAX_OUTPUT_BYTES = int(os.getenv("SANDBOX_MAX_OUTPUT_BYTES", "60000"))
 OUTPUT_HEAD_RATIO = float(os.getenv("SANDBOX_OUTPUT_HEAD_RATIO", "0.5"))
 JOB_ROOT = os.getenv(
@@ -109,6 +123,9 @@ JOB_ROOT = os.getenv(
 )
 DEFAULT_TIMEOUT = int(os.getenv("SANDBOX_DEFAULT_TIMEOUT", "60"))
 OCR_TIMEOUT = int(os.getenv("SANDBOX_OCR_TIMEOUT", "60"))
+
+# Size and count caps for file reads, previews and listings, plus how many identical repeated
+# commands are tolerated before the loop breaker triggers.
 MAX_READ_BYTES = int(os.getenv("SANDBOX_MAX_READ_BYTES", "200000"))
 MAX_CAT_FILE_BYTES = int(os.getenv("SANDBOX_MAX_CAT_FILE_BYTES", "30720"))
 MAX_CAT_LINE_THRESHOLD = int(os.getenv("SANDBOX_MAX_CAT_LINE_THRESHOLD", "300"))
@@ -118,9 +135,14 @@ MAX_FIND_RESULTS = int(os.getenv("SANDBOX_MAX_FIND_RESULTS", "200"))
 MAX_GREP_RESULTS = int(os.getenv("SANDBOX_MAX_GREP_RESULTS", "200"))
 LOOP_BREAK_THRESHOLD = int(os.getenv("SANDBOX_LOOP_BREAK_THRESHOLD", "3"))
 
-# Presentation layer tuning.
 
+# Presentation and container resource limits
+
+# Symbol cap for the file map shown by the presentation layer.
 MAX_FILE_MAP_SYMBOLS = int(os.getenv("SANDBOX_MAX_FILE_MAP_SYMBOLS", "50"))
+
+# Container resource limits: CPU, threads, memory, swap, process count, storage and network
+# (enabled flag and bandwidth cap in Mbit; 0 means no cap).
 CPU_LIMIT = os.getenv("SANDBOX_CPU_LIMIT", "8")
 THREAD_LIMIT = int(os.getenv("SANDBOX_THREAD_LIMIT", "8"))
 MEMORY_LIMIT = os.getenv("SANDBOX_MEMORY_LIMIT", "6g")
@@ -131,12 +153,19 @@ NETWORK_ENABLED = os.getenv("SANDBOX_NETWORK_ENABLED", "1").strip().lower() not 
     "0", "false", "no", "off",
 }
 NETWORK_LIMIT_MBIT = int(os.getenv("SANDBOX_NETWORK_LIMIT_MBIT", "0"))
+
+# How long to wait for the Docker daemon after launching Docker Desktop (seconds).
 DOCKER_START_TIMEOUT_SECONDS = int(
     os.getenv("SANDBOX_DOCKER_START_TIMEOUT_SECONDS", "60")
 )
+
+# Commands with a timeout at or above this many seconds are run as background jobs.
 BACKGROUND_TIMEOUT_THRESHOLD = int(
     os.getenv("SANDBOX_BACKGROUND_TIMEOUT_THRESHOLD", "10")
 )
+
+# Idle workspace cleanup: on/off switch, idle seconds before the workspace is moved into a tmp batch,
+# age in seconds after which a staged batch is sent to the trash, and the monitor polling interval.
 WORKSPACE_CLEANUP_ENABLED = os.getenv(
     "SANDBOX_WORKSPACE_CLEANUP_ENABLED",
     "1",
@@ -152,13 +181,15 @@ WORKSPACE_CLEANUP_INTERVAL_SECONDS = int(
 )
 
 
-# Docker Desktop discovery.
+# Docker Desktop discovery
 
+# Candidate Docker Desktop install locations on Windows.
 WINDOWS_DOCKER_DESKTOP_PATHS = [
     os.path.expandvars(r"%ProgramFiles%\Docker\Docker\Docker Desktop.exe"),
     os.path.expandvars(r"%LocalAppData%\Docker\Docker Desktop.exe"),
 ]
 
+# Candidate Docker Desktop install locations on macOS.
 MACOS_DOCKER_DESKTOP_PATHS = [
     "/Applications/Docker.app",
     os.path.expanduser("~/Applications/Docker.app"),
@@ -172,6 +203,9 @@ LINUX_DOCKER_DESKTOP_PATHS = [
 ]
 
 
+# Search and listing tuning
+
+# Directory names skipped when walking or searching the workspace (VCS, caches, build output).
 IGNORED_DIR_NAMES = {
     ".git",
     ".hg",
@@ -188,7 +222,7 @@ IGNORED_DIR_NAMES = {
     ".nuxt",
 }
 
-
+# Built-in ripgrep type aliases mapped to glob patterns, used when `rg --type-list` is unavailable.
 _RG_TYPE_FALLBACK = {
     "c": "*.c",
     "cc": "*.cc",
@@ -213,8 +247,11 @@ _RG_TYPE_FALLBACK = {
 }
 
 
-# Return ripgrep type aliases mapped to representative glob patterns.
+# Return ripgrep type aliases mapped to representative glob patterns. The map comes from
+# `rg --type-list` (first `*.ext` pattern of each type, plus the bare extension as an alias) and is
+# topped up with the fallback table; the fallback alone is used when rg cannot be run.
 def _load_rg_type_map() -> dict[str, str]:
+    # Ask ripgrep for its type list.
     try:
         result = subprocess.run(
             ["rg", "--type-list"],
@@ -230,6 +267,7 @@ def _load_rg_type_map() -> dict[str, str]:
     if result.returncode != 0:
         return dict(_RG_TYPE_FALLBACK)
 
+    # Parse lines of the form "name: pattern, pattern", keeping only types with a "*.ext" glob.
     type_map: dict[str, str] = {}
     for raw_line in result.stdout.splitlines():
         name, sep, patterns = raw_line.partition(":")
@@ -246,18 +284,26 @@ def _load_rg_type_map() -> dict[str, str]:
         if ext_alias:
             type_map.setdefault(ext_alias, first_pattern)
 
+    # Fill gaps (and the empty-output case) from the fallback table without overriding rg's data.
     for key, value in _RG_TYPE_FALLBACK.items():
         type_map.setdefault(key, value)
     return type_map or dict(_RG_TYPE_FALLBACK)
 
 
+# Ripgrep type alias to glob mapping, resolved once at import time.
 RG_TYPE_TO_GLOB = _load_rg_type_map()
 
 
-# Return True when the host workspace path looks safe.
+# Workspace safety
+
+# Return True when the host workspace path looks safe: it must not be a drive or filesystem root, must
+# not contain a system directory name, must be at least two path components deep, and without a
+# default task subdirectory its last component must contain "sandbox".
 def _validate_workspace_path(path: str) -> bool:
     normalized = os.path.normpath(os.path.abspath(path)).lower()
     path_name = os.path.basename(normalized.rstrip("\\/"))
+
+    # Substrings that mark system locations; any match rejects the path.
     dangerous_patterns = [
         "windows",
         "system32",
@@ -272,16 +318,20 @@ def _validate_workspace_path(path: str) -> bool:
         "/root",
     ]
 
+    # Reject drive roots and the filesystem root.
     if len(normalized) <= 3 and normalized.endswith((":\\", ":/")):
         return False
 
     if normalized in {"/", "\\"}:
         return False
 
+    # Reject paths that point into system directories.
     for pattern in dangerous_patterns:
         if pattern in normalized:
             return False
 
+    # Without a task subdirectory the model works directly in the workspace, so the directory name
+    # itself must signal that it is a sandbox; also require a path that is not top-level.
     path_parts = normalized.replace("\\", "/").strip("/").split("/")
     if DEFAULT_TASK_DIR in {"", "."} and "sandbox" not in path_name:
         return False
@@ -289,6 +339,7 @@ def _validate_workspace_path(path: str) -> bool:
     return len(path_parts) >= 2
 
 
+# Refuse an unsafe host workspace at import time and fall back to the isolated project directory.
 if not IN_CONTAINER and not _validate_workspace_path(HOST_WORKSPACE):
     print(
         f"CRITICAL SECURITY ERROR: HOST_WORKSPACE '{HOST_WORKSPACE}' is not safe!",
@@ -297,10 +348,12 @@ if not IN_CONTAINER and not _validate_workspace_path(HOST_WORKSPACE):
     print("Using fallback isolated directory instead.", file=sys.stderr)
     HOST_WORKSPACE = _DEFAULT_SANDBOX_DIR
 
+# Normalize the final workspace path to an absolute path.
 HOST_WORKSPACE = os.path.abspath(HOST_WORKSPACE)
 
 
-# Return normalized host roots allowed for imports.
+# Return normalized host roots allowed for imports: the entries of the import roots setting, made
+# absolute, with duplicates removed and the original order kept.
 def get_allowed_import_roots() -> list[str]:
     raw_roots: list[str] = []
 
@@ -323,7 +376,8 @@ def get_allowed_import_roots() -> list[str]:
     return normalized_roots
 
 
+# Normalized import roots, then make sure the workspace and the default task directory exist so later
+# code can rely on them at import time.
 ALLOWED_IMPORT_ROOTS = get_allowed_import_roots()
-
 os.makedirs(HOST_WORKSPACE, exist_ok=True)
 os.makedirs(os.path.join(HOST_WORKSPACE, DEFAULT_TASK_DIR), exist_ok=True)

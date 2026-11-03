@@ -42,6 +42,7 @@ def _write_manifest(path) -> None:
 
 # Build a locale catalog with overlays for every manifest section.
 def _write_locale_catalog(directory, language, name) -> None:
+    # Overlays for the manifest name, commands and settings; "absent-key" has no manifest counterpart.
     catalog = {
         "name": f"{name} Chat",
         "description": f"{name} chat module",
@@ -53,6 +54,7 @@ def _write_locale_catalog(directory, language, name) -> None:
             "generate-chat-titles": {"name": f"{name} titles", "description": f"{name} titles desc"},
             "absent-key": {"name": "never applied"},
         },
+        # Category and downloads-bridge overlays are matched by id; unknown ids must be ignored.
         "settingCategories": [
             {"id": "engines", "name": f"{name} Engines", "description": f"{name} engines desc"},
             {"id": "missing-elsewhere", "name": "unused"},
@@ -69,6 +71,7 @@ def _write_locale_catalog(directory, language, name) -> None:
     )
 
 
+# Redirect the manifest and locale catalog folder to temporary paths and return both (the files are not created).
 @pytest.fixture
 def localized_manifest(tmp_path, monkeypatch):
     manifest_path = tmp_path / "ASLM_Module.json"
@@ -79,17 +82,20 @@ def localized_manifest(tmp_path, monkeypatch):
     return manifest_path, locales_dir
 
 
-# Applying a language.
+# Applying a language
 
-
-# Applying a language rewrites every localized section in place.
+# Verify that applying a language rewrites the name, commands, settings, categories and downloads categories of
+# the manifest in place, while entries without an overlay keep their original values.
 def test_apply_manifest_locale_patches_all_sections(localized_manifest):
+    # Arrange: a manifest and a German catalog with overlays for every section.
     manifest_path, locales_dir = localized_manifest
     _write_manifest(manifest_path)
     _write_locale_catalog(locales_dir, "de", "German")
 
+    # Act: apply the language.
     module_manifest_locale.apply_manifest_locale("de")
 
+    # Assert: each section is localized.
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert manifest["name"] == "German Chat"
     assert manifest["description"] == "German chat module"
@@ -98,6 +104,7 @@ def test_apply_manifest_locale_patches_all_sections(localized_manifest):
 
     settings_by_key = {item["key"]: item for item in manifest["settings"]}
     assert settings_by_key["generate-chat-titles"]["name"] == "German titles"
+
     # Settings without a locale overlay keep their original values.
     assert settings_by_key["ui-port"]["name"] == "UI port"
 
@@ -109,7 +116,8 @@ def test_apply_manifest_locale_patches_all_sections(localized_manifest):
     assert bridge_category["title"] == "German models"
 
 
-# Command overlays apply by index and skip missing entries.
+# Verify that a command overlay is applied to the command at the same index and that a command group missing from
+# the catalog is left untouched.
 def test_command_overlay_applies_by_index(localized_manifest):
     manifest_path, locales_dir = localized_manifest
     _write_manifest(manifest_path)
@@ -122,11 +130,12 @@ def test_command_overlay_applies_by_index(localized_manifest):
 
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert manifest["commands"]["run"][0]["name"] == "Renamed"
-    # firstRun is untouched because the catalog has no run-length overlay.
+
+    # firstRun is untouched because the catalog has no firstRun overlay.
     assert manifest["commands"]["firstRun"][0]["name"] == "First Run Setup"
 
 
-# Unknown languages fall back to the English catalog.
+# Verify that an unsupported language code applies the English catalog.
 def test_unknown_language_falls_back_to_english(localized_manifest):
     manifest_path, locales_dir = localized_manifest
     _write_manifest(manifest_path)
@@ -138,10 +147,9 @@ def test_unknown_language_falls_back_to_english(localized_manifest):
     assert manifest["name"] == "English Chat"
 
 
-# Failure modes.
+# Failure modes
 
-
-# A missing manifest is a warning no-op instead of a crash.
+# Verify that a missing manifest only logs a "Module manifest not found" warning instead of crashing.
 def test_missing_manifest_is_a_noop(localized_manifest, caplog):
     _manifest_path, locales_dir = localized_manifest
     _write_locale_catalog(locales_dir, "en", "English")
@@ -152,7 +160,7 @@ def test_missing_manifest_is_a_noop(localized_manifest, caplog):
     assert any("Module manifest not found" in record.getMessage() for record in caplog.records)
 
 
-# A corrupt manifest is left untouched on disk.
+# Verify that a corrupt manifest is left exactly as it was on disk.
 def test_corrupt_manifest_is_a_noop(localized_manifest):
     manifest_path, locales_dir = localized_manifest
     manifest_path.write_text("{broken", encoding="utf-8")

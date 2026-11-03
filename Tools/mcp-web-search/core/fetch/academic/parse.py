@@ -1,13 +1,5 @@
 # Copyright NEXTGGTECH. Elastic License 2.0.
 
-"""Normalize each provider's reply into a flat list of AcademicPaper records.
-
-Every scholarly API returns a different shape (OpenAlex inverts its abstract into a
-position index, Crossref ships JATS-XML abstracts, arXiv is Atom). Each parser is
-defensive: a malformed or missing field yields an empty/partial record, never an
-exception, so one bad row can't sink the provider.
-"""
-
 from __future__ import annotations
 
 import re
@@ -16,26 +8,32 @@ import xml.etree.ElementTree as ET
 
 from .models import AcademicPaper
 
+# Text cleanup patterns (markup tags, whitespace runs), the DOI matcher, and the abstract length
+# cap in characters.
 _TAG_RE = re.compile(r"<[^>]+>")
 _WS_RE = re.compile(r"\s+")
 _DOI_RE = re.compile(r"10\.\d{4,9}/\S+")
 _MAX_ABSTRACT = 1500
 
 
+# Strip markup tags (Crossref ships JATS-XML abstracts) and collapse whitespace.
 def _clean(text: str) -> str:
     return _WS_RE.sub(" ", _TAG_RE.sub(" ", str(text or ""))).strip()
 
 
+# Clean an abstract and cut it at a word boundary below the length cap.
 def _abstract(text: str) -> str:
     cleaned = _clean(text)
     return cleaned[:_MAX_ABSTRACT].rsplit(" ", 1)[0] if len(cleaned) > _MAX_ABSTRACT else cleaned
 
 
+# Extract a normalized (lowercase, trailing punctuation removed) DOI from text, or "" if none.
 def _doi(value: str) -> str:
     m = _DOI_RE.search(str(value or ""))
     return m.group(0).rstrip(".,;)").lower() if m else ""
 
 
+# Convert a value to int, or None when it is missing or not numeric.
 def _int(value: Any) -> int | None:
     try:
         return int(value)
@@ -56,11 +54,16 @@ def _deinvert_abstract(index: dict[str, list[int]] | None) -> str:
     return _abstract(" ".join(word for _, word in slots))
 
 
+# Parse an OpenAlex works reply into papers. Every parser in this module is defensive: a
+# malformed or missing field yields an empty/partial record, never an exception, so one bad row
+# cannot sink the provider.
 def parse_openalex(body: dict[str, Any]) -> list[AcademicPaper]:
     out: list[AcademicPaper] = []
     for work in body.get("results", []) or []:
         if not isinstance(work, dict):
             continue
+
+        # Pull identifiers, open-access info, venue, authors and the landing URL.
         doi = _doi(work.get("doi") or "")
         oa = work.get("open_access") or {}
         loc = work.get("primary_location") or {}
@@ -73,6 +76,8 @@ def parse_openalex(body: dict[str, Any]) -> list[AcademicPaper]:
             if isinstance(a, dict)
         ]
         url = str(loc.get("landing_page_url") or work.get("id") or "")
+
+        # Build the normalized record.
         out.append(AcademicPaper(
             id=str(work.get("id") or doi or url),
             title=_clean(work.get("display_name") or work.get("title") or ""),
@@ -91,12 +96,15 @@ def parse_openalex(body: dict[str, Any]) -> list[AcademicPaper]:
     return out
 
 
+# Parse a Crossref works reply into papers (the PDF link is the first link typed as PDF).
 def parse_crossref(body: dict[str, Any]) -> list[AcademicPaper]:
     items = (body.get("message") or {}).get("items", []) or []
     out: list[AcademicPaper] = []
     for it in items:
         if not isinstance(it, dict):
             continue
+
+        # Pull the title, authors, year, venue and PDF link out of Crossref's nested lists.
         title = ""
         if isinstance(it.get("title"), list) and it["title"]:
             title = str(it["title"][0])
@@ -117,6 +125,8 @@ def parse_crossref(body: dict[str, Any]) -> list[AcademicPaper]:
             if isinstance(link, dict) and "pdf" in str(link.get("content-type") or "").lower():
                 pdf = str(link.get("URL") or "")
                 break
+
+        # Build the normalized record.
         out.append(AcademicPaper(
             id=str(it.get("DOI") or it.get("URL") or title),
             title=_clean(title),
@@ -134,12 +144,15 @@ def parse_crossref(body: dict[str, Any]) -> list[AcademicPaper]:
     return out
 
 
+# Parse a Europe PMC search reply (resultType=core) into papers.
 def parse_europepmc(body: dict[str, Any]) -> list[AcademicPaper]:
     results = (body.get("resultList") or {}).get("result", []) or []
     out: list[AcademicPaper] = []
     for r in results:
         if not isinstance(r, dict):
             continue
+
+        # Pull the PDF link, venue, DOI and the article page URL (built from source + id).
         pdf = ""
         for grp in (r.get("fullTextUrlList") or {}).get("fullTextUrl", []) or []:
             if isinstance(grp, dict) and str(grp.get("documentStyle") or "").lower() == "pdf":
@@ -152,6 +165,8 @@ def parse_europepmc(body: dict[str, Any]) -> list[AcademicPaper]:
         doi = _doi(r.get("doi") or "")
         ext_id, src = str(r.get("id") or ""), str(r.get("source") or "")
         url = f"https://europepmc.org/article/{src}/{ext_id}" if ext_id and src else ""
+
+        # Build the normalized record.
         out.append(AcademicPaper(
             id=str(doi or (src + ext_id) or r.get("title")),
             title=_clean(r.get("title") or ""),
@@ -170,12 +185,15 @@ def parse_europepmc(body: dict[str, Any]) -> list[AcademicPaper]:
     return out
 
 
+# Parse a DOAJ article search reply into papers (the URL is the full-text link, else the DOI URL).
 def parse_doaj(body: dict[str, Any]) -> list[AcademicPaper]:
     out: list[AcademicPaper] = []
     for row in body.get("results", []) or []:
         bj = row.get("bibjson") if isinstance(row, dict) else None
         if not isinstance(bj, dict):
             continue
+
+        # Pull the DOI, full-text URL, authors and journal out of the bibjson record.
         doi = ""
         for ident in bj.get("identifier", []) or []:
             if isinstance(ident, dict) and str(ident.get("type") or "").lower() == "doi":
@@ -189,6 +207,8 @@ def parse_doaj(body: dict[str, Any]) -> list[AcademicPaper]:
             str(a.get("name") or "") for a in bj.get("author", []) or [] if isinstance(a, dict)
         ]
         journal = bj.get("journal") if isinstance(bj.get("journal"), dict) else {}
+
+        # Build the normalized record.
         out.append(AcademicPaper(
             id=str(row.get("id") or doi or url),
             title=_clean(bj.get("title") or ""),
@@ -200,18 +220,23 @@ def parse_doaj(body: dict[str, Any]) -> list[AcademicPaper]:
             year=_int(bj.get("year")),
             venue=_clean(journal.get("title") or ""),
             doi=doi,
-            open_access=True,  # DOAJ is open-access by definition
+            # DOAJ is open-access by definition.
+            open_access=True,
         ))
     return out
 
 
+# XML namespace prefix of Atom elements in arXiv replies.
 _ATOM = "{http://www.w3.org/2005/Atom}"
 
 
+# Parse an arXiv Atom feed into papers; invalid XML yields an empty list. The paper year is the
+# first four characters of the published date.
 def parse_arxiv(xml_text: str) -> list[AcademicPaper]:
     try:
         root = ET.fromstring(xml_text)
     except ET.ParseError:
+        # A malformed feed carries no usable entries.
         return []
     out: list[AcademicPaper] = []
     for entry in root.findall(f"{_ATOM}entry"):
@@ -241,8 +266,10 @@ def parse_arxiv(xml_text: str) -> list[AcademicPaper]:
     return out
 
 
+# Scholar patterns: the "Cited by N" counter and a four-digit year inside the author/venue line.
 _CITED_BY_RE = re.compile(r"cited by\s+([\d,]+)", re.IGNORECASE)
 _YEAR_IN_META_RE = re.compile(r"\b(19|20)\d{2}\b")
+
 # Markers Google Scholar serves on a 200 CAPTCHA / "unusual traffic" wall instead of results.
 _SCHOLAR_BLOCK_MARKERS = (
     "gs_captcha", "id=\"gs_captcha", "/sorry/", "unusual traffic",
@@ -250,16 +277,19 @@ _SCHOLAR_BLOCK_MARKERS = (
 )
 
 
-# True when a Scholar 200 body is actually an antibot wall, not a result page.
+# Return True when a Scholar 200 body is actually an antibot wall, not a result page.
 def is_scholar_block(html_text: str) -> bool:
     low = (html_text or "").lower()
     if any(m in low for m in _SCHOLAR_BLOCK_MARKERS):
         return True
+
     # A genuine result page always carries the result container; its absence on a
     # non-trivial body means we were served something other than results.
     return "gs_r" not in low and len(low) > 2000
 
 
+# Parse a Google Scholar HTML result page into papers. Scholar gives snippets only: no clean DOI
+# or abstract, so the abstract is the result snippet.
 def parse_scholar(html_text: str) -> list[AcademicPaper]:
     from bs4 import BeautifulSoup
 
@@ -270,13 +300,18 @@ def parse_scholar(html_text: str) -> list[AcademicPaper]:
     out: list[AcademicPaper] = []
     for ri in soup.select("div.gs_ri"):
         block = ri.find_parent("div", class_="gs_r") or ri
+
+        # Extract the title and link from the result heading; skip results without a heading.
         title_el = ri.select_one("h3.gs_rt")
         if title_el is None:
             continue
         link = title_el.select_one("a")
         title = _clean(title_el.get_text(" "))
+
         # Strip leading "[PDF]", "[BOOK]", "[CITATION]" tags Scholar prefixes onto titles.
         title = re.sub(r"^\[[A-Z]+\]\s*", "", title)
+
+        # Read authors and year from the "authors - venue, year - site" line, and the citation count.
         meta = _clean((ri.select_one("div.gs_a") or _Empty()).get_text(" "))
         year_m = _YEAR_IN_META_RE.search(meta)
         authors = [a.strip() for a in meta.split(" - ")[0].split(",") if a.strip()]
@@ -286,11 +321,15 @@ def parse_scholar(html_text: str) -> list[AcademicPaper]:
                 cited = a.get_text(" ")
                 break
         cm = _CITED_BY_RE.search(cited)
+
+        # The right-hand "[PDF] domain" link lives on the parent block, not on the result itself.
         pdf = ""
         ggs = block.select_one("div.gs_ggs a") if block is not ri else None
         if ggs and ggs.get("href"):
-            pdf = str(ggs["href"])  # right-hand "[PDF] domain" link, on the parent block
+            pdf = str(ggs["href"])
         url = str(link["href"]) if link and link.get("href") else ""
+
+        # Build the normalized record.
         out.append(AcademicPaper(
             id=url or title,
             title=title,
@@ -308,6 +347,7 @@ def parse_scholar(html_text: str) -> list[AcademicPaper]:
 
 # Tiny null-object so a missing optional element can still be .get_text()'d.
 class _Empty:
+    # Return an empty string, like an element with no text.
     def get_text(self, *_a, **_k) -> str:
         return ""
 
@@ -319,6 +359,8 @@ def parse_serpapi_scholar(body: dict[str, Any]) -> list[AcademicPaper]:
     for it in body.get("organic_results", []) or []:
         if not isinstance(it, dict):
             continue
+
+        # Authors come from the structured list, else from the first part of the summary line.
         pub = it.get("publication_info") or {}
         summary = str(pub.get("summary") or "")
         authors = [
@@ -328,11 +370,15 @@ def parse_serpapi_scholar(body: dict[str, Any]) -> list[AcademicPaper]:
             authors = [a.strip() for a in summary.split(" - ")[0].split(",") if a.strip()]
         year_m = _YEAR_IN_META_RE.search(summary)
         cited = ((it.get("inline_links") or {}).get("cited_by") or {}).get("total")
+
+        # The PDF link is the first resource whose file format is PDF.
         pdf = ""
         for res in it.get("resources", []) or []:
             if isinstance(res, dict) and str(res.get("file_format") or "").upper() == "PDF":
                 pdf = str(res.get("link") or "")
                 break
+
+        # Build the normalized record.
         out.append(AcademicPaper(
             id=str(it.get("result_id") or it.get("link") or it.get("title")),
             title=_clean(it.get("title") or ""),
@@ -349,6 +395,7 @@ def parse_serpapi_scholar(body: dict[str, Any]) -> list[AcademicPaper]:
     return out
 
 
+# JSON parsers by provider name; arXiv (Atom) and the Scholar variants are dispatched by format.
 PARSERS = {
     "openalex": parse_openalex,
     "crossref": parse_crossref,

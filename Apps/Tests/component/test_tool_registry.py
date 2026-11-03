@@ -15,13 +15,11 @@ from Apps.Tests.support import ToolRegistryTestCase
 pytestmark = [pytest.mark.component]
 
 
-# Tool registry tests.
-# Verify MCP-style local server discovery and execution.
+# Cover discovery and execution of local MCP-style server modules written into a temporary tools folder.
 class LocalServerRegistryTests(ToolRegistryTestCase):
-    """Verify discovery and execution of local MCP-style server modules."""
-
-    # Discover valid local server modules.
+    # Verify that a valid server module is listed once with its id, tool count and tool ids.
     def test_list_servers_discovers_valid_server_modules(self):
+        # Arrange: a server module that declares two tools.
         self.write_server(
             "time_suite",
             """
@@ -51,13 +49,15 @@ class LocalServerRegistryTests(ToolRegistryTestCase):
             """,
         )
 
+        # Act and assert: the listing reports exactly this server.
         payload = tool_registry.list_servers()
         self.assertEqual(len(payload), 1)
         self.assertEqual(payload[0]["id"], "time_suite")
         self.assertEqual(payload[0]["tool_count"], 2)
         self.assertEqual(payload[0]["tools"][0]["id"], "time_now")
 
-    # Hide servers that do not support the requested engine.
+    # Verify that a server whose supports() hook rejects an engine is hidden from the listing for that
+    # engine and shown for the engine it accepts.
     def test_supports_filter_hides_servers_for_unsupported_engines(self):
         self.write_server(
             "ollama_only",
@@ -76,7 +76,8 @@ class LocalServerRegistryTests(ToolRegistryTestCase):
         self.assertEqual(tool_registry.list_servers(engine="openai"), [])
         self.assertEqual(tool_registry.list_servers(engine="ollama-service")[0]["id"], "ollama_only")
 
-    # Build one OpenAI-style tool entry per local server tool.
+    # Verify that one OpenAI-style tool entry is built per server tool, named "<server>__<tool>", and
+    # that the lookup maps each alias to its tool definition.
     def test_build_ollama_tools_registers_multiple_tools(self):
         self.write_server(
             "multi",
@@ -101,8 +102,10 @@ class LocalServerRegistryTests(ToolRegistryTestCase):
         self.assertIn("multi__alpha", lookup)
         self.assertEqual(lookup["multi__alpha"]["tool"]["id"], "alpha")
 
-    # Pass context through tool execution and serialize the result.
+    # Verify that calling a tool alias passes the caller context (plus the server name) to the tool
+    # and returns the tool result serialized as JSON text.
     def test_call_ollama_tool_serializes_results_and_passes_context(self):
+        # Arrange: a server whose tool echoes the argument and the context values.
         self.write_server(
             "context_suite",
             """
@@ -126,6 +129,7 @@ class LocalServerRegistryTests(ToolRegistryTestCase):
         tools, lookup = tool_registry.build_ollama_tools("context_suite", engine="ollama-service", model_name="llama3")
         self.assertEqual(len(tools), 1)
 
+        # Act: call the tool through its alias with a chat id in the context.
         payload = tool_registry.call_ollama_tool(
             lookup,
             "context_suite__context_echo",
@@ -133,12 +137,14 @@ class LocalServerRegistryTests(ToolRegistryTestCase):
             context={"chat_id": "chat-1"},
         )
 
+        # Assert: the serialized result carries the tool id, argument and both context values.
         self.assertIn('"tool_id": "context_echo"', payload)
         self.assertIn('"value": "hello"', payload)
         self.assertIn('"chat_id": "chat-1"', payload)
         self.assertIn('"server_name": "Context Suite"', payload)
 
-    # Skip invalid local server modules without breaking discovery.
+    # Verify that a server module without a call_tool entry point or tool handlers is skipped and the
+    # listing stays empty instead of failing.
     def test_invalid_server_modules_are_skipped(self):
         self.write_server(
             "invalid",
@@ -150,8 +156,10 @@ class LocalServerRegistryTests(ToolRegistryTestCase):
 
         self.assertEqual(tool_registry.list_servers(), [])
 
-    # Execute servers that expose dedicated tool handlers.
+    # Verify that a server exposing a TOOL_HANDLERS mapping, without a generic call_tool dispatcher,
+    # can be called and that the handler receives the arguments and the tool alias in its context.
     def test_tool_handlers_are_supported_without_generic_dispatcher(self):
+        # Arrange: a server that registers one handler function for its tool.
         self.write_server(
             "handler_suite",
             """
@@ -168,6 +176,7 @@ class LocalServerRegistryTests(ToolRegistryTestCase):
             """,
         )
 
+        # Act: call the handler through its alias.
         _tools, lookup = tool_registry.build_ollama_tools("handler_suite")
         payload = tool_registry.call_ollama_tool(
             lookup,
@@ -178,7 +187,8 @@ class LocalServerRegistryTests(ToolRegistryTestCase):
         self.assertIn('"value": "hello"', payload)
         self.assertIn('"alias": "handler_suite__echo"', payload)
 
-    # Execute async tool handlers through the sync registry API.
+    # Verify that an async tool handler is awaited by the synchronous registry call and its result is
+    # returned.
     def test_async_tool_handlers_are_supported(self):
         self.write_server(
             "async_suite",
@@ -202,7 +212,8 @@ class LocalServerRegistryTests(ToolRegistryTestCase):
 
         self.assertIn('"value": "async"', payload)
 
-    # Test persistent workers ignore heartbeat lines and wait for the final envelope.
+    # Verify that a persistent worker session skips heartbeat lines and returns the first line that
+    # carries the final response envelope.
     def test_external_worker_session_skips_heartbeat_lines(self):
         session = tool_registry.ExternalWorkerSession(Path("dummy-server.py"), Path(sys.executable))
         session.process = type(
@@ -213,8 +224,10 @@ class LocalServerRegistryTests(ToolRegistryTestCase):
 
         self.assertEqual(session._read_response_line(timeout_s=1), '{"ok": true, "result": "done"}\n')
 
-    # Test a silent persistent worker is killed instead of blocking forever.
+    # Verify that a persistent worker that stays silent past the idle timeout makes the request fail
+    # with a "Tool worker stopped" error instead of blocking until the tool finishes.
     def test_external_worker_session_times_out_silent_worker(self):
+        # Arrange: a server whose tool sleeps far longer than the request timeout.
         server_file = self.tools_dir / "slow_suite" / "mcp-server.py"
         server_file.parent.mkdir(parents=True, exist_ok=True)
         server_file.write_text(
@@ -234,6 +247,9 @@ class LocalServerRegistryTests(ToolRegistryTestCase):
             encoding="utf-8",
         )
         session = tool_registry.ExternalWorkerSession(server_file, Path(sys.executable))
+
+        # Act and assert: the call fails once the shortened idle timeout expires, and the session is
+        # always closed afterwards.
         try:
             with (
                 patch.object(tool_registry, "WORKER_RESPONSE_IDLE_TIMEOUT_SECONDS", 0.2),
@@ -243,7 +259,8 @@ class LocalServerRegistryTests(ToolRegistryTestCase):
         finally:
             session.close()
 
-    # Return a readable error for unknown tool aliases.
+    # Verify that calling an alias missing from the lookup returns the text "Unknown tool: <alias>"
+    # instead of raising.
     def test_call_ollama_tool_returns_error_for_unknown_alias(self):
         payload = tool_registry.call_ollama_tool({}, "missing__tool", {})
 

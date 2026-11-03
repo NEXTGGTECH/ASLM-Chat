@@ -15,11 +15,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
+# Project root and the folder with the bundled tools.
 BASE_DIR = Path(__file__).resolve().parent.parent
 TOOLS_DIR = BASE_DIR / "Tools"
 
 
-# True when a venv's package manifest declares the given distribution (any version pin).
+# Return whether a venv's package manifest declares the given distribution (any version pin).
 # Lets browser-binary bootstrap follow what each venv actually installs rather than a
 # hardcoded tool list — tools stay independent, the installer just reads their manifests.
 def _venv_declares(packages: list[str], dist: str) -> bool:
@@ -36,6 +37,7 @@ def _build_initial_settings(
     existing: dict[str, Any],
     ui_port: int,
 ) -> dict[str, Any]:
+    # Keep every existing value and only fill in the missing ones; the secret key is generated once.
     initial: dict[str, Any] = dict(existing)
     initial.update(
         {
@@ -69,6 +71,7 @@ def _run_optional_command(
     cwd: Path | None = None,
     env: dict[str, str] | None = None,
 ) -> bool:
+    # Announce the step, then run it with captured output; a start failure is only a warning.
     if log:
         print(f"[ASLM-Chat] {description}...")
 
@@ -85,11 +88,13 @@ def _run_optional_command(
         _print_warning(f"{description} could not be started: {exc}")
         return False
 
+    # Echo the command output only in verbose mode.
     if result.stdout and log:
         print(result.stdout.strip())
     if result.stderr and log:
         print(result.stderr.strip())
 
+    # A non-zero exit code is reported as a warning with the command output as details.
     if result.returncode != 0:
         details = (result.stderr or result.stdout).strip()
         suffix = f" Details: {details}" if details else ""
@@ -133,10 +138,8 @@ def _ensure_camoufox_binary(venv_id: str, log: bool) -> None:
     )
 
 
-# Download the Chromium binary used by Web Search.
+# Download the Chromium binary used by Web Search in its configured venv.
 def _ensure_cloakbrowser_binary(venv_id: str, log: bool) -> None:
-    """Fetch the Chromium binary used by Web Search in its configured environment."""
-
     from Services import venv_manager
 
     # Reuse the same downloader as the browser launcher, including its platform selection.
@@ -154,13 +157,13 @@ def _ensure_cloakbrowser_binary(venv_id: str, log: bool) -> None:
 
 
 # Read the dependency provider's package list without executing its generated shell command.
+# The list is obtained from Playwright's public dry-run command and validated before it is used.
 def _browser_dependency_packages(python_path: Path, browsers: list[str], environment: dict[str, str]) -> list[str]:
-    """Obtain a validated package list from Playwright's public dry-run command."""
-
     result = subprocess.run(
         [str(python_path), "-m", "playwright", "install-deps", "--dry-run", *browsers],
         env=environment, capture_output=True, text=True, timeout=60, check=True,
     )
+
     # Only extract package names. Never execute the provider's sudo/sh command or trust arbitrary options.
     command = shlex.split(result.stdout.strip())
     install = shlex.split(command[-1].split("&&")[-1]) if command else []
@@ -169,6 +172,7 @@ def _browser_dependency_packages(python_path: Path, browsers: list[str], environ
         re.fullmatch(r"[a-z0-9][a-z0-9+.-]*", package) for package in packages
     ):
         raise RuntimeError("Playwright did not provide a supported browser dependency package list.")
+
     # Playwright also lists its test display server and font bundles. ASLM needs runtime libraries,
     # not another Xvfb installation or replacement desktop fonts.
     libraries = [package for package in packages if package.startswith("lib")]
@@ -178,9 +182,8 @@ def _browser_dependency_packages(python_path: Path, browsers: list[str], environ
 
 
 # Install native browser requirements using Playwright's maintained platform definitions.
+# This provisions Linux system libraries without maintaining a second package map.
 def _ensure_browser_dependencies(venv_id: str, browsers: list[str], log: bool) -> None:
-    """Provision Linux system libraries without maintaining a second package map."""
-
     from Services import venv_manager
 
     # Windows and macOS do not need the Linux package-manager step.
@@ -189,6 +192,7 @@ def _ensure_browser_dependencies(venv_id: str, browsers: list[str], log: bool) -
 
     python_path = venv_manager.get_venv_python(venv_id)
     environment = venv_manager.get_subprocess_environment(python_path)
+
     # Playwright 1.50 has no package table for newer Ubuntu releases and silently skips them.
     # Limit its package installer to the last supported Ubuntu ABI, without changing browser selection.
     try:
@@ -296,7 +300,10 @@ def _run_tool_bootstrap(log: bool) -> None:
         packages = list(cfg.get("packages", [])) + list(cfg.get("packages_no_deps", []))
         camoufox = _venv_declares(packages, "camoufox")
         cloakbrowser = _venv_declares(packages, "cloakbrowser")
-        # Managed browsers replace the stock Playwright downloads on every platform.
+
+        # A venv that declares Playwright supplies the interpreter for the shared native dependencies.
+        # Stock Playwright browsers are downloaded only when no managed browser (Camoufox or
+        # CloakBrowser) replaces them in that venv.
         if _venv_declares(packages, "playwright"):
             browser_venv = venv_id
         if _venv_declares(packages, "playwright") and not (camoufox or cloakbrowser):
@@ -348,10 +355,12 @@ def run(
 ) -> None:
     from Settings.settings import SETTINGS_FILE, load_settings, save_settings
 
+    # Write the initial settings, keeping any value the user already has.
     existing = load_settings()
     initial = _build_initial_settings(existing, ui_port)
     save_settings(initial)
 
+    # Create the default mcp.json and the skills folder when they are missing.
     from Settings.mcp_json import ensure_default_mcp_json
 
     ensure_default_mcp_json()
@@ -359,6 +368,7 @@ def run(
 
     ensure_skills_dir()
 
+    # Install the bundled tool environments and their browser binaries.
     _run_tool_bootstrap(log)
 
     if log:

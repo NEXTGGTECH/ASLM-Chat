@@ -9,11 +9,14 @@ from pathlib import Path
 from typing import Any
 
 
+# Repository root, the web search server script and the tool worker script that loads it.
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SERVER_FILE = Path(__file__).resolve().parents[1] / "mcp-server.py"
 WORKER_FILE = REPO_ROOT / "Services" / "tool_worker.py"
 
 
+# Run the tool worker as a subprocess for one operation with the JSON payload on stdin, assert it exits
+# cleanly with an ok envelope, and return the envelope's result.
 def _worker(operation: str, payload: dict[str, Any]) -> dict[str, Any]:
     completed = subprocess.run(
         [sys.executable, str(WORKER_FILE), operation, str(SERVER_FILE)],
@@ -30,6 +33,8 @@ def _worker(operation: str, payload: dict[str, Any]) -> dict[str, Any]:
     return envelope["result"]
 
 
+# Verify that the worker describes web_search with a required query that is either a string or an array
+# of at most three queries, and read_page with a url that can also be an array.
 def test_worker_publishes_string_and_three_query_batch_inputs():
     described = _worker("describe", {})
 
@@ -44,7 +49,11 @@ def test_worker_publishes_string_and_three_query_batch_inputs():
     assert read_tool["parameters"]["properties"]["url"]["oneOf"][1]["type"] == "array"
 
 
+# Verify that the worker's prepare step matches the published batch contract: a single query and a
+# three-query batch are accepted, a four-query batch is rejected with a message telling not to repeat the
+# shape, and an alternative argument shape (call_description and web) is recovered into web arguments.
 def test_worker_preflight_matches_the_published_batch_contract():
+    # A single query string is accepted unchanged.
     good = _worker("prepare", {
         "tool_id": "web_search",
         "arguments": {
@@ -55,6 +64,7 @@ def test_worker_preflight_matches_the_published_batch_contract():
     assert good["ok"] is True
     assert good["arguments"]["query"] == "github rate limit fallback"
 
+    # A three-query batch is accepted and produces three planned queries.
     batch = _worker("prepare", {
         "tool_id": "web_search",
         "arguments": {"query": ["first query", "second query", "third query"]},
@@ -62,6 +72,7 @@ def test_worker_preflight_matches_the_published_batch_contract():
     assert batch["ok"] is True
     assert len(batch["search_request"]["queries"]) == 3
 
+    # A batch over the limit is rejected with a guidance message for the model.
     bad_cases = [
         (
             {
@@ -81,6 +92,7 @@ def test_worker_preflight_matches_the_published_batch_contract():
         assert expected_message in context
         assert "Never repeat the rejected shape" in context
 
+    # An alternative argument shape is recovered into the web arguments.
     recovered = _worker("prepare", {
         "tool_id": "web_search",
         "arguments": {

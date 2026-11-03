@@ -38,16 +38,19 @@ _UNITS_LATIN = (
 # Cyrillic abbreviations for the same physical quantities (RU/UA/BY content).
 _UNITS_CYR = r"г|гр|кг|мг|мм|см|дм|м|км|мл|л|кл|Вт|кВт|МВт|Гц|кГц|МПа|бар"
 
+# Alternation of every known unit (Latin or Cyrillic), and an integer or decimal number with
+# either a dot or a comma as the separator.
 _UNITS = rf"(?:{_UNITS_LATIN}|{_UNITS_CYR})"
 _NUM = r"\d+(?:[.,]\d+)?"
 
 
-# Compile currency, measurement, and decimal regexes once per process.
+# Compile currency, measurement, and decimal regexes once per process (case-insensitive).
 @lru_cache(maxsize=1)
 def _compiled():
     flags = re.IGNORECASE
     sym = _CURRENCY_SYMBOLS
     return {
+        # Currency: a number next to a symbol or ISO code (either order), or a currency word.
         "currency": re.compile(
             rf"(?:"
             rf"{sym}\s*{_NUM}"
@@ -60,6 +63,7 @@ def _compiled():
             rf")",
             flags,
         ),
+        # Measurement: a number followed by a known unit, a percent sign or a per-mille sign.
         "measurement": re.compile(
             rf"(?:"
             rf"{_NUM}\s*(?:{_UNITS})\b"
@@ -69,26 +73,27 @@ def _compiled():
             rf")",
             flags,
         ),
+        # Decimal: digits, a dot or comma, digits.
         "decimal": re.compile(r"\d+[.,]\d+"),
     }
 
 
-# True when text contains a currency symbol, ISO code, or currency word.
+# Return True when the text contains a currency amount (symbol or ISO code with a number) or a currency word.
 def has_currency(text: str) -> bool:
     return bool(_compiled()["currency"].search(text))
 
 
-# True when text contains a numeric value with a known unit or percent.
+# Return True when the text contains a numeric value with a known unit or a percent sign.
 def has_measurement(text: str) -> bool:
     return bool(_compiled()["measurement"].search(text))
 
 
-# True when text contains a decimal number (digit separator or fraction).
+# Return True when the text contains a decimal number (dot or comma as the separator).
 def has_decimal_number(text: str) -> bool:
     return bool(_compiled()["decimal"].search(text))
 
 
-# Factual-density score: 0 none, 0.4 decimal only, 0.8 currency or unit.
+# Return the factual-density score: 0.8 for a currency or measurement, 0.4 for a decimal number only, otherwise 0.
 def fact_signal_score(text: str) -> float:
     if has_currency(text) or has_measurement(text):
         return 0.8
@@ -97,6 +102,6 @@ def fact_signal_score(text: str) -> float:
     return 0.0
 
 
-# True when any factual signal is present in the text.
+# Return True when any factual signal is present in the text.
 def is_fact_like_text(text: str) -> bool:
     return fact_signal_score(text) > 0.0

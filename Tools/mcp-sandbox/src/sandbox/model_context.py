@@ -1,7 +1,5 @@
 # Copyright NEXTGGTECH. Elastic License 2.0.
 
-"""Small, allowlisted environment summary for the model; never export the raw config."""
-
 from __future__ import annotations
 
 import json
@@ -11,7 +9,8 @@ from typing import Any
 
 from sandbox import config
 
-
+# Allowlist of execution limits shown to the model: summary field name -> (environment variable of the
+# running container, attribute of the sandbox config module holding the configured value).
 _EXECUTION_FIELDS = {
     "default_timeout_s": ("SANDBOX_DEFAULT_TIMEOUT", "DEFAULT_TIMEOUT"),
     "output_bytes_per_stream": ("SANDBOX_MAX_OUTPUT_BYTES", "MAX_OUTPUT_BYTES"),
@@ -28,6 +27,9 @@ _EXECUTION_FIELDS = {
 }
 
 
+# Return the allowlisted execution limits. Without an environment these are the configured values; with the
+# environment of a running container each limit is read from it, and "unknown" marks one that is absent or
+# not an integer, so the model is never shown a configured value as if it were verified.
 def _execution_limits(environment: dict[str, str] | None = None) -> dict[str, Any]:
     limits = {}
     for field, (env_key, attr) in _EXECUTION_FIELDS.items():
@@ -40,6 +42,8 @@ def _execution_limits(environment: dict[str, str] | None = None) -> dict[str, An
         elif environment is not None:
             value = "unknown"
         limits[field] = value
+
+    # The cleanup switch is a boolean, so it is parsed separately from the integer limits.
     cleanup = config.WORKSPACE_CLEANUP_ENABLED
     if environment is not None:
         raw = environment.get("SANDBOX_WORKSPACE_CLEANUP_ENABLED")
@@ -48,8 +52,10 @@ def _execution_limits(environment: dict[str, str] | None = None) -> dict[str, An
     return limits
 
 
+# Return the docker inspect data of the running sandbox container whose workspace mount matches the
+# configured one, or None. Inspection is read-only: it never starts Docker, creates a container or exposes
+# host paths; any failure means "not verified" and yields None.
 def _matching_container() -> dict[str, Any] | None:
-    """Read-only inspection: never start Docker, create a container, or expose host paths."""
     try:
         result = subprocess.run(
             ["docker", "inspect", config.CONTAINER_NAME],
@@ -58,6 +64,8 @@ def _matching_container() -> dict[str, Any] | None:
         if result.returncode:
             return None
         info = json.loads(result.stdout)[0]
+
+        # The container only counts when the model workspace is mounted from the expected host directory.
         expected = os.path.normcase(os.path.normpath(
             os.path.join(config.HOST_WORKSPACE, config.DEFAULT_TASK_DIR)
         ))
@@ -68,11 +76,14 @@ def _matching_container() -> dict[str, Any] | None:
         )
         return info if matching_mount and info.get("State", {}).get("Running") else None
     except (OSError, subprocess.SubprocessError, ValueError, KeyError, IndexError, TypeError):
+        # Docker missing, slow or returning unexpected output: the container cannot be verified.
         return None
 
 
+# Build the small, allowlisted environment summary shown to the model: configured limits and, when
+# verifiable, the limits of the matching live container. It never exports the raw config.
 def get_model_context() -> str:
-    """Return configured limits and, when verifiable, the matching live container's limits."""
+    # Configured limits for newly created containers.
     settings = {
         "cpu_quota_cores": config.CPU_LIMIT,
         "memory": config.MEMORY_LIMIT,
@@ -89,6 +100,8 @@ def get_model_context() -> str:
         + " This setting is not a connectivity test; network_limit_mbit=0 means no bandwidth cap, not disabled internet.",
         "Configured limits for newly created containers: " + json.dumps(settings, ensure_ascii=False),
     ]
+
+    # Verify the live limits only on the host (inside the container there is nothing to inspect).
     runtime = _matching_container() if not config.IN_CONTAINER else None
     if runtime is None:
         lines.append(
@@ -96,6 +109,8 @@ def get_model_context() -> str:
             "running container has these limits; inspect cgroups before resource-heavy work."
         )
     else:
+        # Read the real limits from the running container; the CPU quota comes from NanoCpus or from
+        # CpuQuota / CpuPeriod, and the execution limits from its environment.
         host = runtime.get("HostConfig", {})
         environment = dict(
             item.split("=", 1) for item in runtime.get("Config", {}).get("Env", []) if "=" in item
@@ -114,6 +129,8 @@ def get_model_context() -> str:
         }
         lines.append("Verified running container limits: " + json.dumps(actual, ensure_ascii=False))
         lines.append("Use the running limits for this session when they differ from configuration.")
+
+    # Closing guidance on resource use, archives, timeouts and background jobs.
     lines.extend([
         "The PID limit counts processes AND threads together; it is not the number of parallel jobs. "
         "CPU quota is capacity, not reserved physical cores. Bound worker pools by both CPU and RAM; "

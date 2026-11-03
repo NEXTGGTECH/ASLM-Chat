@@ -35,6 +35,8 @@ class _FakeUpload:
         return self.content
 
 
+# Redirect the sandbox, upload and manifest roots into a temporary directory; return the upload root
+# and the external manifest root.
 @pytest.fixture
 def isolated_storage(tmp_path, monkeypatch):
     sandbox_root = tmp_path / "_sandbox"
@@ -46,16 +48,16 @@ def isolated_storage(tmp_path, monkeypatch):
     return upload_root, manifest_root
 
 
-# Request normalization and routing.
+# Request normalization and routing
 
-
-# Tool server ids deduplicate case-insensitively.
+# Verify that tool server ids are trimmed, lowercased, de-duplicated and stripped of empty values.
 def test_normalize_tool_server_ids_dedupes_and_lowercases():
     assert normalize_tool_server_ids(["Sandbox", "sandbox", " other ", "", None]) == ["sandbox", "other"]
     assert normalize_tool_server_ids(None) == []
 
 
-# UI uploads route into the mcp-sandbox tree.
+# Verify that uploads for the sandbox tool server are routed into the sandbox User tree with the
+# matching model path prefix.
 def test_resolve_upload_storage_target_routes_to_sandbox(isolated_storage):
     target = upload_storage.resolve_upload_storage_target(["sandbox"])
 
@@ -64,33 +66,36 @@ def test_resolve_upload_storage_target_routes_to_sandbox(isolated_storage):
     assert target.model_prefix == "/workspace/_sandbox/User"
 
 
-# Stored names and scopes.
+# Stored names and scopes
 
-
-# Hostile characters collapse to underscores in stored names.
+# Verify that a run of characters that are unsafe in file names collapses to one underscore in the
+# stored name, which is prefixed with the file id.
 def test_stored_file_name_sanitizes_hostile_names():
     name = upload_storage._stored_file_name("abc123", 'weird<>:"|?*name.txt')
 
     assert name == "abc123__weird_name.txt"
 
 
-# Scopes normalize to path-safe segments and default to "pending".
+# Verify that scopes are normalized to path-safe segments and empty or missing scopes fall back to
+# "pending".
 def test_safe_scope_normalizes_and_falls_back_to_pending():
     assert upload_storage._safe_scope("chat/1") == "chat_1"
     assert upload_storage._safe_scope("") == "pending"
     assert upload_storage._safe_scope(None) == "pending"
 
 
-# Saving uploads.
+# Saving uploads
 
-
-# Saving persists the file, the external manifest, and the public payload.
+# Verify that saving an upload stores one file under the sandbox root, writes the manifest under the
+# external root by content hash, and returns the public payload.
 def test_save_upload_persists_file_and_manifest(isolated_storage):
     upload_root, manifest_root = isolated_storage
     upload = _FakeUpload("notes.txt", b"hello upload", "text/plain")
 
+    # Act: save the upload.
     manifest, payload = save_upload_to_sandbox(upload)
 
+    # Assert: the file landed under the sandbox User tree and the manifest describes it.
     stored_files = [path for path in upload_root.rglob("*") if path.is_file()]
     assert len(stored_files) == 1
     assert manifest.name == "notes.txt"
@@ -104,12 +109,13 @@ def test_save_upload_persists_file_and_manifest(isolated_storage):
     assert reloaded is not None
     assert reloaded["sha256"] == manifest.sha256
 
+    # Assert: the returned public payload identifies the file and links its content.
     assert payload["file_id"] == manifest.file_id
     assert payload["content_url"] == f"/api/uploads/{manifest.file_id}/content/"
     assert payload["display_kind"] == "text"
 
 
-# Identical content is deduplicated to one stored file.
+# Verify that saving the same content twice yields the same file id and a single stored file.
 def test_save_upload_is_deduplicated_by_content(isolated_storage):
     upload_root, _manifest_root = isolated_storage
     first = save_upload_to_sandbox(_FakeUpload("a.txt", b"same bytes", "text/plain"))
@@ -120,7 +126,7 @@ def test_save_upload_is_deduplicated_by_content(isolated_storage):
     assert len(stored_files) == 1
 
 
-# Hostile upload names reduce to a safe basename.
+# Verify that a path-traversal upload name is reduced to its safe basename in the returned payload.
 def test_save_upload_sanitizes_hostile_names(isolated_storage):
     _manifest, payload = save_upload_to_sandbox(
         _FakeUpload("../../etc/passwd.txt", b"x", "text/plain")
@@ -130,7 +136,7 @@ def test_save_upload_sanitizes_hostile_names(isolated_storage):
     assert ".." not in payload["name"]
 
 
-# An oversized declared size is rejected before reading starts.
+# Verify that an upload whose declared size exceeds the limit is rejected with a "too large" error.
 def test_save_upload_rejects_oversized_declared_size(monkeypatch):
     upload = _FakeUpload("big.bin", b"x")
     upload.size = upload_storage.MAX_UPLOAD_BYTES + 1
@@ -139,8 +145,10 @@ def test_save_upload_rejects_oversized_declared_size(monkeypatch):
         save_upload_to_sandbox(upload)
 
 
-# The streaming path enforces the size limit chunk by chunk.
+# Verify that the chunked streaming path enforces the size limit while reading even when the declared
+# size is zero.
 def test_save_upload_enforces_size_limit_while_streaming(isolated_storage, monkeypatch):
+    # Upload stand-in that only offers chunks() and declares no size.
     class _ChunkedUpload:
         name = "stream.bin"
         size = 0
@@ -157,10 +165,9 @@ def test_save_upload_enforces_size_limit_while_streaming(isolated_storage, monke
         save_upload_to_sandbox(_ChunkedUpload())
 
 
-# Host path resolution.
+# Host path resolution
 
-
-# Model sandbox paths map back to their host files.
+# Verify that a model sandbox path maps back to the stored host file inside the upload root.
 def test_resolve_host_path_maps_model_path_back_to_disk(isolated_storage):
     upload_root, _manifest_root = isolated_storage
     manifest, _payload = save_upload_to_sandbox(_FakeUpload("findme.txt", b"content", "text/plain"))
@@ -172,7 +179,8 @@ def test_resolve_host_path_maps_model_path_back_to_disk(isolated_storage):
     assert host_path.parent.parent == upload_root.resolve()
 
 
-# Escaping or missing paths fail with explicit errors.
+# Verify that empty paths, paths outside the sandbox User tree and paths that escape it with ".."
+# raise an error instead of resolving.
 def test_resolve_host_path_rejects_escapes_and_missing_files():
     with pytest.raises(FileNotFoundError):
         resolve_uploaded_file_host_path({"sandbox_path": ""})
@@ -182,10 +190,10 @@ def test_resolve_host_path_rejects_escapes_and_missing_files():
         resolve_uploaded_file_host_path({"sandbox_path": "/workspace/_sandbox/User/../secret.txt"})
 
 
-# Legacy sidecar manifests remain discoverable.
+# Legacy sidecar manifests
 
-
-# Manifests in the legacy sandbox sidecar layout still load by file id.
+# Verify that a manifest stored next to the file in the legacy sidecar layout still loads by file id
+# and unknown or empty ids return None.
 def test_load_upload_manifest_falls_back_to_legacy_sidecars(isolated_storage):
     upload_root, _manifest_root = isolated_storage
 
@@ -201,10 +209,9 @@ def test_load_upload_manifest_falls_back_to_legacy_sidecars(isolated_storage):
     assert load_upload_manifest("") is None
 
 
-# Display kinds and payloads.
+# Display kinds and payloads
 
-
-# Display kinds classify uploads by MIME type and extension.
+# Verify that the display kind and label of an upload follow its MIME type and file extension.
 @pytest.mark.parametrize(
     ("name", "mime", "kind", "label"),
     [
@@ -227,7 +234,7 @@ def test_display_kind_for_upload(name, mime, kind, label):
     assert display_kind_for_upload(name, mime) == (kind, label)
 
 
-# The public payload accepts manifests and plain dictionaries.
+# Verify that the public payload is identical whether built from a manifest object or its dictionary.
 def test_public_payload_accepts_manifest_or_dict():
     from Services.file_manifests import build_uploaded_file_manifest
 
@@ -239,7 +246,8 @@ def test_public_payload_accepts_manifest_or_dict():
     assert from_dict["display_kind"] == "text"
 
 
-# The model payload hides sandbox state when the sandbox is disabled.
+# Verify that the model payload hides the sandbox path and the sandbox tool recommendation when the
+# sandbox is disabled and passes the manifest through unchanged when it is enabled.
 def test_model_payload_hides_sandbox_state_when_disabled():
     manifest = {
         "sandbox_path": "/workspace/_sandbox/User/a.txt",

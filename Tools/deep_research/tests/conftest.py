@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 
+# Tool directory, repository root and the mcp-sandbox supervisor package that provides sandbox.temporal.
 TOOL_ROOT = Path(__file__).resolve().parents[1]
 REPO_ROOT = TOOL_ROOT.parent.parent
 SANDBOX_SUPERVISOR = REPO_ROOT / "Tools" / "mcp-sandbox" / "supervisor"

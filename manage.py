@@ -6,17 +6,14 @@ import sys
 from Settings.proxy_policy import apply_loopback_proxy_bypass
 
 
-# Configure Django settings module
+# Set the default Django settings module for management commands unless the environment already defines one.
 def _configure_settings_module() -> None:
-    """Set the default Django settings module for management commands."""
-
     os.environ.setdefault("DJANGO_SETTINGS_MODULE", "ASLM.settings")
 
 
-# Run Django management entry point
+# Run Django administrative tasks: install the loopback proxy bypass, configure settings and
+# dispatch the command line, with a friendlier error when Django is not installed.
 def main() -> None:
-    """Run Django administrative tasks."""
-
     apply_loopback_proxy_bypass()
     _configure_settings_module()
 
@@ -32,5 +29,6 @@ def main() -> None:
     execute_from_command_line(sys.argv)
 
 
+# Run: python manage.py <command>
 if __name__ == "__main__":
     main()

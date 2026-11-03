@@ -10,12 +10,9 @@ from Apps.Data.models import Chat, Message, MessageAttachment, MessageAttachment
 pytestmark = [pytest.mark.component]
 
 
-# Chat and attachment model tests.
-# Verify compact model helpers used by admin and API serialization.
+# Cover the string helpers of the chat and message models, which admin and API serialization rely on.
 class ChatMessageModelTests(TestCase):
-    """Verify string helpers on persisted chat data."""
-
-    # Test chat and message string values stay readable.
+    # Verify that the chat string is its title and the message string is its role plus the first 50 characters.
     def test_chat_and_message_string_representations_are_readable(self):
         chat = Chat.objects.create(title="Planning")
         message = Message.objects.create(
@@ -27,12 +24,10 @@ class ChatMessageModelTests(TestCase):
         self.assertEqual(str(chat), "Planning")
         self.assertEqual(str(message), f"user: {'x' * 50}")
 
-# Attachment model tests.
-# Verify helper behavior for legacy image records.
-class MessageImageTests(TestCase):
-    """Verify helper serialization on stored message images."""
 
-    # Ensure data URLs include the expected prefix.
+# Cover the helper serialization of legacy image-only message records.
+class MessageImageTests(TestCase):
+    # Verify that the data URL of a stored image starts with its MIME type and the base64 marker.
     def test_data_url_builds_valid_prefix(self):
         chat = Chat.objects.create(title="Test")
         message = Message.objects.create(chat=chat, role=MessageRole.USER, content="Hello")
@@ -44,12 +39,10 @@ class MessageImageTests(TestCase):
 
         self.assertEqual(image.data_url(), "data:image/png;base64,abc123")
 
-# Attachment model tests.
-# Verify normalized attachment helpers and ordering.
-class MessageAttachmentTests(TestCase):
-    """Verify helper behavior for normalized message attachments."""
 
-    # Set up a message for attachment records.
+# Cover the data URL, image detection, ordering and string helpers of normalized message attachments.
+class MessageAttachmentTests(TestCase):
+    # Create the chat and message that own the attachment records.
     def setUp(self):
         super().setUp()
         self.chat = Chat.objects.create(title="Test")
@@ -59,7 +52,8 @@ class MessageAttachmentTests(TestCase):
             content="Hello",
         )
 
-    # Ensure data URLs and image detection use stored metadata.
+    # Verify that the data URL uses the stored MIME type and that image detection follows the MIME type
+    # even when the attachment kind is a file.
     def test_data_url_and_image_detection_use_stored_metadata(self):
         image = MessageAttachment.objects.create(
             message=self.message,
@@ -82,7 +76,8 @@ class MessageAttachmentTests(TestCase):
         self.assertTrue(image.is_image)
         self.assertFalse(file_attachment.is_image)
 
-    # Ensure attachment query ordering is stable for the UI.
+    # Verify that attachments are ordered by their order field, then by creation (id), and that the
+    # string form names the file and the owning message.
     def test_attachment_ordering_uses_order_then_id(self):
         last = MessageAttachment.objects.create(
             message=self.message,

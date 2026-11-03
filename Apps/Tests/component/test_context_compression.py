@@ -10,9 +10,11 @@ from Apps.API.views import _resolve_history_char_budget
 pytestmark = [pytest.mark.component]
 
 
-# Cover context compression threshold math.
+# Cover the character budget that bounds chat history before context compression.
 class ContextCompressionBudgetTests(SimpleTestCase):
-    # Verify history budget uses same model token estimator as usage ui.
+    # Verify that the history budget is derived from the context length with the per-engine
+    # characters-per-token estimate, the same one the usage UI relies on (20000 for LM Studio and
+    # 27000 for Ollama at 10000 tokens).
     def test_history_budget_uses_same_model_token_estimator_as_usage_ui(self):
         payload = {"context_length": 10000}
 
@@ -25,7 +27,8 @@ class ContextCompressionBudgetTests(SimpleTestCase):
             27000,
         )
 
-    # Verify history budget blends observed token ratio.
+    # Verify that an observed characters-per-token ratio is blended into the estimate, giving a
+    # 17400-character budget for 10000 tokens at an observed ratio of 1.6.
     def test_history_budget_blends_observed_token_ratio(self):
         payload = {"context_length": 10000}
 

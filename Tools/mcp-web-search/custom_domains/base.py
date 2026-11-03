@@ -14,24 +14,17 @@ from typing import Any, Protocol, runtime_checkable
 SCOPE_BOTH = "both"
 SCOPE_READ_PAGE = "read_page"
 
-# Unified contract for the custom-domains pass-through layer. read_page stays thin: it
-# asks `match(url)` for a handler and calls `handler.read(url, ctx)`. Two handler shapes
-# share this one API:
-#   - terminal handlers (github, Wikipedia, reddit, x, stackexchange, amazon, ebay, youtube) produce
-#     their own final markdown;
-#   - strategy handlers (retail dns-shop/citilink, twitch, cursor, …) reuse read_page's
-#     generic pipeline via `ctx.generic_read(...)` with per-domain parameters, so domain
-#     quirks live here and never bloat read_page.
 
-
-# Final outcome of reading one URL through a handler or the generic pipeline.
+# Final outcome of reading one URL through a handler or the generic pipeline. `method` is the
+# winning fetch method (e.g. "github_api", "browser"); `apply_budget` asks read_page to run its
+# BM25 compression budget on the markdown.
 @dataclass(slots=True)
 class PageResult:
     markdown: str = ""
     ok: bool = False
-    method: str = ""          # winning fetch method (e.g. "github_api", "browser")
+    method: str = ""
     blocked: bool = False
-    apply_budget: bool = False  # run read_page's BM25 compression budget on markdown
+    apply_budget: bool = False
     error: str = ""
 
 
@@ -77,7 +70,14 @@ class FetchContext:
     attempts: list[PageAttempt] = field(default_factory=list)
 
 
-# A custom-domain handler. `matches` is a cheap host/path test; `read` does the work.
+# A custom-domain handler: the unified contract of the pass-through layer, which keeps read_page
+# thin (it asks `match(url)` for a handler and calls `handler.read(url, ctx)`). `matches` is a
+# cheap host/path test; `read` does the work. Two handler shapes share this one API:
+#   - terminal handlers (github, Wikipedia, reddit, x, stackexchange, amazon, ebay, youtube)
+#     produce their own final markdown;
+#   - strategy handlers (retail dns-shop/citilink, twitch, cursor, ...) reuse read_page's
+#     generic pipeline via `ctx.generic_read(...)` with per-domain parameters, so domain
+#     quirks live here and never bloat read_page.
 # `fallback_to_generic` lets terminal handlers (amazon/ebay) defer to the generic
 # pipeline when their specialised fetch comes back empty/blocked.
 @runtime_checkable
@@ -87,6 +87,8 @@ class DomainHandler(Protocol):
     # Optional; consumers read it via getattr(handler, "scope", SCOPE_BOTH).
     scope: str
 
+    # Return True when this handler is responsible for the URL.
     def matches(self, url: str) -> bool: ...
 
+    # Fetch and normalise the URL into a PageResult.
     async def read(self, url: str, ctx: FetchContext) -> PageResult: ...

@@ -11,6 +11,8 @@ from Apps.Tests.fakes.ollama_server import ollama_server  # noqa: F401 - registe
 pytestmark = [pytest.mark.integration]
 
 
+# Provide the fake Ollama server with the Ollama service enabled in the isolated settings and
+# pointed at the fake server's port.
 @pytest.fixture
 def ollama_endpoint(ollama_server, isolated_settings):
     from Settings import settings as project_settings
@@ -40,10 +42,9 @@ def _chunk_value(chunks, key):
     return getattr(value, key, None)
 
 
-# Model discovery.
+# Model discovery
 
-
-# Model discovery reads the /api/tags payload.
+# Verify that model discovery returns the models listed in the /api/tags payload.
 def test_get_models_reads_tag_payload(ollama_endpoint):
     ollama_endpoint.tags_payload = {
         "models": [
@@ -58,7 +59,7 @@ def test_get_models_reads_tag_payload(ollama_endpoint):
     assert [getattr(model, "model", "") for model in models] == ["llama3:latest", "qwen3:8b"]
 
 
-# A stopped runtime degrades to an empty model list.
+# Verify that model discovery returns an empty list when the Ollama server is no longer reachable.
 def test_get_models_survives_server_outage(ollama_server, isolated_settings):
     from Settings import settings as project_settings
 
@@ -71,10 +72,10 @@ def test_get_models_survives_server_outage(ollama_server, isolated_settings):
     assert ollama_api.get_models() == []
 
 
-# Streaming generation.
+# Streaming generation
 
-
-# Plain generation streams NDJSON chunks through the SDK.
+# Verify that plain generation streams the NDJSON chunks through the SDK and ends with the final done
+# chunk carrying the eval count.
 def test_generate_streams_content_chunks(ollama_endpoint):
     ollama_endpoint.enqueue_text("Hello ", "from fake Ollama")
 
@@ -85,7 +86,7 @@ def test_generate_streams_content_chunks(ollama_endpoint):
     assert _chunk_value(chunks, "eval_count") == 22
 
 
-# Options, thinking flags, and messages reach the request payload.
+# Verify that the model, messages, runtime options and thinking flag reach the chat request payload.
 def test_generate_forwards_options_and_messages(ollama_endpoint):
     ollama_endpoint.enqueue_text("ok")
 
@@ -108,7 +109,7 @@ def test_generate_forwards_options_and_messages(ollama_endpoint):
     assert request["think"] is True
 
 
-# Engine failures propagate to the caller.
+# Verify that an HTTP 500 answer from the engine raises an exception for the caller.
 def test_generate_error_response_raises(ollama_endpoint):
     ollama_endpoint.chat_status = 500
 
@@ -116,7 +117,7 @@ def test_generate_error_response_raises(ollama_endpoint):
         list(ollama_api.generate("fake-model", [{"role": "user", "content": "hi"}], stream=True))
 
 
-# Unsupported runtime options are dropped with a warning.
+# Verify that unsupported runtime options (vocab_only, numa) are dropped from the request options.
 def test_generate_drops_unsupported_options_with_warning(ollama_endpoint, caplog):
     ollama_endpoint.enqueue_text("ok")
 
@@ -134,10 +135,9 @@ def test_generate_drops_unsupported_options_with_warning(ollama_endpoint, caplog
     assert "numa" not in request["options"]
 
 
-# Model metadata.
+# Model metadata
 
-
-# Model metadata reads the /api/show payload.
+# Verify that model settings come from the /api/show payload and the request carries the model name.
 def test_get_model_settings_uses_show_endpoint(ollama_endpoint):
     payload = ollama_api.get_model_settings("fake-model")
 

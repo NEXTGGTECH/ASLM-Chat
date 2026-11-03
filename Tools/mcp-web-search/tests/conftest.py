@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 
+# Root directory of the web search tool (the parent of this tests folder).
 TOOL_ROOT = Path(__file__).resolve().parents[1]
 
 # Make `core.*` and `custom_domains.*` importable regardless of how pytest

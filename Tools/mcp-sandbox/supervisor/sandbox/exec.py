@@ -31,17 +31,21 @@ logger = __import__("logging").getLogger(__name__)
 
 # Shared output helpers
 
+# Decode a byte slice as UTF-8, dropping bytes of characters cut in half at the slice edges.
 def _slice_utf8(data: bytes, start: int | None = None, end: int | None = None) -> str:
     return data[start:end].decode("utf-8", errors="ignore")
 
 
-# Trim output to a configurable head/tail window with an inline marker.
+# Trim output to a configurable head/tail window with an inline marker. Return the text and whether
+# it was truncated; the head share comes from OUTPUT_HEAD_RATIO, clamped to 10%-90%.
 def _truncate(value: str | None) -> tuple[str, bool]:
     if value is None:
         return "", False
     encoded = value.encode("utf-8", errors="replace")
     if len(encoded) <= MAX_OUTPUT_BYTES:
         return value, False
+
+    # Split the byte budget between the head and the tail of the output.
     head_ratio = min(0.9, max(0.1, OUTPUT_HEAD_RATIO))
     head_bytes = max(1, int(MAX_OUTPUT_BYTES * head_ratio))
     tail_bytes = max(1, MAX_OUTPUT_BYTES - head_bytes)
@@ -59,22 +63,33 @@ def _truncate(value: str | None) -> tuple[str, bool]:
     )
 
 
-# Collect process output with a fixed head/tail memory budget.
+# Collect process output with a fixed head/tail memory budget. Output is kept whole until it exceeds
+# MAX_OUTPUT_BYTES; after that only the first head bytes and a rolling window of the last tail bytes
+# are kept, so memory stays bounded however much the process prints.
 class BoundedOutputCollector:
+    # Set up the whole-output buffer, the head/tail windows and the head/tail byte budgets.
     def __init__(self) -> None:
+        # The buffer is dropped (set to None) once the output outgrows the budget.
         self._buffer = bytearray()
         self._head = bytearray()
         self._tail = bytearray()
+
+        # Total number of bytes seen so far.
         self._total = 0
+
+        # Byte budgets of the head and tail windows (head share clamped to 10%-90%).
         head_ratio = min(0.9, max(0.1, OUTPUT_HEAD_RATIO))
         self._head_bytes = max(1, int(MAX_OUTPUT_BYTES * head_ratio))
         self._tail_bytes = max(1, MAX_OUTPUT_BYTES - self._head_bytes)
 
+    # Add a chunk of text; switch from whole-output mode to head/tail mode when the budget is exceeded.
     def append(self, chunk: str) -> None:
         data = chunk.encode("utf-8", errors="replace")
         if not data:
             return
 
+        # Whole-output mode: keep everything until the budget is crossed, then freeze the head and
+        # keep the last bytes as the tail.
         if self._buffer is not None:
             self._buffer.extend(data)
             self._total = len(self._buffer)
@@ -85,11 +100,13 @@ class BoundedOutputCollector:
             self._buffer = None
             return
 
+        # Head/tail mode: count the bytes and keep only the newest tail bytes.
         self._total += len(data)
         self._tail.extend(data)
         if len(self._tail) > self._tail_bytes:
             del self._tail[: len(self._tail) - self._tail_bytes]
 
+    # Return the collected text and whether it was truncated (head, marker with sizes, then tail).
     def value(self) -> tuple[str, bool]:
         if self._buffer is not None:
             return self._buffer.decode("utf-8", errors="replace"), False
@@ -107,7 +124,8 @@ class BoundedOutputCollector:
         )
 
 
-# Read process output in chunks and forward each chunk to an optional callback.
+# Read process output in 1024-character chunks until EOF, adding each chunk to the collector and
+# forwarding it to an optional callback (streaming progress).
 def _read_stream_chunks(
     stream,
     sink: BoundedOutputCollector,
@@ -124,6 +142,8 @@ def _read_stream_chunks(
 
 # Background job helpers
 
+# Command words (package managers, builds, test runners, training) that suggest a long-running
+# command, which is then run as a background job in "auto" mode.
 _LONG_RUNNING_PATTERNS = re.compile(
     r"\b("
     r"apt-get|pip|npm|pnpm|yarn|cargo|pytest|make|cmake|"
@@ -133,7 +153,8 @@ _LONG_RUNNING_PATTERNS = re.compile(
 )
 
 
-# Map bool/None background flag to auto | always | never.
+# Map bool/None background flag to auto | always | never (True is always, False/None is auto);
+# raise ValueError for any other unknown string.
 def _normalize_background_mode(background: str | bool | None) -> str:
     if background is True:
         return "always"
@@ -145,7 +166,8 @@ def _normalize_background_mode(background: str | bool | None) -> str:
     return normalized
 
 
-# Decide whether a command should run as a tracked background job.
+# Decide whether a command should run as a tracked background job: always/never are explicit; in auto
+# mode a long timeout or a long-running command word selects background execution.
 def should_use_background(
     command: str, timeout_s: int, background: str | bool | None = "auto"
 ) -> bool:
@@ -159,6 +181,7 @@ def should_use_background(
     )
 
 
+# Return a fresh background job id: "bg_" plus eight random hex characters.
 def _new_background_job_id() -> str:
     return f"bg_{uuid.uuid4().hex[:8]}"
 
@@ -170,7 +193,8 @@ def job_root() -> Path:
     return root
 
 
-# Bash-shaped dict when foreground wait hits timeout but the job keeps running.
+# Build the bash-shaped result dict returned when the foreground wait hits the timeout but the job
+# keeps running; error_type "backgrounded" and the job id let the caller poll it later.
 def _background_error_result(
     *,
     job: BackgroundJob,
@@ -194,7 +218,8 @@ def _background_error_result(
     }
 
 
-# Read and truncate background job spool files (stdout/stderr).
+# Read and truncate background job spool files (stdout/stderr). With incremental=True only the output
+# produced since the previous read is returned. Return stdout, stderr and a truncation flag.
 def _job_files_result(
     job: BackgroundJob, *, incremental: bool = True
 ) -> tuple[str, str, bool]:
@@ -207,7 +232,8 @@ def _job_files_result(
 
 # User / process helpers
 
-# POSIX-only Popen user-switching options when supervisor runs as root.
+# POSIX-only Popen user-switching options: switch to COMMAND_USER only when the supervisor runs as
+# root; otherwise return no options.
 def _popen_user_kwargs() -> dict:
     if os.name != "posix" or not COMMAND_USER or COMMAND_USER == "root":
         return {}
@@ -217,7 +243,8 @@ def _popen_user_kwargs() -> dict:
     return {"user": COMMAND_USER}
 
 
-# Environment overrides (HOME, USER, SHELL) for the model command user.
+# Environment overrides (HOME, USER, SHELL) for the model command user. When the user cannot be looked
+# up, only USER and LOGNAME are set.
 def _command_user_env() -> dict[str, str]:
     if os.name != "posix" or not COMMAND_USER or COMMAND_USER == "root":
         return {}
@@ -225,6 +252,7 @@ def _command_user_env() -> dict[str, str]:
         import pwd
         user_info = pwd.getpwnam(COMMAND_USER)
     except Exception:
+        # Unknown user (or no pwd module): fall back to the minimal identity variables.
         return {"USER": COMMAND_USER, "LOGNAME": COMMAND_USER}
     return {
         "HOME": user_info.pw_dir,
@@ -234,7 +262,9 @@ def _command_user_env() -> dict[str, str]:
     }
 
 
-# Best-effort SIGTERM then SIGKILL for the command's process group.
+# Best-effort SIGTERM then SIGKILL for the command's process group. SIGKILL follows if the process is
+# still alive after two seconds; on non-POSIX systems, or if signalling the group fails, fall back to
+# killing the process itself.
 def _kill_process_group(process: subprocess.Popen) -> None:
     if os.name == "posix":
         try:
@@ -242,7 +272,10 @@ def _kill_process_group(process: subprocess.Popen) -> None:
         except ProcessLookupError:
             return
         except Exception:
+            # Cannot look up the group; assume the process leads its own group (started with a new session).
             pgid = process.pid
+
+        # Ask politely first, wait up to two seconds for exit, then force-kill the group.
         try:
             os.killpg(pgid, signal.SIGTERM)
             deadline = time.monotonic() + 2.0
@@ -255,6 +288,7 @@ def _kill_process_group(process: subprocess.Popen) -> None:
         except ProcessLookupError:
             return
         except Exception:
+            # Group signalling failed; fall through to killing the process directly.
             pass
     process.kill()
 
@@ -264,12 +298,16 @@ def _wait_after_kill(process: subprocess.Popen, timeout: float = 2.0) -> None:
     try:
         process.wait(timeout=timeout)
     except Exception:
+        # Best-effort wait: an unkillable process must not block the caller past the timeout.
         pass
 
 
 # Native execution
 
-# Run bash with output spooled to disk; may return early as a background job.
+# Run bash with output spooled to disk; may return early as a background job. If the command is still
+# running after timeout_s seconds, the process is left running, registered in JOB_REGISTRY, and a
+# "backgrounded" result with its job id is returned; otherwise the job is removed and the normal bash
+# result dict is returned.
 def _exec_bash_native_background(
     command: str,
     cwd: str = ".",
@@ -277,6 +315,7 @@ def _exec_bash_native_background(
     stdin: str | None = None,
     on_progress: Callable[[float, str], None] | None = None,
 ) -> dict:
+    # Validate the working directory inside the task root.
     target_dir = get_secure_task_path(cwd, kind="cwd")
     if not target_dir.exists():
         raise FileNotFoundError(f"cwd not found: {normalize_model_relative_path(cwd)}")
@@ -285,6 +324,7 @@ def _exec_bash_native_background(
             f"cwd is not a directory: {normalize_model_relative_path(cwd)}"
         )
 
+    # Create the job directory with empty stdout/stderr spool files.
     start_time = time.time()
     job_id = _new_background_job_id()
     job_dir = job_root() / job_id
@@ -294,11 +334,13 @@ def _exec_bash_native_background(
     stdout_path.write_text("", encoding="utf-8")
     stderr_path.write_text("", encoding="utf-8")
 
+    # Build the login-shell command and its environment (UTF-8 plus the command user's identity).
     exec_cmd = ["bash", "-lc", command]
     env = os.environ.copy()
     env.update({"PYTHONIOENCODING": "utf-8", "LANG": "C.UTF-8"})
     env.update(_command_user_env())
 
+    # Start bash in its own session, with stdout and stderr written straight to the spool files.
     try:
         with (
             stdout_path.open("w", encoding="utf-8") as stdout_file,
@@ -328,14 +370,17 @@ def _exec_bash_native_background(
             "cwd": normalize_model_relative_path(cwd),
         }
 
+    # Feed the optional stdin text, then close the pipe so the command sees EOF.
     if stdin is not None and process.stdin is not None:
         try:
             process.stdin.write(stdin)
         except BrokenPipeError:
+            # The command exited or closed stdin without reading it all; its result still reports.
             pass
         finally:
             process.stdin.close()
 
+    # Record the job on disk (pid, process group, status) and in the in-memory registry.
     (job_dir / "pid").write_text(f"{process.pid}\n", encoding="utf-8")
     (job_dir / "pgid").write_text(f"{process.pid}\n", encoding="utf-8")
     (job_dir / "status").write_text("running\n", encoding="utf-8")
@@ -369,6 +414,7 @@ def _exec_bash_native_background(
             on_progress(progress, f"Running bash in {normalize_model_relative_path(cwd)}")
         time.sleep(0.2)
 
+    # The process finished within the timeout: record the exit state and read the complete output.
     JOB_REGISTRY.mark_done(job.job_id, process.returncode)
     (job_dir / "status").write_text("done\n", encoding="utf-8")
     (job_dir / "exit_code").write_text(f"{process.returncode}\n", encoding="utf-8")
@@ -390,7 +436,9 @@ def _exec_bash_native_background(
     }
 
 
-# Execute bash in-process with piped stdout/stderr and optional background routing.
+# Execute bash in-process with piped stdout/stderr and optional background routing. Output is collected
+# with a bounded head/tail budget and streamed to the optional callbacks; on timeout the whole process
+# group is killed. Return a dict with exit_code, stdout, stderr, error, elapsed_ms, truncated and cwd.
 def _exec_bash_native(
     command: str,
     cwd: str = ".",
@@ -404,6 +452,7 @@ def _exec_bash_native(
     if timeout_s <= 0:
         raise ValueError("timeout_s must be greater than 0.")
 
+    # Long-running or explicitly background commands take the spooled job path instead.
     if should_use_background(command, timeout_s, background):
         return _exec_bash_native_background(
             command=command,
@@ -413,6 +462,7 @@ def _exec_bash_native(
             on_progress=on_progress,
         )
 
+    # Validate the working directory inside the task root.
     target_dir = get_secure_task_path(cwd, kind="cwd")
     if not target_dir.exists():
         raise FileNotFoundError(f"cwd not found: {normalize_model_relative_path(cwd)}")
@@ -421,12 +471,14 @@ def _exec_bash_native(
             f"cwd is not a directory: {normalize_model_relative_path(cwd)}"
         )
 
+    # Build the login-shell command and its environment (UTF-8 plus the command user's identity).
     start_time = time.time()
     exec_cmd = ["bash", "-lc", command]
     env = os.environ.copy()
     env.update({"PYTHONIOENCODING": "utf-8", "LANG": "C.UTF-8"})
     env.update(_command_user_env())
 
+    # Start bash in its own session with piped streams; a launch failure becomes an error result.
     try:
         process = subprocess.Popen(
             exec_cmd,
@@ -452,6 +504,7 @@ def _exec_bash_native(
             "cwd": normalize_model_relative_path(cwd),
         }
 
+    # Drain stdout and stderr on daemon threads so a full pipe cannot block the process.
     stdout_chunks = BoundedOutputCollector()
     stderr_chunks = BoundedOutputCollector()
     stdout_thread = threading.Thread(
@@ -467,15 +520,17 @@ def _exec_bash_native(
     stdout_thread.start()
     stderr_thread.start()
 
-    # Wait for process exit, progress callbacks, or timeout → kill group.
+    # Feed the optional stdin text, then close the pipe so the command sees EOF.
     if stdin is not None and process.stdin is not None:
         try:
             process.stdin.write(stdin)
         except BrokenPipeError:
+            # The command exited or closed stdin without reading it all; its result still reports.
             pass
         finally:
             process.stdin.close()
 
+    # Wait for process exit, progress callbacks, or timeout → kill group.
     timed_out = False
     while process.poll() is None:
         elapsed_s = time.time() - start_time
@@ -489,12 +544,14 @@ def _exec_bash_native(
             on_progress(progress, f"Running bash in {normalize_model_relative_path(cwd)}")
         time.sleep(0.2)
 
+    # Give the reader threads a moment to flush the remaining output, then collect it.
     stdout_thread.join(timeout=2)
     stderr_thread.join(timeout=2)
 
     stdout_value, trunc_out = stdout_chunks.value()
     stderr_value, trunc_err = stderr_chunks.value()
 
+    # Build the result: a timeout error, or the exit code of the finished command.
     if timed_out:
         return {
             "exit_code": None,

@@ -16,6 +16,7 @@ from camoufox.async_api import AsyncCamoufox
 from mcp.types import TextContent
 from playwright.async_api import Browser, BrowserContext, Page
 
+# This server's folder and the path of the sibling config module.
 SERVER_ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = SERVER_ROOT / "config.py"
 
@@ -31,8 +32,10 @@ def _load_local_config():
     return module
 
 
+# Config module loaded once at import time.
 _config = _load_local_config()
 
+# Browser window, download folder and snapshot limits re-exported from the config module.
 AUTO_TEXT_PREVIEW_LEN = _config.AUTO_TEXT_PREVIEW_LEN
 BROWSER_HEIGHT = _config.BROWSER_HEIGHT
 BROWSER_HEADLESS = _config.BROWSER_HEADLESS
@@ -53,13 +56,16 @@ def _camoufox_launch_options() -> dict[str, Any]:
     }
 
 
-# Keep one dedicated event loop alive for all browser operations.
+# Keep one dedicated event loop alive for all browser operations. The loop runs on its own daemon thread
+# so that browser coroutines stay on a single loop while callers submit work from any thread or loop.
 class BrowserRuntime:
-
     # Initialize empty loop/thread handles for the dedicated browser event loop.
     def __init__(self) -> None:
+        # The loop and the thread running it; both are None while the runtime is stopped.
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
+
+        # Set once the thread has created its loop, and a lock guarding start and stop.
         self._ready = threading.Event()
         self._lock = threading.Lock()
 
@@ -80,6 +86,7 @@ class BrowserRuntime:
             return
 
         with self._lock:
+            # Check again under the lock: another thread may have started the loop meanwhile.
             if self._thread is not None and self._thread.is_alive() and self._loop is not None:
                 return
 
@@ -100,6 +107,7 @@ class BrowserRuntime:
 
     # Stop the dedicated browser loop after browser resources are closed.
     def close(self) -> None:
+        # Detach the loop and thread handles under the lock so no new work is submitted to them.
         with self._lock:
             loop = self._loop
             thread = self._thread
@@ -107,6 +115,7 @@ class BrowserRuntime:
             self._thread = None
             self._ready.clear()
 
+        # Stop the loop and wait briefly for its thread (unless close() runs on that thread itself).
         if loop is not None and loop.is_running():
             loop.call_soon_threadsafe(loop.stop)
 
@@ -114,6 +123,7 @@ class BrowserRuntime:
             thread.join(timeout=5.0)
 
 
+# Process-wide runtime that owns the dedicated browser event loop.
 _browser_runtime = BrowserRuntime()
 
 
@@ -122,13 +132,16 @@ def close_browser_runtime() -> None:
     _browser_runtime.close()
 
 
-# Run a browser coroutine on the dedicated browser loop with optional keepalive logs.
+# Run a browser coroutine on the dedicated browser loop with optional keepalive logs. While the coroutine
+# runs, a debug log message is sent to the MCP session every interval seconds (until one send fails), and
+# cancelling the caller cancels the underlying coroutine too.
 async def run_in_browser_loop(
     coro,
     session=None,
     interval: float = 3.0,
     message: str = "working...",
 ):
+    # Submit to the browser loop and await the result from the caller's loop.
     future = _browser_runtime.submit(coro)
     wrapped = asyncio.wrap_future(future)
 
@@ -138,12 +151,14 @@ async def run_in_browser_loop(
             if wrapped in done:
                 return wrapped.result()
 
+            # Still running: send a keepalive so the client does not time out.
             if session is not None:
                 try:
                     send_log_message = getattr(session, "send_log_message", None)
                     if send_log_message is not None:
                         await send_log_message(level="debug", data=message, logger="browser-agent")
                 except BaseException:
+                    # A failing session stops further keepalives; the browser work itself continues.
                     session = None
                     pass
     except asyncio.CancelledError:
@@ -151,9 +166,10 @@ async def run_in_browser_loop(
         raise
 
 
+# On Windows, patch the destructors of asyncio transports at import time: Playwright/Camoufox may leave
+# subprocess transports pending on shutdown, and guarding their destructors keeps tool calls from emitting
+# false crash traces.
 if sys.platform.startswith("win"):
-    # Playwright/Camoufox may leave subprocess transports pending on shutdown.
-    # Guard their destructors so tool calls do not emit false crash traces.
     try:
         import asyncio.base_subprocess as _base_subprocess
         import asyncio.proactor_events as _proactor_events
@@ -166,6 +182,7 @@ if sys.platform.startswith("win"):
             try:
                 _orig_pipe_del(self)
             except Exception:
+                # A destructor failure on an orphaned transport is harmless noise at shutdown.
                 pass
 
         # Swallow destructor errors from orphaned subprocess transports on Windows.
@@ -173,15 +190,18 @@ if sys.platform.startswith("win"):
             try:
                 _orig_subproc_del(self)
             except Exception:
+                # A destructor failure on an orphaned transport is harmless noise at shutdown.
                 pass
 
+        # Replace the original destructors with the guarded versions.
         _proactor_events._ProactorBasePipeTransport.__del__ = _safe_pipe_del
         _base_subprocess.BaseSubprocessTransport.__del__ = _safe_subproc_del
     except Exception:
+        # The asyncio internals differ between Python versions; skipping the patch only costs log noise.
         pass
 
 
-# Logging
+# Log to stderr, leaving stdout free for the protocol streams, under the shared "browser-agent" logger.
 logging.basicConfig(
     level=logging.INFO,
     format="[%(asctime)s] %(levelname)s: %(message)s",
@@ -190,7 +210,7 @@ logging.basicConfig(
 log = logging.getLogger("browser-agent")
 
 
-# Accessibility tree constants
+# ARIA roles of controls the model can act on.
 INTERACTIVE_ROLES = {
     "button",
     "link",
@@ -209,6 +229,7 @@ INTERACTIVE_ROLES = {
     "spinbutton", "treeitem",
 }
 
+# Roles of controls that accept typed text.
 TEXT_ENTRY_ROLES = {
     "textbox",
     "searchbox",
@@ -216,6 +237,7 @@ TEXT_ENTRY_ROLES = {
     "spinbutton",
 }
 
+# Roles of controls that are clicked or toggled rather than typed into or followed as links.
 ACTION_CONTROL_ROLES = {
     "button",
     "checkbox",
@@ -230,6 +252,7 @@ ACTION_CONTROL_ROLES = {
     "treeitem",
 }
 
+# Roles that are kept in the snapshot even without an accessible name: interactive controls plus structure.
 SEMANTIC_ROLES = INTERACTIVE_ROLES | {
     "heading",
     "img",
@@ -253,8 +276,7 @@ SEMANTIC_ROLES = INTERACTIVE_ROLES | {
     "toolbar",
 }
 
-
-# Landmark tracking
+# Page landmark roles tracked while walking the tree; each element is tagged with its enclosing landmark.
 LANDMARK_ROLES = {
     "banner",
     "main",
@@ -265,6 +287,7 @@ LANDMARK_ROLES = {
     "region",
 }
 
+# Presentational roles that are dropped when they have no accessible name.
 SKIP_ROLES = {
     "none",
     "presentation",
@@ -277,7 +300,8 @@ SKIP_ROLES = {
 }
 
 
-# Noise filters
+# Accessible names of decorative or boilerplate controls (avatars, copy and reply buttons, social and
+# footer links, in English and Russian) that are hidden from the compact snapshot.
 _NOISE_NAME_PATTERNS = re.compile(
     r"^(User avatar|icon|Скопировать код|Показать полностью|"
     r"Показать обсуждения|Самые популярные|Оставить комментарий|"
@@ -288,10 +312,12 @@ _NOISE_NAME_PATTERNS = re.compile(
     re.IGNORECASE,
 )
 
+# Matches names made only of digits, such as comment counters on buttons.
 _COMMENT_BUTTON_RE = re.compile(r"^\d+$")
 
 
-# Snapshot parsing patterns
+# Patterns for parsing one line of the aria snapshot: the line (indent, role, optional quoted name and
+# the trailing attributes) and a single "[key]" or "[key=value]" attribute.
 _LINE_RE = re.compile(
     r'^(?P<indent>\s*)'
     r'- (?P<role>[A-Za-z][A-Za-z0-9_-]*)'
@@ -304,8 +330,11 @@ _ATTR_RE = re.compile(r'\[(?P<key>\w+)(?:=(?P<val>[^\]]+))?\]')
 
 # Accessibility tree extraction
 
-# Extract the current accessibility tree and assign stable element refs.
+# Extract the current accessibility tree and assign stable element refs. Return the list of element dicts
+# (ref, role, name, landmark, depth and state flags) and a readable indented text tree. Refs are numbered
+# "e0", "e1", ... in document order; the element cap is doubled for a full snapshot.
 async def get_accessibility_tree(page: Page, full: bool = False) -> tuple[list[dict], str]:
+    # Take the aria snapshot of the page body; an unreadable page yields an empty tree.
     try:
         yaml_text = await page.locator("body").aria_snapshot(timeout=10000)
     except Exception as exc:
@@ -331,12 +360,14 @@ async def get_accessibility_tree(page: Page, full: bool = False) -> tuple[list[d
         if not match:
             continue
 
+        # Split the line into depth (two spaces per level), role, name and attribute text.
         indent_str = match.group("indent") or ""
         depth = len(indent_str) // 2
         role = (match.group("role") or "").strip().rstrip(":")
         name = match.group("name") or ""
         attrs_str = match.group("attrs") or ""
 
+        # Skip lines that are too deep, beyond the element cap, or carry no useful information.
         if depth > MAX_A11Y_DEPTH or ref_counter >= max_elements:
             continue
 
@@ -349,7 +380,8 @@ async def get_accessibility_tree(page: Page, full: bool = False) -> tuple[list[d
         if not (is_semantic or name):
             continue
 
-        # Drop landmarks that are no longer active at the current depth.
+        # Drop landmarks that are no longer active at the current depth, then work out which landmark
+        # encloses this element (a landmark element becomes the current one itself).
         while landmark_stack and landmark_stack[-1][0] >= depth:
             landmark_stack.pop()
 
@@ -361,7 +393,8 @@ async def get_accessibility_tree(page: Page, full: bool = False) -> tuple[list[d
         else:
             current_landmark = "unknown"
 
-        # Convert bracket attributes into plain Python values.
+        # Convert bracket attributes into plain Python values: flags and "true"/"false" become booleans,
+        # numeric values become integers and everything else stays a string.
         attrs: dict[str, Any] = {}
         for attr_match in _ATTR_RE.finditer(attrs_str):
             key = attr_match.group("key")
@@ -380,6 +413,7 @@ async def get_accessibility_tree(page: Page, full: bool = False) -> tuple[list[d
                     except ValueError:
                         attrs[key] = val
 
+        # Assign the next ref and record the element with the attributes that matter to the model.
         ref = f"e{ref_counter}"
         ref_counter += 1
 
@@ -407,6 +441,7 @@ async def get_accessibility_tree(page: Page, full: bool = False) -> tuple[list[d
         # Keep the readable tree focused on content-bearing regions.
         show_in_tree = full or current_landmark in ("main", "dialog", "form", "region", "unknown", "complementary")
 
+        # Render the element as one indented line of the readable tree.
         if show_in_tree:
             indent = "  " * depth
             label_parts = [f"[{ref}]", role]
@@ -453,7 +488,8 @@ def _is_noise_element(elem: dict) -> bool:
     return False
 
 
-# Return the stable, model-facing subset of one accessibility element.
+# Return the stable, model-facing subset of one accessibility element (the landmark is reported as "region",
+# and text-entry roles are marked editable).
 def _snapshot_element_payload(el: dict) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "ref": el.get("ref"),
@@ -535,7 +571,8 @@ def _group_controls(elements: list[dict]) -> dict[str, list[dict]]:
     return groups
 
 
-# Format controls in a predictable grouped order for snapshot markdown.
+# Format controls in a predictable grouped order for snapshot markdown. At most max_items controls are
+# listed across all groups; a final line reports how many were left out and how to see them.
 def _format_parsed_controls(
     elements: list[dict],
     *,
@@ -547,6 +584,7 @@ def _format_parsed_controls(
     lines: list[str] = []
     shown = 0
 
+    # Group headings in display order, paired with the keys of the groups.
     labels = [
         ("text_inputs", "Text inputs"),
         ("buttons", "Buttons and controls"),
@@ -554,6 +592,7 @@ def _format_parsed_controls(
         ("other_controls", "Other interactive elements"),
     ]
 
+    # List each non-empty group under its heading until the item cap is reached.
     for key, label in labels:
         items = groups[key]
         if not items:
@@ -570,6 +609,7 @@ def _format_parsed_controls(
         if shown >= max_items:
             break
 
+    # Tell the model about controls cut by the cap, or that the page has none.
     remaining = max(0, len(selected) - shown)
     if remaining:
         hint = "browser_snapshot(full=true)" if not full else "scroll or refine the request"
@@ -602,9 +642,12 @@ def _build_parsed_state(elements: list[dict], *, full: bool, max_items: int) -> 
 
 # Snapshot text extraction
 
-# Extract a short text preview from the main content area for full snapshots.
+# Extract a short text preview from the main content area for full snapshots. The in-page script prefers
+# the main landmark, temporarily hides navigation, footer and comment elements, reads the visible text,
+# restores the page, then collapses whitespace and truncates to max_chars. Failures yield an empty string.
 async def _extract_brief_text(page: Page, max_chars: int = AUTO_TEXT_PREVIEW_LEN) -> str:
     try:
+        # Run the extraction script in the page; max_chars is passed in as its argument.
         text = await page.evaluate("""(maxChars) => {
             // Try main landmark first
             let el = document.querySelector('main, [role="main"]');
@@ -639,13 +682,15 @@ async def _extract_brief_text(page: Page, max_chars: int = AUTO_TEXT_PREVIEW_LEN
         }""", max_chars)
         return text or ""
     except Exception as exc:
+        # The text preview is optional; log the failure and let the snapshot go out without it.
         log.debug(f"Brief text extraction failed: {exc}")
         return ""
 
 
 # Rendering wait helpers
 
-# Wait until SPA main content becomes readable without fixed sleeps.
+# Wait until SPA main content becomes readable without fixed sleeps. Polls up to six times (about 300 ms
+# apart) for a non-busy main landmark with more than 100 characters of text, then waits one last window.
 async def _wait_for_spa_content(page: Page, timeout_ms: int = 5000):
     # Poll the main landmark until meaningful text appears.
     for _ in range(6):
@@ -667,6 +712,7 @@ async def _wait_for_spa_content(page: Page, timeout_ms: int = 5000):
             if has_content:
                 return
         except Exception:
+            # The page may be navigating or closing; treat it as "not ready yet" and keep polling.
             pass
 
         # Use an in-page timer to keep the Playwright transport active.
@@ -683,6 +729,8 @@ async def _wait_for_spa_content(page: Page, timeout_ms: int = 5000):
 
 
 # Overlay and page-state detection
+
+# Selectors of close buttons that are common on generic modal and popup windows.
 _KNOWN_CLOSE_SELECTORS = [
     "[data-dismiss='modal']", "[data-action*='close' i]",
     "[data-action*='dismiss' i]", "[data-testid*='close' i]",
@@ -692,6 +740,7 @@ _KNOWN_CLOSE_SELECTORS = [
     "button.close", "[class*='close'][role='button']",
 ]
 
+# Selectors of "accept cookies" buttons of common consent platforms and generic accept attributes.
 _KNOWN_ACCEPT_SELECTORS = [
     "#onetrust-accept-btn-handler",
     "#accept-cookie-consent",
@@ -704,7 +753,10 @@ _KNOWN_ACCEPT_SELECTORS = [
 ]
 
 
-# Try to dismiss common cookie banners and blocking popups before snapshotting.
+# Try to dismiss common cookie banners and blocking popups before snapshotting. Four steps, from safest
+# to most heuristic: click a known accept selector, otherwise let an in-page script rank the buttons of
+# banner-like containers; then click a known close selector, or a script-found close control; finally press
+# Escape when a dialog is still open. Return labels of the actions taken (empty when nothing was dismissed).
 async def _auto_dismiss_overlays(page: Page) -> list[str]:
     dismissed = []
 
@@ -723,11 +775,14 @@ async def _auto_dismiss_overlays(page: Page) -> list[str]:
                     closed_this_pass = True
                     break
             except Exception:
+                # The selector matched nothing clickable on this page; try the next one.
                 pass
 
         if closed_this_pass:
             continue
 
+        # No known selector matched: score the buttons of banner-like containers in the page and click
+        # the best accept-style one, never reject/manage ones.
         try:
             clicked = await page.evaluate("""() => {
                 const containers = Array.from(document.querySelectorAll(
@@ -794,6 +849,7 @@ async def _auto_dismiss_overlays(page: Page) -> list[str]:
                 dismissed.append(f"close-selector:{sel}")
                 break
         except Exception:
+            # The selector matched nothing clickable on this page; try the next one.
             pass
 
     # Fall back to markup heuristics if explicit selectors are missing.
@@ -872,9 +928,13 @@ async def _auto_dismiss_overlays(page: Page) -> list[str]:
     return dismissed
 
 
-# Detect CAPTCHA, login, cookie banner, and error-page situations for warnings.
+# Detect CAPTCHA, login, cookie banner, and error-page situations for warnings. An in-page script checks
+# for known widgets and markup; the findings are turned into warning lines that tell the model what to
+# do next. Detection failures are logged and give no warnings.
 async def _detect_page_situation(page: Page) -> list[str]:
     warnings: list[str] = []
+
+    # Collect the raw findings from the page.
     try:
         situation = await page.evaluate("""() => {
             const r = {
@@ -944,6 +1004,7 @@ async def _detect_page_situation(page: Page) -> list[str]:
         log.warning(f"Situation detection failed: {exc}")
         return warnings
 
+    # Turn each finding into a warning line for the model.
     if situation.get("captcha"):
         ctype = situation.get("captcha_type", "unknown")
         warnings.append(
@@ -970,8 +1031,12 @@ async def _detect_page_situation(page: Page) -> list[str]:
     return warnings
 
 
-# Describe a blocking overlay that remains visible after auto-dismiss attempts.
+# Describe a blocking overlay that remains visible after auto-dismiss attempts. An in-page script looks
+# for a large, high z-index fixed or absolute element covering the viewport centre and classifies it
+# (registration, newsletter, login wall, cookie banner, ...) from its id, classes, role and text. Return
+# "kind" or 'kind: "text"', or None when no such overlay exists or detection fails.
 async def _detect_undismissable_overlay(page: Page) -> str | None:
+    # Run the detection script in the page.
     try:
         result = await page.evaluate("""() => {
             const vw = window.innerWidth;
@@ -1024,6 +1089,7 @@ async def _detect_undismissable_overlay(page: Page) -> str | None:
         log.debug(f"Overlay detection error: {exc}")
         return None
 
+    # Format the classification as a short description for the model.
     if result is None:
         return None
 
@@ -1034,6 +1100,7 @@ async def _detect_undismissable_overlay(page: Page) -> str | None:
 
 # Browser lifecycle
 
+# Lower-case fragments of exception text that mean the browser, context or driver connection is gone.
 _BROWSER_CLOSED_MARKERS = (
     "targetclosederror",
     "target page, context or browser has been closed",
@@ -1052,7 +1119,7 @@ def is_browser_closed_error(exc: BaseException) -> bool:
     return any(marker in text for marker in _BROWSER_CLOSED_MARKERS)
 
 
-# Return the most recent non-blank URL from the navigation history buffer.
+# Return the most recent non-blank, non-about:blank URL from the navigation history buffer.
 def last_known_url() -> str:
     for url in reversed(_nav_history):
         value = str(url or "").strip()
@@ -1063,16 +1130,20 @@ def last_known_url() -> str:
 
 # Store the shared Camoufox/Playwright session used by MCP browser tools.
 class BrowserState:
-
     # Initialize empty browser, context, page, and tool context handles.
     def __init__(self):
+        # The Camoufox context manager that owns the launched browser, and the Playwright objects created
+        # from it; all are None until ensure_open() launches the browser.
         self._camoufox_cm: AsyncCamoufox | None = None
         self.browser: Browser | None = None
         self.context: BrowserContext | None = None
         self.page: Page | None = None
+
+        # Context of the current tool call (module and project folders, sandbox flags, MCP session).
         self.tool_context: dict[str, Any] = {}
 
-    # Return the active downloads directory for the current tool context.
+    # Return the active downloads directory for the current tool context: the sandbox downloads folder when
+    # sandbox mode is on and the module folder is known, otherwise the configured DOWNLOADS_DIR.
     def downloads_dir(self) -> Path:
         safe_context = self.tool_context or {}
         module_dir = str(safe_context.get("module_dir") or safe_context.get("project_dir") or "").strip()
@@ -1084,7 +1155,9 @@ class BrowserState:
             return Path(module_dir) / "Tools" / "mcp-sandbox" / "_sandbox" / "downloads"
         return DOWNLOADS_DIR
 
-    # Return whether the stored Playwright page can still receive commands.
+    # Return whether the stored Playwright page can still receive commands. A page that is closed, times
+    # out on a trivial evaluate, or fails with a browser-closed error is dead; any other evaluate error is
+    # treated as non-fatal and the page is still considered alive.
     async def _has_live_page(self) -> bool:
         if self.page is None:
             return False
@@ -1093,8 +1166,10 @@ class BrowserState:
             if self.page.is_closed():
                 return False
         except Exception:
+            # Even asking the page about its state failed, so it is unusable.
             return False
 
+        # Health check: run a trivial script in the page.
         try:
             await asyncio.wait_for(self.page.evaluate("() => true"), timeout=2.0)
             return True
@@ -1107,11 +1182,14 @@ class BrowserState:
             log.debug("Browser page health check failed but did not look fatal: %s", exc)
             return True
 
-    # Launch the browser lazily on first use; return True when a new session started.
+    # Launch the browser lazily on first use; return True when a new session started. A half-dead session
+    # is closed first, a failed launch cleans up everything and raises a RuntimeError, and a new page gets
+    # handlers that save downloads and auto-accept dialogs.
     async def ensure_open(self) -> bool:
         if await self._has_live_page():
             return False
 
+        # Discard leftovers of a previous session that is no longer usable.
         if (
             self.page is not None
             or self.context is not None
@@ -1121,6 +1199,7 @@ class BrowserState:
             log.warning("Stored Camoufox page is no longer usable; relaunching browser session.")
             await self.close()
 
+        # Launch Camoufox and open a context and page of the configured size.
         log.info("Launching camoufox browser (Firefox stealth, headless=%s)...", BROWSER_HEADLESS)
 
         try:
@@ -1134,6 +1213,7 @@ class BrowserState:
             )
             self.page = await self.context.new_page()
         except Exception as exc:
+            # Roll back the partial launch and report a readable error.
             self.page = None
             self.context = None
             self.browser = None
@@ -1141,6 +1221,7 @@ class BrowserState:
                 try:
                     await self._camoufox_cm.__aexit__(None, None, None)
                 except Exception:
+                    # Cleanup after a failed launch is best-effort; the launch error is raised below.
                     pass
             self._camoufox_cm = None
             raise RuntimeError(
@@ -1177,8 +1258,10 @@ class BrowserState:
         log.info("Camoufox browser ready.")
         return True
 
-    # Close all shared browser resources and clear stored references.
+    # Close all shared browser resources and clear stored references. Page, context, browser and the
+    # Camoufox manager are closed in that order, each independently, so one failure does not skip the rest.
     async def close(self):
+        # Detach the references first so the state is clean even if closing fails.
         page = self.page
         context = self.context
         browser = self.browser
@@ -1188,30 +1271,36 @@ class BrowserState:
         self.browser = None
         self._camoufox_cm = None
 
+        # Close from the innermost resource outwards.
         if page:
             try:
                 if not page.is_closed():
                     await page.close()
             except Exception:
+                # The browser may already be dead; shutdown must continue with the other resources.
                 pass
         if context:
             try:
                 await context.close()
             except Exception:
+                # The browser may already be dead; shutdown must continue with the other resources.
                 pass
         if browser:
             try:
                 await browser.close()
             except Exception:
+                # The browser may already be dead; shutdown must continue with the other resources.
                 pass
         if camoufox_cm:
             try:
                 await camoufox_cm.__aexit__(None, None, None)
             except Exception:
+                # The browser may already be dead; there is nothing more to release.
                 pass
 
 
-# Shared runtime state
+# Shared runtime state: the browser session, the elements of the last snapshot (refs resolve against them),
+# whether a wait_for_user call is pending, and the URLs visited so far.
 state = BrowserState()
 _last_elements: list[dict] = []
 _waiting_for_user: bool = False
@@ -1222,16 +1311,19 @@ _nav_history: list[str] = []
 # every PORTAL_A11Y_CAPTURE_EVERY publishes to avoid excessive Playwright calls.
 PORTAL_A11Y_CAPTURE_EVERY = 4
 
-# Compact a11y bundle for the live portal panel — kept as last-known value so
-# the Django frame response always has something to return even between rebuilds.
+# Compact a11y bundle for the live portal panel and its publish counter. The bundle is kept as the
+# last-known value so the Django frame response always has something to return even between rebuilds.
 _portal_a11y_bundle: dict | None = None
 _portal_a11y_capture_counter: int = 0
 
 
-# Build a compact a11y bundle for the live portal panel (throttled Playwright calls).
+# Build a compact a11y bundle for the live portal panel (throttled Playwright calls). Only every
+# PORTAL_A11Y_CAPTURE_EVERY-th call rebuilds the bundle; the others return the last-known one (which is
+# None before the first rebuild).
 async def capture_portal_a11y_bundle(page: Any, *, max_controls: int = 60) -> dict | None:
     global _last_elements, _portal_a11y_bundle, _portal_a11y_capture_counter
 
+    # Throttle: rebuild on the first call and then once per PORTAL_A11Y_CAPTURE_EVERY calls.
     _portal_a11y_capture_counter += 1
     if _portal_a11y_capture_counter % PORTAL_A11Y_CAPTURE_EVERY != 1:
         # Return the last-known bundle without re-querying Playwright.
@@ -1243,6 +1335,7 @@ async def capture_portal_a11y_bundle(page: Any, *, max_controls: int = 60) -> di
     try:
         elements, _ = await get_accessibility_tree(page, full=False)
     except Exception:
+        # A failed snapshot keeps the last-known bundle rather than breaking the portal frame.
         return _portal_a11y_bundle
 
     # Sync the shared element cache so _click_by_role_and_name works with ref
@@ -1252,6 +1345,7 @@ async def capture_portal_a11y_bundle(page: Any, *, max_controls: int = 60) -> di
     controls = _filter_snapshot_controls(elements, full=False)[:max_controls]
     items = [_snapshot_element_payload(el) for el in controls]
 
+    # Page address and title are optional extras for the panel.
     try:
         url = page.url
         title = await page.title()
@@ -1279,7 +1373,9 @@ def reset_portal_a11y_state() -> None:
 
 # Snapshot builders
 
-# Build the detailed page snapshot returned after navigation or major page changes.
+# Build the detailed page snapshot returned after navigation or major page changes. The default snapshot
+# lists controls only; full mode also adds the page text and the accessibility tree. Side effects: the
+# element cache used to resolve refs is replaced and the navigation trail is updated.
 async def _take_snapshot(
     action_context: str | None = None,
     run_dismiss: bool = False,
@@ -1308,11 +1404,12 @@ async def _take_snapshot(
     elements, tree_text = await get_accessibility_tree(state.page, full=full)
     _last_elements = elements
 
+    # Read the page address and title and check for CAPTCHA, login, cookie and error-page situations.
     url = state.page.url
     title = await state.page.title()
     warnings = await _detect_page_situation(state.page)
 
-    # Keep a short navigation trail to help with backtracking.
+    # Keep a short navigation trail (at most 20 entries) to help with backtracking.
     if not _nav_history or _nav_history[-1] != url:
         _nav_history.append(url)
         if len(_nav_history) > 20:
@@ -1335,6 +1432,7 @@ async def _take_snapshot(
     controls = _filter_snapshot_controls(elements, full=full)
     parts.append(f"**Elements:** {len(elements)} total, {main_count} in main area, {len(controls)} controls")
 
+    # Warnings come first, with the unremovable-overlay warning on top.
     all_warnings = list(warnings)
     if overlay_warning:
         all_warnings.insert(0, overlay_warning)
@@ -1343,12 +1441,14 @@ async def _take_snapshot(
         parts.append("\n### ⚠️ Page Situation")
         parts.extend(all_warnings)
 
+    # Machine-readable counts, using a larger control cap for full snapshots.
     max_items = MAX_MAIN_INTERACTIVE * 3 if full else MAX_MAIN_INTERACTIVE
     parts.append("\n### Parsed state")
     parts.append("```json")
     parts.append(json.dumps(_build_parsed_state(elements, full=full, max_items=max_items), ensure_ascii=False, indent=2))
     parts.append("```")
 
+    # The default snapshot stops after the grouped controls and a hint about the full mode.
     if not full:
         parts.extend(_format_parsed_controls(elements, full=full, max_items=max_items))
         parts.append(
@@ -1367,6 +1467,7 @@ async def _take_snapshot(
 
     parts.extend(_format_parsed_controls(elements, full=full, max_items=max_items))
 
+    # Finish with the readable accessibility tree.
     if tree_text.strip():
         parts.append(f"\n### Accessibility tree\n```\n{tree_text}\n```")
     else:
@@ -1375,16 +1476,19 @@ async def _take_snapshot(
     return [TextContent(type="text", text="\n".join(parts))]
 
 
-# Build the smaller controls-only snapshot used after in-page actions.
+# Build the smaller controls-only snapshot used after in-page actions. Like the detailed snapshot it
+# refreshes the element cache and the navigation trail, but it skips overlay and situation detection.
 async def _take_compact_snapshot(action_context: str | None = None) -> list[TextContent]:
     global _last_elements, _nav_history
 
+    # Refresh the element cache and read the page address and title.
     elements, _ = await get_accessibility_tree(state.page)
     _last_elements = elements
 
     url = state.page.url
     title = await state.page.title()
 
+    # Record the page in the navigation trail (at most 20 entries).
     if not _nav_history or _nav_history[-1] != url:
         _nav_history.append(url)
         if len(_nav_history) > 20:
@@ -1423,7 +1527,9 @@ def _find_element(ref: str) -> dict | None:
     return None
 
 
-# Resolve the best Playwright locator for a role and accessible name pair.
+# Resolve the best Playwright locator for a role and accessible name pair. Try role lookup (exact name
+# first, then substring), then label, then visible text; with several matches the first visible one among
+# the first six wins. Return None when nothing matches.
 async def _resolve_locator(role: str, name: str):
     # Prefer semantic role lookups because they match the accessibility tree.
     for exact in (True, False):
@@ -1439,9 +1545,11 @@ async def _resolve_locator(role: str, name: str):
                     if await loc.nth(i).is_visible():
                         return loc.nth(i)
                 except Exception:
+                    # This candidate went stale or detached; check the next one.
                     continue
             return loc.first
         except Exception:
+            # This lookup strategy failed; fall through to the next one.
             continue
 
     if not name:
@@ -1453,6 +1561,7 @@ async def _resolve_locator(role: str, name: str):
         if await loc.count() > 0:
             return loc.first
     except Exception:
+        # The label lookup failed; fall back to text matching.
         pass
 
     # Text matching is the broadest fallback when semantic lookup fails.
@@ -1467,8 +1576,10 @@ async def _resolve_locator(role: str, name: str):
                     if await loc.nth(i).is_visible():
                         return loc.nth(i)
                 except Exception:
+                    # This candidate went stale or detached; check the next one.
                     continue
         except Exception:
+            # This lookup strategy failed; fall through to the next one.
             continue
 
     return None
@@ -1476,7 +1587,9 @@ async def _resolve_locator(role: str, name: str):
 
 # Click actions
 
-# Click a cached accessibility element using role/name resolution and fallbacks.
+# Click a cached accessibility element using role/name resolution and fallbacks. Strategies in order:
+# normal click, check for checkable roles, forced click, DOM click. Raise ValueError when the ref is
+# unknown, the element cannot be located, or every strategy fails.
 async def _click_by_role_and_name(ref: str):
     elem = _find_element(ref)
     if not elem:

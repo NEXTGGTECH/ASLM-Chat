@@ -16,6 +16,7 @@ from xml.etree import ElementTree
 from Services.markitdown_extractor import extract_markdown
 
 
+# File extensions (lowercase, with the dot) that mark an upload as text.
 TEXT_FILE_EXTENSIONS = {
     ".adoc", ".ahk", ".asm", ".asciidoc", ".bash", ".bat", ".bib", ".c", ".cc", ".cfg",
     ".clj", ".cljc", ".cljs", ".cmd", ".cmake", ".conf", ".config", ".cpp", ".cs",
@@ -35,6 +36,7 @@ TEXT_FILE_EXTENSIONS = {
     ".vtt", ".xhtml", ".xml", ".xsd", ".xsl", ".yaml", ".yml", ".zsh",
 }
 
+# Exact lowercase file names without a usable extension that mark an upload as text.
 TEXT_FILE_NAMES = {
     ".bash_profile", ".bashrc", ".dockerignore", ".editorconfig", ".env", ".env.example",
     ".eslintignore", ".eslintrc", ".gitattributes", ".gitconfig", ".gitignore", ".gitkeep",
@@ -44,6 +46,7 @@ TEXT_FILE_NAMES = {
     "makefile", "procfile", "rakefile", "tiltfile", "vagrantfile",
 }
 
+# Non-text/* MIME types that still carry text content.
 TEXT_MIME_TYPES = {
     "application/ecmascript",
     "application/json",
@@ -64,6 +67,9 @@ TEXT_MIME_TYPES = {
     "image/svg+xml",
 }
 
+# Preview and scan limits: characters kept in the text preview, character count above which text
+# counts as truncated, bytes decoded per file, archive entries listed, table rows and characters
+# per table cell previewed, and Office XML parts (slides, sheets) read per document.
 TEXT_PREVIEW_CHAR_LIMIT = 24_000
 TEXT_FULL_CHAR_LIMIT = 256 * 1024
 TEXT_MAX_SCAN_BYTES = 2 * 1024 * 1024
@@ -73,6 +79,9 @@ TABLE_PREVIEW_CELL_LIMIT = 120
 OFFICE_XML_MEMBER_LIMIT = 80
 
 
+# Model-facing description of one uploaded file: identity (id, name, MIME, size, hash), where it
+# lives in the sandbox, whether text or vision access is available, the text, archive and table
+# previews, and the tools recommended for reading it further.
 @dataclass(frozen=True)
 class UploadedFileManifest:
     file_id: str
@@ -122,9 +131,10 @@ def is_probably_text_upload(name: str, mime: str) -> bool:
     return any(suffix.lower() in TEXT_FILE_EXTENSIONS for suffix in upload_path.suffixes)
 
 
-# Upload text extraction helpers.
+# Upload text extraction
 
-# Return whether a byte sample contains binary markers.
+# Return whether a byte sample looks binary: it holds a NUL byte, or more than 2% of its bytes are
+# control characters other than tab, newline, form feed, carriage return and escape.
 def _has_binary_markers(sample: bytes) -> bool:
     if b"\x00" in sample:
         return True
@@ -135,12 +145,17 @@ def _has_binary_markers(sample: bytes) -> bool:
     return control_count / len(sample) > 0.02
 
 
-# Decode text bytes.
+# Decode up to TEXT_MAX_SCAN_BYTES of a file as text, trying UTF-8, UTF-8 with BOM and cp1251
+# (plus latin-1 when the file is known to be text). Return the text with normalized newlines and
+# whether the file was cut at the scan limit, or an empty string when the bytes are not text.
 def _decode_text_bytes(file_bytes: bytes, *, explicit_text: bool) -> tuple[str, bool]:
+    # Reject binary content by its first 8 KiB.
     sample = file_bytes[:8192]
     if _has_binary_markers(sample):
         return "", False
 
+    # Pick the encodings to try; latin-1 accepts any byte, so it is only a last resort for
+    # uploads already classified as text.
     candidate_bytes = file_bytes[:TEXT_MAX_SCAN_BYTES]
     encodings = ("utf-8", "utf-8-sig", "cp1251")
     if explicit_text:
@@ -150,13 +165,15 @@ def _decode_text_bytes(file_bytes: bytes, *, explicit_text: bool) -> tuple[str, 
         try:
             text = candidate_bytes.decode(encoding)
         except UnicodeDecodeError:
+            # This encoding does not fit the bytes; try the next one.
             continue
         if _looks_like_text(text):
             return text.replace("\r\n", "\n").replace("\r", "\n"), len(file_bytes) > len(candidate_bytes)
     return "", False
 
 
-# Return whether decoded text looks printable enough to treat as text.
+# Return whether decoded text looks printable enough to treat as text: at least 92% of the first
+# 8192 characters are printable (or a newline or tab). Empty text counts as text.
 def _looks_like_text(text: str) -> bool:
     if not text:
         return True
@@ -165,7 +182,8 @@ def _looks_like_text(text: str) -> bool:
     return printable / max(len(sample), 1) >= 0.92
 
 
-# Trim text preview.
+# Cut the text to the preview limit and append a truncation marker when anything was dropped.
+# Return the preview, the total character count of the stripped text and whether it is truncated.
 def _trim_text_preview(text: str, *, source_truncated: bool) -> tuple[str | None, int, bool]:
     normalized = str(text or "").strip()
     total_chars = len(normalized)
@@ -178,7 +196,8 @@ def _trim_text_preview(text: str, *, source_truncated: bool) -> tuple[str | None
     return preview, total_chars, truncated
 
 
-# Build table preview.
+# Build a pipe-separated preview of a CSV or TSV file (first rows and 12 cells per row, each cell
+# cut short). Return None for other file types, unparsable text or an empty table.
 def _build_table_preview(name: str, text: str) -> str | None:
     suffix = Path(normalize_upload_name(name)).suffix.lower()
     if suffix not in {".csv", ".tsv"}:
@@ -199,7 +218,8 @@ def _build_table_preview(name: str, text: str) -> str | None:
     return "\n".join(rows) if rows else None
 
 
-# Build zip tree.
+# List the entry names of a zip archive (directories get a trailing slash), capped at
+# ARCHIVE_TREE_LIMIT with a truncation marker. Return None when the bytes are not a readable zip.
 def _build_zip_tree(file_bytes: bytes) -> list[str] | None:
     try:
         with zipfile.ZipFile(io.BytesIO(file_bytes)) as archive:
@@ -214,7 +234,7 @@ def _build_zip_tree(file_bytes: bytes) -> list[str] | None:
         return None
 
 
-# Extract xml text.
+# Join all text nodes of an XML document with spaces. Return an empty string for invalid XML.
 def _extract_xml_text(xml_bytes: bytes) -> str:
     try:
         root = ElementTree.fromstring(xml_bytes)
@@ -229,7 +249,8 @@ def _extract_xml_text(xml_bytes: bytes) -> str:
     return " ".join(parts)
 
 
-# Extract pdf text.
+# Extract PDF text page by page with PyMuPDF, stopping once TEXT_MAX_SCAN_BYTES characters are
+# collected. Return an empty string when PyMuPDF is missing or the document cannot be read.
 def _extract_pdf_text(file_bytes: bytes) -> str:
     try:
         import fitz
@@ -242,10 +263,11 @@ def _extract_pdf_text(file_bytes: bytes) -> str:
                     break
         return "\n".join(pages).strip()
     except Exception:
+        # PyMuPDF missing or a corrupt/encrypted PDF: no text rather than a failed upload.
         return ""
 
 
-# Extract docx text.
+# Extract the text of a docx archive from word/document.xml. Return an empty string when the part is missing.
 def _extract_docx_text(archive: zipfile.ZipFile) -> str:
     try:
         document_xml = archive.read("word/document.xml")
@@ -254,7 +276,8 @@ def _extract_docx_text(archive: zipfile.ZipFile) -> str:
     return _extract_xml_text(document_xml)
 
 
-# Extract pptx text.
+# Extract the text of a pptx archive as "Slide N: ..." lines, one per non-empty slide, in slide
+# file order and capped at OFFICE_XML_MEMBER_LIMIT slides.
 def _extract_pptx_text(archive: zipfile.ZipFile) -> str:
     slide_names = sorted(
         name for name in archive.namelist()
@@ -268,8 +291,10 @@ def _extract_pptx_text(archive: zipfile.ZipFile) -> str:
     return "\n".join(slides)
 
 
-# Extract xlsx text.
+# Extract the text of an xlsx archive as "Sheet N:" blocks of pipe-separated rows (at most
+# TABLE_PREVIEW_ROWS rows of 12 cells per sheet, OFFICE_XML_MEMBER_LIMIT sheets).
 def _extract_xlsx_text(archive: zipfile.ZipFile) -> str:
+    # Load the shared string table that cells of type "s" point into.
     shared_strings: list[str] = []
     try:
         root = ElementTree.fromstring(archive.read("xl/sharedStrings.xml"))
@@ -280,6 +305,7 @@ def _extract_xlsx_text(archive: zipfile.ZipFile) -> str:
     except (KeyError, ElementTree.ParseError):
         shared_strings = []
 
+    # Read the worksheets in file order and collect their non-empty rows.
     sheet_names = sorted(
         name for name in archive.namelist()
         if name.startswith("xl/worksheets/sheet") and name.endswith(".xml")
@@ -289,6 +315,7 @@ def _extract_xlsx_text(archive: zipfile.ZipFile) -> str:
         try:
             root = ElementTree.fromstring(archive.read(sheet_name))
         except ElementTree.ParseError:
+            # A corrupt sheet is skipped; the other sheets still contribute text.
             continue
 
         sheet_rows = []
@@ -299,6 +326,8 @@ def _extract_xlsx_text(archive: zipfile.ZipFile) -> str:
             for cell in row:
                 if not cell.tag.endswith("c"):
                     continue
+
+                # Take the cell value (<v> or inline <t>) and resolve shared string references.
                 cell_type = cell.attrib.get("t", "")
                 value = ""
                 for child in cell:
@@ -320,7 +349,7 @@ def _extract_xlsx_text(archive: zipfile.ZipFile) -> str:
     return "\n\n".join(rows)
 
 
-# Extract document text.
+# Extract text from a PDF or Office document. Return an empty string for other types or unreadable files.
 def _extract_document_text(file_bytes: bytes, name: str, mime: str) -> str:
     suffix = Path(normalize_upload_name(name)).suffix.lower()
     normalized_mime = str(mime or "").lower()
@@ -336,6 +365,7 @@ def _extract_document_text(file_bytes: bytes, name: str, mime: str) -> str:
     if suffix not in {".docx", ".pptx", ".xlsx"}:
         return ""
 
+    # Office documents are zip archives; read them with the format-specific local parser.
     try:
         with zipfile.ZipFile(io.BytesIO(file_bytes)) as archive:
             if suffix == ".docx":
@@ -360,6 +390,7 @@ def build_uploaded_file_manifest(
     file_id: str | None = None,
     tool_server_id: str = "sandbox",
 ) -> UploadedFileManifest:
+    # Normalize the identity of the file: safe name, MIME, id, hash and the text/image classification.
     raw_bytes = bytes(file_bytes or b"")
     clean_name = normalize_upload_name(name)
     clean_mime = guess_upload_mime(clean_name, mime)
@@ -368,6 +399,8 @@ def build_uploaded_file_manifest(
     is_image = clean_mime.startswith("image/")
     explicit_text = is_probably_text_upload(clean_name, clean_mime)
 
+    # Build the text preview: decode text-like files directly, extract text from documents
+    # (PDF, Office) otherwise. CSV/TSV and xlsx content also gets a table preview.
     text_preview = None
     text_total_chars = None
     text_truncated = False
@@ -390,10 +423,13 @@ def build_uploaded_file_manifest(
             if Path(clean_name).suffix.lower() == ".xlsx":
                 table_preview = text_preview
 
+    # List the contents of zip archives.
     archive_tree = None
     if clean_name.lower().endswith(".zip") or clean_mime in {"application/zip", "application/x-zip-compressed"}:
         archive_tree = _build_zip_tree(raw_bytes)
 
+    # Recommend the tools that can read the file further: the sandbox server when the file is
+    # stored there, archive tools for zips, and file search when the preview is truncated.
     recommended_tools: list[str] = []
     if sandbox_path:
         recommended_tools.append(str(tool_server_id or "sandbox").strip() or "sandbox")

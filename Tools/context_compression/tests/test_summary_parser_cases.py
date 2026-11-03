@@ -8,6 +8,8 @@ import unittest
 from context_compression.history_compressor import build_structured_history_summary
 
 
+# Overflow entries and recent user message shared by every parser case; the URL carries a stray trailing
+# backtick that the summary must strip.
 BASE_ENTRIES = [
     {
         "role": "user",
@@ -21,8 +23,8 @@ BASE_ENTRIES = [
 BASE_RECENT = ["Check this URL: https://www.youtube.com/watch?v=QknRUGPvsAQ"]
 
 
-# Run model output through the structured summary builder and classify parse status.
-
+# Run model output through the structured summary builder and return the payload together with its parse
+# status: "fallback" when a risk flag reports unparseable or empty output, otherwise "parsed".
 def _run_model_output(model_output: str) -> tuple[str, dict]:
     _summary_text, payload = build_structured_history_summary(
         overflow_entries=BASE_ENTRIES,
@@ -36,10 +38,13 @@ def _run_model_output(model_output: str) -> tuple[str, dict]:
     return status, payload
 
 
+# Cover how the summary builder parses different model output shapes.
 class SummaryParserCasesTests(unittest.TestCase):
-    # Parser matrix: JSON, Markdown, canonical labels, and fallback cases.
-
+    # Verify that strict, fenced and prose-wrapped JSON, contract Markdown sections and canonical labels are
+    # parsed, that generic labels, malformed JSON, plain text and empty output fall back to the raw harvest,
+    # and that every case keeps the cleaned URL and drops the bogus "//www.youtube.com" file.
     def test_parser_reports_parsed_or_fallback_for_model_outputs(self) -> None:
+        # Arrange: a valid JSON summary reused by the three JSON cases.
         json_payload = {
             "summary_version": 1,
             "session_goal": "Check YouTube URL.",
@@ -57,6 +62,8 @@ class SummaryParserCasesTests(unittest.TestCase):
             "risk_flags": [],
             "source_memory": ["assistant: JSON parsed."],
         }
+
+        # Cases: (name, model output, expected parse status, text expected inside work_summary).
         cases = [
             (
                 "strict_json",
@@ -162,7 +169,8 @@ class SummaryParserCasesTests(unittest.TestCase):
             ),
         ]
 
-        # Each case: expected parsed/fallback status, work_summary fragment, and URL normalization.
+        # Act and assert per case: the parse status and work_summary fragment match, the URL is normalized
+        # (backtick removed), the web-host "file" is filtered out, and empty output reports the empty-output flag.
         for name, model_output, expected_status, expected_work_fragment in cases:
             with self.subTest(name=name):
                 status, payload = _run_model_output(model_output)
@@ -181,5 +189,6 @@ class SummaryParserCasesTests(unittest.TestCase):
                     )
 
 
+# Allow running the tests without pytest.
 if __name__ == "__main__":
     unittest.main(verbosity=2)

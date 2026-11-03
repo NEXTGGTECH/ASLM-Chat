@@ -30,15 +30,20 @@ from sandbox.config import (
 )
 from sandbox.responses import SandboxToolError
 
+# Context lines shown around a match in previews, the number of leading bytes sampled to tell text from
+# binary, the MIME prefixes of images and text, and the largest file the supervisor loads into memory.
 CONTEXT_LINES = 3
 TEXT_SAMPLE_BYTES = 8192
 IMAGE_MIME_PREFIX = "image/"
 TEXT_MIME_PREFIX = "text/"
 MAX_FILE_READ_BYTES = max(MAX_READ_BYTES, MAX_IMAGE_PREVIEW_BYTES, TEXT_SAMPLE_BYTES)
+
+# Path prefixes of an older upload convention; such paths are mapped to "User/" in the task workspace.
 LEGACY_UPLOAD_ROOT_PREFIXES = ("mnt/data/User",)
 
 
-# Return accepted model-facing workspace root aliases.
+# Return accepted model-facing workspace root aliases: the default task directory name, cleaned of
+# slashes and duplicates (empty names are dropped).
 def model_root_aliases() -> tuple[str, ...]:
     aliases = [DEFAULT_TASK_DIR]
     seen: set[str] = set()
@@ -54,8 +59,9 @@ def model_root_aliases() -> tuple[str, ...]:
 
 # Encoding and newlines
 
-
-# Decode bytes with a small fallback chain.
+# Decode bytes with a small fallback chain: UTF-16 (with or without BOM), then utf-8, cp866, cp1251 and
+# latin1. Return the text and the encoding that worked; undecodable data falls back to utf-8 with
+# replacement characters.
 def smart_decode(bytes_data: bytes) -> tuple[str, str | None]:
     if not bytes_data:
         return "", "utf-8"
@@ -66,6 +72,7 @@ def smart_decode(bytes_data: bytes) -> tuple[str, str | None]:
         try:
             return bytes_data.decode("utf-16"), "utf-16"
         except UnicodeDecodeError:
+            # Not valid UTF-16 after all: continue with the other detection steps.
             pass
 
     # UTF-16 without BOM: count null bytes at even vs odd byte positions in a
@@ -80,23 +87,27 @@ def smart_decode(bytes_data: bytes) -> tuple[str, str | None]:
             try:
                 return bytes_data.decode("utf-16-le"), "utf-16-le"
             except UnicodeDecodeError:
+                # The null pattern was a coincidence; try the next candidate.
                 pass
         if even_nulls > threshold:
             try:
                 return bytes_data.decode("utf-16-be"), "utf-16-be"
             except UnicodeDecodeError:
+                # The null pattern was a coincidence; fall through to the single-byte encodings.
                 pass
 
+    # Single-byte and UTF-8 candidates, strictest first (latin1 accepts anything).
     for encoding in ("utf-8", "cp866", "cp1251", "latin1"):
         try:
             return bytes_data.decode(encoding), encoding
         except UnicodeDecodeError:
+            # Wrong encoding: try the next one.
             continue
 
     return bytes_data.decode("utf-8", errors="replace"), "utf-8"
 
 
-# Detect the dominant newline style in text.
+# Detect the dominant newline style in text: CRLF, lone CR or LF (LF when there is a tie or no newline).
 def detect_newline_style(text: str) -> str:
     crlf = text.count("\r\n")
     normalized = text.replace("\r\n", "")
@@ -117,7 +128,6 @@ def normalize_newlines(text: str) -> str:
 
 # Workspace roots
 
-
 # Return the resolved host workspace root.
 def workspace_root() -> Path:
     return Path(HOST_WORKSPACE).resolve()
@@ -130,8 +140,7 @@ def task_root() -> Path:
 
 # Path normalization
 
-
-# Normalize a workspace-relative path to POSIX form.
+# Normalize a workspace-relative path to POSIX form (forward slashes, no leading slash).
 def normalize_relative_path(path: str) -> str:
     normalized = str(path or ".").replace("\\", "/").strip()
     if not normalized:
@@ -141,13 +150,16 @@ def normalize_relative_path(path: str) -> str:
     return normalized.lstrip("/")
 
 
-# Normalize model-facing paths and tolerate workspace-root aliases.
+# Normalize model-facing paths and tolerate workspace-root aliases: legacy upload paths are mapped,
+# and a leading task directory (plain or under the container workspace) is stripped, so the result
+# is relative to the task root.
 def normalize_model_relative_path(path: str) -> str:
     normalized = normalize_relative_path(path)
     legacy_upload = _legacy_upload_relative_path(normalized)
     if legacy_upload is not None:
         return legacy_upload
 
+    # Strip the task directory prefix in its plain and container-absolute forms.
     for alias in model_root_aliases():
         if normalized == alias:
             return "."
@@ -181,8 +193,8 @@ def _legacy_upload_relative_path(normalized_path: str) -> str | None:
 
 # Path validation and resolution
 
-
-# Reject unsafe paths; allow absolute Linux paths inside the container.
+# Reject unsafe paths (null bytes, Windows drive paths); allow absolute Linux paths inside the
+# container, and outside it only the workspace-root aliases. Raise ValueError for rejected paths.
 def validate_model_path(rel_path: str, kind: str = "path") -> None:
     raw = str(rel_path or ".").replace("\\", "/").strip()
     if not raw or raw == ".":
@@ -208,6 +220,7 @@ def validate_model_path(rel_path: str, kind: str = "path") -> None:
             container_task_root = f"{CONTAINER_WORKSPACE.rstrip('/')}/{alias}"
             if raw == container_task_root or raw.startswith(f"{container_task_root}/"):
                 return
+
         # Inside the container any absolute Linux path is legal — the container
         # filesystem is the security boundary, not path restrictions.
         if IN_CONTAINER:
@@ -219,13 +232,16 @@ def validate_model_path(rel_path: str, kind: str = "path") -> None:
         )
 
 
-# Resolve a model-facing path relative to the provided cwd.
+# Resolve a model-facing path relative to the provided cwd. Absolute workspace paths and paths that
+# already carry a workspace alias are kept; other absolute paths are accepted only inside the
+# container; relative paths are joined with the cwd.
 def resolve_model_path(path: str, cwd: str = ".") -> str:
     raw = str(path or ".").replace("\\", "/").strip()
     normalized_cwd = normalize_model_relative_path(cwd)
     if not raw or raw == ".":
         return normalized_cwd
 
+    # Absolute paths: legacy uploads, workspace aliases, or any container path.
     if raw.startswith("/"):
         legacy_upload = _legacy_upload_relative_path(raw)
         if legacy_upload is not None:
@@ -239,6 +255,7 @@ def resolve_model_path(path: str, cwd: str = ".") -> str:
             return posixpath.normpath(raw)
         raise ValueError(f"Access denied: Absolute path '{raw}' is outside the task workspace.")
 
+    # Relative paths that already start with a workspace alias are kept as they are.
     for alias in model_root_aliases():
         if raw == alias or raw.startswith(f"{alias}/"):
             return raw
@@ -246,6 +263,7 @@ def resolve_model_path(path: str, cwd: str = ".") -> str:
         if raw == container_prefix or raw.startswith(f"{container_prefix}/"):
             return raw
 
+    # Everything else is relative to the cwd.
     if normalized_cwd in ("", "."):
         return posixpath.normpath(raw)
 
@@ -266,19 +284,24 @@ def _chown_to_command_user(*paths: Path) -> None:
 
         user_info = pwd.getpwnam(COMMAND_USER)
     except Exception:
+        # Unknown user (or no pwd module): leave the ownership as it is.
         return
     for path in paths:
         try:
             os.chown(path, user_info.pw_uid, user_info.pw_gid)
         except OSError:
+            # Best-effort: a path that vanished or cannot be re-owned is skipped.
             continue
 
 
-# Resolve a path to a sandbox-safe location (container vs host rules).
+# Resolve a path to a sandbox-safe location (container vs host rules). Paths are validated first;
+# inside the container absolute Linux paths are returned as they are, other paths are resolved under
+# the task root and must not escape it.
 def get_secure_task_path(rel_path: str, kind: str = "path") -> Path:
     validate_model_path(rel_path, kind=kind)
 
     raw = str(rel_path or ".").replace("\\", "/").strip()
+
     # Inside the container, absolute Linux paths bypass task_root resolution.
     if IN_CONTAINER and raw.startswith("/"):
         return Path(posixpath.normpath(raw))
@@ -288,6 +311,7 @@ def get_secure_task_path(rel_path: str, kind: str = "path") -> Path:
     if normalized == ".":
         return task_root()
 
+    # Resolve under the task root and reject results that escape it (for example via "..").
     full_path = (task_root() / normalized).resolve()
     if not full_path.is_relative_to(task_root()):
         raise ValueError(f"Access denied: {rel_path} is outside sandbox workspace.")
@@ -372,8 +396,8 @@ def _reject_oversized_read(path: Path, original: str, max_bytes: int | None = No
 
 # Host import
 
-
-# Return True when a host path is allowed for import.
+# Return True when a host path is allowed for import: inside the task root or one of the allowed
+# import roots.
 def is_allowed_host_import(source: Path) -> bool:
     resolved = source.resolve()
     if is_within(resolved, task_root()):
@@ -388,8 +412,7 @@ def is_allowed_host_import(source: Path) -> bool:
 
 # Text preview helpers
 
-
-# Render a numbered text excerpt with context lines.
+# Render a numbered text excerpt: lines start_line..end_line plus CONTEXT_LINES lines on each side.
 def render_numbered_context(text: str, start_line: int, end_line: int) -> str:
     lines = text.split("\n")
     total_lines = len(lines)
@@ -415,14 +438,15 @@ def build_match_preview(text: str, start_index: int, needle_len: int) -> dict[st
 
 # MIME, binary, and image helpers
 
-
 # Guess MIME type from file extension.
 def _guess_mime(path: Path) -> str:
     mime_type, _ = mimetypes.guess_type(str(path))
     return mime_type or "application/octet-stream"
 
 
-# Heuristic check whether sample bytes look binary.
+# Heuristic check whether sample bytes look binary: text and image MIME types decide directly; otherwise
+# null bytes mean binary, valid UTF-8 means text, and anything else is judged by the share of
+# printable bytes (under 85% means binary).
 def _is_probably_binary(data: bytes, mime_type: str) -> bool:
     if mime_type.startswith(TEXT_MIME_PREFIX):
         return False
@@ -438,6 +462,7 @@ def _is_probably_binary(data: bytes, mime_type: str) -> bool:
         sample.decode("utf-8")
         return False
     except UnicodeDecodeError:
+        # Not valid UTF-8: fall back to the printable-byte ratio below.
         pass
 
     text_like = 0
@@ -521,7 +546,8 @@ def _image_dimensions(data: bytes, mime_type: str) -> dict[str, int] | None:
     return None
 
 
-# Build read_image result dict with optional base64 preview.
+# Build read_image result dict with optional base64 preview. The preview is inlined only when the file
+# is no larger than max_preview_bytes; otherwise a warning says it was omitted.
 def _image_payload(
     path: str,
     data: bytes,
@@ -534,6 +560,7 @@ def _image_payload(
     preview_data = None
     max_preview_bytes = max(0, int(max_preview_bytes))
 
+    # Inline the image as base64 when it fits the preview limit.
     if include_preview:
         if len(data) <= max_preview_bytes:
             preview_data = {
@@ -546,6 +573,7 @@ def _image_payload(
                 f"Image preview omitted because the file is larger than {max_preview_bytes} bytes."
             )
 
+    # Assemble the result, adding width and height when the format is recognized.
     result: dict[str, Any] = {
         "path": path,
         "kind": "image",
@@ -565,7 +593,8 @@ def _image_payload(
     }
 
 
-# Return True when a directory listing entry should be skipped.
+# Return True when a directory listing entry should be skipped (ignored names, and dotfiles unless
+# hidden entries are requested).
 def _should_skip_entry(name: str, include_hidden: bool) -> bool:
     if name in IGNORED_DIR_NAMES:
         return True
@@ -574,7 +603,8 @@ def _should_skip_entry(name: str, include_hidden: bool) -> bool:
     return False
 
 
-# Extract a 1-based line range from normalized text.
+# Extract a 1-based line range from normalized text. Return the sliced text, the effective start and
+# end lines (clamped to the file) and the total number of lines.
 def _line_slice(
     text: str,
     start_line: int | None = None,
@@ -590,7 +620,8 @@ def _line_slice(
     return "\n".join(lines[start - 1 : end]), start, end, total_lines
 
 
-# Truncate UTF-8 text to max_bytes.
+# Truncate UTF-8 text to max_bytes (a character cut in half is dropped). Return the text and whether it
+# was cut.
 def _truncate_text(text: str, max_bytes: int) -> tuple[str, bool]:
     encoded = text.encode("utf-8")
     if len(encoded) <= max_bytes:
@@ -602,20 +633,23 @@ def _truncate_text(text: str, max_bytes: int) -> tuple[str, bool]:
 
 # File operations
 
-
-# List files and directories inside the task workspace.
+# List files and directories inside the task workspace. Directories come first, then files, each
+# sorted by name; the walk stops at max_entries entries (truncated=True) and descends at most depth
+# levels below path.
 def ls(
     path: str = ".",
     depth: int = 1,
     max_entries: int = MAX_LS_ENTRIES,
     include_hidden: bool = False,
 ) -> dict[str, Any]:
+    # Validate the target directory.
     target = get_secure_task_path(path)
     if not target.exists():
         raise FileNotFoundError(f"Path not found: {normalize_model_relative_path(path)}")
     if not target.is_dir():
         raise NotADirectoryError(f"Not a directory: {normalize_model_relative_path(path)}")
 
+    # Clamp the limits; entry depth is counted relative to the listed directory.
     depth = max(0, int(depth))
     max_entries = max(1, int(max_entries))
     entries: list[dict[str, Any]] = []
@@ -630,6 +664,7 @@ def ls(
         if truncated:
             return
 
+        # Directories first, then files, each alphabetically (symlinks sort with the files).
         children = sorted(
             current.iterdir(),
             key=lambda item: (
@@ -645,6 +680,7 @@ def ls(
             if child_depth > depth:
                 continue
 
+            # Describe the entry; symlinks are listed but never followed.
             is_symlink = child.is_symlink()
             is_dir = child.is_dir() and not is_symlink
             entry: dict[str, Any] = {
@@ -658,8 +694,10 @@ def ls(
                     entry["size_bytes"] = child.stat().st_size
                     entry["mime"] = _guess_mime(child)
                 except OSError:
+                    # The file vanished or is unreadable: list it without size and MIME type.
                     pass
 
+            # Stop at the entry cap; otherwise recurse into directories within the depth limit.
             entries.append(entry)
             if len(entries) >= max_entries:
                 truncated = True
@@ -669,6 +707,7 @@ def ls(
             if is_dir and child_depth < depth:
                 _walk(child)
 
+    # Walk the tree and report the entries found.
     _walk(target)
     return {
         "result": {
@@ -681,13 +720,16 @@ def ls(
     }
 
 
-# Read a file from the task workspace.
+# Read a file from the task workspace. Images return an image payload, binary files metadata only, and
+# text files the decoded content (newlines normalized to LF), optionally sliced by 1-based line range
+# and cut to max_bytes.
 def read(
     path: str,
     start_line: int | None = None,
     end_line: int | None = None,
     max_bytes: int = MAX_READ_BYTES,
 ) -> dict[str, Any]:
+    # Validate the path and load the file (oversized files are rejected).
     target = get_secure_task_path(path)
     _reject_symlink_escape(target, path)
     if not target.is_file():
@@ -717,6 +759,7 @@ def read(
             "truncated": False,
         }
 
+    # Decode the text and take the requested line range (the whole file when none was given).
     text, encoding = smart_decode(data)
     if start_line is not None or end_line is not None:
         content, line_start, line_end, total_lines = _line_slice(text, start_line, end_line)
@@ -727,6 +770,7 @@ def read(
         line_start = 1
         line_end = total_lines
 
+    # Cap the returned content at max_bytes.
     content, truncated = _truncate_text(content, max(1, int(max_bytes)))
     if truncated:
         warnings.append(f"Read output truncated to {max_bytes} bytes.")
@@ -748,7 +792,8 @@ def read(
     }
 
 
-# Return file metadata without loading the full file into memory.
+# Return file metadata without loading the full file into memory: path, kind (image, binary or text),
+# MIME type, size and, for text, the encoding detected from the first TEXT_SAMPLE_BYTES bytes.
 def describe(path: str) -> dict[str, Any]:
     target = get_secure_task_path(path)
     _reject_symlink_escape(target, path)
@@ -759,6 +804,7 @@ def describe(path: str) -> dict[str, Any]:
     mime_type = _guess_mime(target)
     normalized_path = normalize_model_relative_path(path)
 
+    # Only a small sample is read to classify the file.
     with target.open("rb") as handle:
         sample = handle.read(TEXT_SAMPLE_BYTES)
 
@@ -785,12 +831,14 @@ def describe(path: str) -> dict[str, Any]:
     }
 
 
-# Read image metadata and, when small enough, an inline preview.
+# Read image metadata and, when small enough, an inline preview. Only workspace paths are accepted;
+# a file that is not an image raises SandboxToolError("not_image") carrying its detected kind.
 def read_image(
     path: str,
     include_preview: bool = True,
     max_preview_bytes: int = MAX_IMAGE_PREVIEW_BYTES,
 ) -> dict[str, Any]:
+    # Validate the path and the file size.
     _reject_non_workspace_absolute_path(path, "view_image")
     target = get_secure_task_path(path)
     _reject_symlink_escape(target, path)
@@ -800,6 +848,8 @@ def read_image(
     size_bytes = _reject_oversized_read(target, path)
     mime_type = _guess_mime(target)
     normalized_path = normalize_model_relative_path(path)
+
+    # Report non-image files with their detected kind instead of previewing them.
     if not mime_type.startswith(IMAGE_MIME_PREFIX):
         with target.open("rb") as handle:
             sample = handle.read(TEXT_SAMPLE_BYTES)
@@ -814,6 +864,7 @@ def read_image(
             },
         )
 
+    # Load the image and build the payload with its optional inline preview.
     data = target.read_bytes()
     return _image_payload(
         normalized_path,
@@ -824,9 +875,11 @@ def read_image(
     )
 
 
-# Write a UTF-8 text file inside the task workspace.
+# Write a UTF-8 text file inside the task workspace, creating missing parent directories; the content
+# is written as given (no newline translation).
 def write(path: str, content: str) -> dict[str, Any]:
     target = get_secure_task_path(path)
+
     # Note: _reject_symlink_escape is intentionally not called here.
     # For a new (non-existent) file it would be a no-op (is_symlink() = False).
     # For an existing file, get_secure_task_path already resolved and validated
@@ -850,6 +903,7 @@ def write(path: str, content: str) -> dict[str, Any]:
             created_dirs.append(probe)
             probe = probe.parent
 
+    # Create the file; newly created files and directories go to the command user.
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(content, encoding="utf-8", newline="")
     if not existed and inside_workspace:
@@ -867,7 +921,11 @@ def write(path: str, content: str) -> dict[str, Any]:
     }
 
 
-# Replace exact text matches inside a text file.
+# Replace exact text matches inside a text file. Newlines are compared in normalized (LF) form and the
+# file's original newline style is restored on write. A missing match or an ambiguous one without
+# replace_all raises SandboxToolError. The result uses short keys to save tokens: p path, m match
+# count, rep replacements made, all replace_all flag, cx/cxr/cxt compact context with its line range
+# and truncation flag, ud unified diff.
 def edit(path: str, old_str: str, new_str: str, replace_all: bool = False) -> dict[str, Any]:
     target = get_secure_task_path(path)
     _reject_symlink_escape(target, path)
@@ -876,11 +934,13 @@ def edit(path: str, old_str: str, new_str: str, replace_all: bool = False) -> di
     if old_str == "":
         raise ValueError("old_str must not be empty.")
 
+    # Load the file as text; binary files cannot be edited.
     original_bytes = target.read_bytes()
     mime_type = _guess_mime(target)
     if _is_probably_binary(original_bytes, mime_type):
         raise SandboxToolError("binary_not_supported", "edit only supports text files.")
 
+    # Normalize newlines and count the matches of old_str.
     original_text, _encoding = smart_decode(original_bytes)
     newline_style = detect_newline_style(original_text)
     normalized_content = normalize_newlines(original_text)
@@ -919,6 +979,8 @@ def edit(path: str, old_str: str, new_str: str, replace_all: bool = False) -> di
             },
         )
 
+    # Apply the replacement (all matches with replace_all, otherwise the only/first one) and write it back
+    # in the original newline style.
     replaced_count = match_count if replace_all else 1
     match_index = normalized_content.find(normalized_old)
     updated_normalized = normalized_content.replace(normalized_old, normalized_new, replaced_count)
@@ -926,6 +988,7 @@ def edit(path: str, old_str: str, new_str: str, replace_all: bool = False) -> di
     final_text = updated_normalized if newline_style == "\n" else updated_normalized.replace("\n", newline_style)
     target.write_text(final_text, encoding="utf-8", newline="")
 
+    # Build the compact context around the first change and a unified diff for the result.
     updated_lines = updated_normalized.splitlines()
     change_start = normalized_content[:match_index].count("\n") + 1
     change_end = change_start + normalized_new.count("\n")
@@ -960,6 +1023,8 @@ def edit(path: str, old_str: str, new_str: str, replace_all: bool = False) -> di
     }
 
 
+# Line-range editing helpers
+
 # Split normalized text into lines preserving trailing newline flag.
 def _split_edit_lines(text: str) -> tuple[list[str], bool]:
     normalized = normalize_newlines(text)
@@ -972,8 +1037,11 @@ def _split_edit_lines(text: str) -> tuple[list[str], bool]:
     return lines, has_trailing_newline
 
 
-# Parse a 1-based line range string into start, end, and insert-mode flag.
+# Parse a 1-based line range string into start, end, and insert-mode flag. Accepted forms are "N",
+# "start:end" or a two-item list; an end below the start (for example "12:11") means insert before
+# line start. Raise ValueError for malformed or out-of-range input.
 def _parse_line_range(range_str: Any, total_lines: int) -> tuple[int, int, bool]:
+    # Turn the argument into a "left:right" string.
     if isinstance(range_str, (list, tuple)):
         if len(range_str) != 2:
             raise ValueError("range list must contain exactly two line numbers.")
@@ -988,6 +1056,7 @@ def _parse_line_range(range_str: Any, total_lines: int) -> tuple[int, int, bool]
     else:
         left, right = raw, raw
 
+    # Parse the bounds as integers.
     try:
         start = int(left)
         end = int(right)
@@ -997,6 +1066,7 @@ def _parse_line_range(range_str: Any, total_lines: int) -> tuple[int, int, bool]
     if start < 1 or end < 0:
         raise ValueError("range must use positive 1-based line numbers.")
 
+    # Insert ranges may point one line past the end of the file; replace ranges must lie inside it.
     is_insert = end < start
     if is_insert:
         if start > total_lines + 1:
@@ -1022,7 +1092,10 @@ def _new_edit_lines(content: str) -> list[str]:
     return lines
 
 
-# Build compact numbered context around edited lines.
+# Build compact numbered context around edited lines. Lines highlight_start..highlight_end are marked
+# with "+"; the context is widened by up to max_radius lines on each side and narrowed down to
+# min_radius until it fits max_chars, then individual lines are clipped as a last resort. Return the
+# rendered lines, the first and last line shown, and whether anything was shortened.
 def _render_compact_line_edit_context(
     lines: list[str],
     highlight_start: int,
@@ -1038,6 +1111,7 @@ def _render_compact_line_edit_context(
     highlight_start = max(1, min(line_count, highlight_start))
     highlight_end = max(highlight_start, min(line_count, highlight_end))
 
+    # Cut text to limit characters, ending with an ellipsis; return the text and whether it was cut.
     def shorten(text: str, limit: int) -> tuple[str, bool]:
         if len(text) <= limit:
             return text, False
@@ -1045,8 +1119,11 @@ def _render_compact_line_edit_context(
             return "…", True
         return text[: limit - 1].rstrip() + "…", True
 
+    # Render lines start_line..end_line as "<marker>L<number> <text>", with the per-line text budget
+    # derived from max_chars; return the lines and whether any was shortened.
     def render(start_line: int, end_line: int) -> tuple[list[str], bool]:
         visible_count = max(1, end_line - start_line + 1)
+
         # Keep every visible line represented. Long individual lines are
         # shortened before the whole context is shortened.
         text_budget = max(48, (max_chars // visible_count) - 8)
@@ -1059,6 +1136,7 @@ def _render_compact_line_edit_context(
             rendered.append(f"{marker}L{line_no} {text}")
         return rendered, truncated_any
 
+    # Return the first and last line shown for a context radius around the highlighted lines.
     def bounds(radius: int) -> tuple[int, int]:
         return (
             max(1, highlight_start - radius),
@@ -1069,6 +1147,7 @@ def _render_compact_line_edit_context(
     chosen_text, chosen_truncated = render(chosen_start, chosen_end)
     truncated = False
 
+    # Try radii from largest to smallest and return the first context that fits the budget.
     for radius in range(max_radius, min_radius - 1, -1):
         start_line, end_line = bounds(radius)
         text, line_truncated = render(start_line, end_line)
@@ -1077,6 +1156,7 @@ def _render_compact_line_edit_context(
         chosen_start, chosen_end, chosen_text = start_line, end_line, text
         chosen_truncated = line_truncated
 
+    # Even the smallest context is too long: clip lines until the character budget is used up.
     chosen_len = sum(len(line) for line in chosen_text) + max(0, len(chosen_text) - 1)
     if chosen_len > max_chars and chosen_text:
         truncated = True
@@ -1095,7 +1175,11 @@ def _render_compact_line_edit_context(
     return chosen_text, chosen_start, chosen_end, truncated or chosen_truncated
 
 
-# Replace or insert text by 1-based line range inside a text file.
+# Replace or insert text by 1-based line range inside a text file. An optional anchor must equal the
+# line at the start of the range (ignoring surrounding whitespace); on mismatch SandboxToolError
+# reports the actual line and suggests a nearby range. The result uses short keys to save tokens:
+# p path, r range, rm lines removed, add lines added, n new line count, d line count change,
+# cx/cxr/cxt compact context with its line range and truncation flag, ud unified diff.
 def edit_lines(
     path: str,
     range_str: Any,
@@ -1108,6 +1192,7 @@ def edit_lines(
     if not target.is_file():
         raise FileNotFoundError(f"File not found: {normalize_model_relative_path(path)}")
 
+    # Load the file as text (binary files cannot be edited) and split it into lines.
     original_bytes = target.read_bytes()
     mime_type = _guess_mime(target)
     if _is_probably_binary(original_bytes, mime_type):
@@ -1151,8 +1236,8 @@ def edit_lines(
                 result=result,
             )
 
-    replacement_lines = _new_edit_lines(content)
     # Insert before start line, or replace the inclusive start:end range.
+    replacement_lines = _new_edit_lines(content)
     if is_insert:
         updated_lines = (
             original_lines[: start - 1]
@@ -1168,6 +1253,7 @@ def edit_lines(
     lines_after = len(replacement_lines)
     shift = total_after - total_before
 
+    # Write the file back with its original trailing newline and newline style.
     final_text = "\n".join(updated_lines)
     if had_trailing_newline:
         final_text += "\n"
@@ -1175,6 +1261,7 @@ def edit_lines(
         final_text = final_text.replace("\n", newline_style)
     target.write_text(final_text, encoding="utf-8", newline="")
 
+    # Build the compact context around the changed lines and a unified diff for the result.
     highlight_start = start
     highlight_end = start + max(lines_after, 1) - 1
     context_text, context_start, context_end, context_truncated = _render_compact_line_edit_context(
@@ -1216,8 +1303,9 @@ def edit_lines(
 
 # Search
 
-
-# Find files and directories inside the task workspace.
+# Find files and directories inside the task workspace by name pattern (fnmatch on the entry name),
+# optionally limited to files or directories. Ignored and hidden entries are skipped, the walk goes
+# at most max_depth levels deep and stops at max_results matches.
 def find(
     path: str = ".",
     name_pattern: str | None = None,
@@ -1225,6 +1313,7 @@ def find(
     max_depth: int = 8,
     max_results: int = MAX_FIND_RESULTS,
 ) -> dict[str, Any]:
+    # Validate the start directory and the type filter.
     target = get_secure_task_path(path)
     if not target.exists():
         raise FileNotFoundError(f"Path not found: {normalize_model_relative_path(path)}")
@@ -1244,6 +1333,7 @@ def find(
 
     base_depth = len(target.relative_to(task_root()).parts)
 
+    # Walk the tree top-down; pruning dirnames in place controls which subdirectories os.walk visits.
     for root, dirnames, filenames in os.walk(target):
         root_path = Path(root)
         current_depth = len(root_path.relative_to(task_root()).parts) - base_depth
@@ -1253,9 +1343,11 @@ def find(
             if not _should_skip_entry(name, include_hidden=False)
         ]
 
+        # Do not descend below max_depth.
         if current_depth >= max_depth:
             dirnames[:] = []
 
+        # Directory matches of this level.
         if normalized_type in {"any", "directory"}:
             for dirname in dirnames:
                 if not fnmatch.fnmatch(dirname, name_pattern):
@@ -1281,6 +1373,7 @@ def find(
                         "truncated": True,
                     }
 
+        # File matches of this level.
         if normalized_type in {"any", "file"}:
             for filename in sorted(filenames):
                 if _should_skip_entry(filename, include_hidden=False):
@@ -1318,7 +1411,10 @@ def find(
     }
 
 
-# Search text files inside the task workspace.
+# Search text files inside the task workspace for a regular expression (case-insensitive unless
+# case_sensitive is set), optionally limited by a glob on the workspace-relative path. Binary and
+# oversized files are skipped (oversized ones with a warning); each match carries up to
+# context_before/context_after surrounding lines; the search stops at max_results matches.
 def grep(
     pattern: str,
     path: str = ".",
@@ -1332,12 +1428,14 @@ def grep(
     if not target.exists():
         raise FileNotFoundError(f"Path not found: {normalize_model_relative_path(path)}")
 
+    # Compile the pattern; an invalid expression is reported as a ValueError.
     regex_flags = re.MULTILINE if case_sensitive else (re.MULTILINE | re.IGNORECASE)
     try:
         regex = re.compile(pattern, regex_flags)
     except re.error as exc:
         raise ValueError(f"Invalid regular expression: {exc}") from exc
 
+    # Clamp the limits.
     max_results = max(1, int(max_results))
     context_before = max(0, int(context_before))
     context_after = max(0, int(context_after))
@@ -1367,6 +1465,7 @@ def grep(
                     continue
                 candidates.append(file_path)
 
+    # Scan every candidate line by line; unsafe symlinks abort, oversized and binary files are skipped.
     for candidate in candidates:
         _reject_symlink_escape(candidate, candidate.relative_to(task_root()).as_posix())
         try:
@@ -1387,6 +1486,7 @@ def grep(
             if regex.search(line) is None:
                 continue
 
+            # Record the match with its context lines.
             before_start = max(1, index - context_before)
             after_end = min(len(lines), index + context_after)
             matches.append(
@@ -1398,6 +1498,8 @@ def grep(
                     "after": lines[index:after_end],
                 }
             )
+
+            # Stop as soon as the result cap is reached.
             if len(matches) >= max_results:
                 truncated = True
                 warnings.append(f"Result limit reached at {max_results} items.")
@@ -1424,8 +1526,8 @@ def grep(
 
 # Directory operations
 
-
-# Create a directory inside the task workspace.
+# Create a directory inside the task workspace; an existing directory is not an error, an existing
+# non-directory is.
 def mkdir(path: str, parents: bool = True) -> dict[str, Any]:
     target = get_secure_task_path(path)
     existed = target.exists()
@@ -1448,13 +1550,16 @@ def mkdir(path: str, parents: bool = True) -> dict[str, Any]:
     }
 
 
-# Move or rename a file or directory inside the task workspace.
+# Move or rename a file or directory inside the task workspace. An existing destination is removed
+# first when overwrite is set, otherwise it is an error.
 def move(src: str, dst: str, overwrite: bool = False) -> dict[str, Any]:
+    # Resolve both paths and require an existing source.
     source = get_secure_task_path(src, kind="src")
     destination = get_secure_task_path(dst, kind="dst")
     if not source.exists():
         raise FileNotFoundError(f"Path not found: {normalize_model_relative_path(src)}")
 
+    # Handle an existing destination.
     if destination.exists():
         if not overwrite:
             raise SandboxToolError(
@@ -1466,6 +1571,7 @@ def move(src: str, dst: str, overwrite: bool = False) -> dict[str, Any]:
         else:
             destination.unlink()
 
+    # Create missing parent directories and move.
     destination.parent.mkdir(parents=True, exist_ok=True)
     shutil.move(str(source), str(destination))
     return {
@@ -1479,7 +1585,7 @@ def move(src: str, dst: str, overwrite: bool = False) -> dict[str, Any]:
     }
 
 
-# Delete a file or directory inside the task workspace.
+# Delete a file or directory inside the task workspace; directories need recursive=True.
 def delete(path: str, recursive: bool = False) -> dict[str, Any]:
     target = get_secure_task_path(path)
     if not target.exists():
@@ -1509,8 +1615,7 @@ def delete(path: str, recursive: bool = False) -> dict[str, Any]:
 
 # Workspace reset
 
-
-# Clear the dedicated sandbox workspace without deleting its root.
+# Clear the dedicated sandbox workspace without deleting its root; return the names removed.
 def clear_workspace() -> dict[str, Any]:
     root = task_root()
     cleared: list[str] = []

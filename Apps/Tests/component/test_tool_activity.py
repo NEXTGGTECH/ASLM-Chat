@@ -11,7 +11,10 @@ from Apps.API.views import _serialize_tool_activity_marker
 pytestmark = [pytest.mark.component]
 
 
+# Cover the tool activity marker streamed to the chat UI.
 class ToolActivityStreamTests(SimpleTestCase):
+    # Verify that the activity marker wraps the activity in <tool_activity> tags and that the JSON
+    # inside decodes back to the same structured realtime event.
     def test_activity_marker_keeps_structured_realtime_event(self):
         activity = {
             "alias": "deep_research__research",

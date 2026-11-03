@@ -18,16 +18,21 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+# Sandbox image used for the disposable container; overridable through SANDBOX_IMAGE.
 IMAGE = os.getenv("SANDBOX_IMAGE", "nggtlightkeeper/aslm-chat-sandbox:latest")
 
 
+# One throwaway sandbox container with its own temporary task directory, removed again by cleanup().
 class DisposableSandbox:
+    # Choose a unique container name and create a temporary host directory with an empty _sandbox task root.
     def __init__(self) -> None:
         self.name = f"mcp-sandbox-destructive-{uuid.uuid4().hex[:10]}"
         self.tmp = Path(tempfile.mkdtemp(prefix="mcp-sandbox-destructive-"))
         self.task_root = self.tmp / "_sandbox"
         self.task_root.mkdir(parents=True, exist_ok=True)
 
+    # Run a host command and return the completed process; with check=True a non-zero exit code raises an
+    # AssertionError that includes the command, stdout and stderr.
     def run(self, args: list[str], *, timeout: int = 60, check: bool = True) -> subprocess.CompletedProcess[str]:
         result = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
         if check and result.returncode != 0:
@@ -38,6 +43,8 @@ class DisposableSandbox:
             )
         return result
 
+    # Remove any container with the same name, then start a detached one with the temporary task root
+    # mounted at /workspace/_sandbox.
     def start(self) -> None:
         self.run(["docker", "rm", "-f", self.name], timeout=30, check=False)
         self.run(
@@ -56,6 +63,8 @@ class DisposableSandbox:
             timeout=120,
         )
 
+    # Run a bash login script inside the container through docker exec, optionally as another user and
+    # from another working directory (default: the task root).
     def exec(
         self,
         script: str,
@@ -71,11 +80,13 @@ class DisposableSandbox:
         args.extend([self.name, "bash", "-lc", script])
         return self.run(args, timeout=timeout, check=check)
 
+    # Remove the container and the temporary host directory.
     def cleanup(self) -> None:
         self.run(["docker", "rm", "-f", self.name], timeout=30, check=False)
         shutil.rmtree(self.tmp, ignore_errors=True)
 
 
+# Run the supervisor healthcheck inside the container, using its bundled virtualenv and sources.
 def _healthcheck(container: DisposableSandbox, *, check: bool = True) -> subprocess.CompletedProcess[str]:
     return container.exec(
         "PYTHONPATH=/opt/sandbox-src /opt/sandbox-venv/bin/python -m sandbox.supervisor --healthcheck",
@@ -84,7 +95,9 @@ def _healthcheck(container: DisposableSandbox, *, check: bool = True) -> subproc
     )
 
 
-# Escalate ordinary-to-destructive actions inside a disposable sandbox container.
+# Verify that a disposable sandbox container survives escalating actions (ordinary work, package install,
+# system file changes, killing the supervisor and wiping the workspace) and that the supervisor healthcheck
+# still passes after the risky stages.
 def test_disposable_container_survives_escalating_destructive_actions() -> None:
     sandbox = DisposableSandbox()
     try:

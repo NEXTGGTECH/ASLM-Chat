@@ -15,13 +15,16 @@ pytestmark = [pytest.mark.unit]
 
 # Keep literal inline reasoning tags visible while preserving real control blocks.
 class ReasoningTextParserBoundaryTests(SimpleTestCase):
+    # Adapter modules that each define their own _ReasoningTextParser; every test runs against all of them.
     PARSER_MODULES = ("API.openai", "API.lms", "API.google_genai")
 
+    # Yield the module name and a fresh reasoning parser for every adapter module.
     def _parsers(self):
         for module_name in self.PARSER_MODULES:
             module = importlib.import_module(module_name)
             yield module_name, module._ReasoningTextParser()
 
+    # Verify that a think tag quoted in the middle of a sentence is left in the visible text.
     def test_inline_quoted_reasoning_block_stays_visible(self):
         source = "The token <think>quoted text</think> stays visible."
 
@@ -31,6 +34,8 @@ class ReasoningTextParserBoundaryTests(SimpleTestCase):
                 self.assertEqual(thinking, "")
                 self.assertEqual(visible, source)
 
+    # Verify that an inline think tag split across two stream chunks is still kept visible and produces no
+    # thinking text.
     def test_inline_tag_boundary_survives_stream_chunking(self):
         for module_name, parser in self._parsers():
             with self.subTest(module=module_name):
@@ -42,6 +47,8 @@ class ReasoningTextParserBoundaryTests(SimpleTestCase):
                     "The token <think>quoted</think> stays visible.",
                 )
 
+    # Verify that a think block is parsed into thinking text when it follows a newline or a colon (optionally
+    # followed by a quote) and is removed from the visible text.
     def test_reasoning_block_after_clear_separator_is_parsed(self):
         for module_name, parser in self._parsers():
             with self.subTest(module=module_name):
@@ -57,6 +64,7 @@ class ReasoningTextParserBoundaryTests(SimpleTestCase):
                     self.assertEqual(thinking, "plan")
                     self.assertEqual(visible, f"{prefix}Answer")
 
+    # Verify that a think block at the very start of the response is parsed into thinking text.
     def test_reasoning_block_at_response_start_is_parsed(self):
         for module_name, parser in self._parsers():
             with self.subTest(module=module_name):
@@ -64,9 +72,11 @@ class ReasoningTextParserBoundaryTests(SimpleTestCase):
                 self.assertEqual(thinking, "plan")
                 self.assertEqual(visible, "Answer")
 
+
 # Ensure generic runtime options are safely mapped for OpenAI-compatible APIs.
 class OpenAiOptionMappingTests(SimpleTestCase):
-    # Test maps supported options and keeps custom values in extra body.
+    # Verify that supported options are mapped to OpenAI names (num_predict to max_tokens, think_level to
+    # reasoning_effort) and unsupported ones are kept in extra_body.
     def test_maps_supported_options_and_keeps_custom_values_in_extra_body(self):
         payload = _build_openai_request_options(
             {
@@ -84,7 +94,7 @@ class OpenAiOptionMappingTests(SimpleTestCase):
         self.assertEqual(payload["extra_body"]["num_ctx"], 4096)
         self.assertEqual(payload["extra_body"]["top_k"], 40)
 
-    # Test top logprobs is dropped unless logprobs output is enabled.
+    # Verify that top_logprobs is dropped unless logprobs output is enabled.
     def test_top_logprobs_requires_logprobs(self):
         disabled_payload = _build_openai_request_options({"top_logprobs": 5})
         enabled_payload = _build_openai_request_options({"logprobs": True, "top_logprobs": 5})
@@ -92,11 +102,10 @@ class OpenAiOptionMappingTests(SimpleTestCase):
         self.assertNotIn("top_logprobs", disabled_payload)
         self.assertEqual(enabled_payload["top_logprobs"], 5)
 
-    # Test OpenAI client uses placeholder API key when not configured.
+    # Verify that the OpenAI client is created with the placeholder API key when no key is configured.
     @patch("openai.OpenAI")
     @patch("API.openai.settings.get_engine_url", return_value="http://127.0.0.1:1234/v1")
     @patch("API.openai.settings.get_openai_api_key", return_value="")
-    # Verify openai client uses placeholder api key when not configured.
     def test_openai_client_uses_placeholder_api_key_when_not_configured(
         self,
         _mock_api_key,
@@ -110,9 +119,10 @@ class OpenAiOptionMappingTests(SimpleTestCase):
 
         self.assertEqual(mock_openai_client.call_args.kwargs["api_key"], "not-needed")
 
+
 # Cover extended OpenAI-compatible capability parsing and reasoning output.
 class OpenAiAdapterTests(SimpleTestCase):
-    # OpenAI-compatible messages encode supported audio as native input_audio.
+    # Verify that OpenAI-compatible messages encode supported audio media as a native input_audio part.
     def test_openai_messages_include_audio_media_part(self):
         payload = openai_api._build_openai_messages(
             [
@@ -134,10 +144,11 @@ class OpenAiAdapterTests(SimpleTestCase):
         self.assertEqual(payload[0]["content"][1]["type"], "input_audio")
         self.assertEqual(payload[0]["content"][1]["input_audio"]["format"], "mp3")
 
-    # Test get model settings reads OpenAI capabilities and reasoning.
+    # Verify that get_model_settings reads tool, vision and reasoning capabilities, effort options, context length
+    # and supported parameters from the listed and retrieved model payloads.
     @patch("API.openai._get_client")
-    # Verify get model settings reads openai capabilities and reasoning.
     def test_get_model_settings_reads_openai_capabilities_and_reasoning(self, mock_get_client):
+        # Arrange: a model list entry with capabilities and reasoning, and a retrieved model with parameters.
         client = Mock()
         client.models.list.return_value = Mock(
             data=[
@@ -166,8 +177,10 @@ class OpenAiAdapterTests(SimpleTestCase):
         }
         mock_get_client.return_value = client
 
+        # Act: read the model settings.
         payload = get_openai_model_settings("gpt-test")
 
+        # Assert: capabilities, reasoning effort options, defaults and limits come from the two payloads.
         self.assertTrue(payload["supports_tool_calling"])
         self.assertTrue(payload["supports_vision"])
         self.assertTrue(payload["supports_thinking"])
@@ -181,10 +194,11 @@ class OpenAiAdapterTests(SimpleTestCase):
         self.assertEqual(payload["context_length"], 65536)
         self.assertIn("tool_choice", payload["supported_parameters"])
 
-    # Test get model settings reads direct feature flags and scalar supported parameters.
+    # Verify that get_model_settings reads direct feature flags, input modalities and a supported_parameters list
+    # of plain names; a bare reasoning flag with a reasoning_effort parameter gives a think level but no toggle.
     @patch("API.openai._get_client")
-    # Verify get model settings reads direct feature flags and scalar supported parameters.
     def test_get_model_settings_reads_direct_feature_flags_and_scalar_supported_parameters(self, mock_get_client):
+        # Arrange: a model list entry with plain boolean flags and modalities, and a parameter name list.
         client = Mock()
         client.models.list.return_value = Mock(
             data=[
@@ -203,8 +217,10 @@ class OpenAiAdapterTests(SimpleTestCase):
         }
         mock_get_client.return_value = client
 
+        # Act: read the model settings.
         payload = get_openai_model_settings("gpt-test")
 
+        # Assert: the flags and modalities are mapped to the capability keys.
         self.assertTrue(payload["supports_tool_calling"])
         self.assertTrue(payload["supports_vision"])
         self.assertTrue(payload["supports_audio_input"])
@@ -214,9 +230,8 @@ class OpenAiAdapterTests(SimpleTestCase):
         self.assertFalse(payload["supports_think_toggle"])
         self.assertIn("reasoning_effort", payload["supported_parameters"])
 
-    # Test generate stream parses reasoning and visible content.
+    # Verify that a streamed response yields reasoning_content as thinking and regular content as visible text.
     @patch("API.openai._get_client")
-    # Verify generate stream parses reasoning and visible content.
     def test_generate_stream_parses_reasoning_and_visible_content(self, mock_get_client):
         client = Mock()
         client.chat.completions.create.return_value = [
@@ -237,9 +252,9 @@ class OpenAiAdapterTests(SimpleTestCase):
         self.assertEqual(chunks[0]["message"]["content"], "")
         self.assertEqual(chunks[1]["message"]["content"], "Final answer")
 
-    # Test generate stream does not duplicate plain content into thinking.
+    # Verify that a streamed response with only plain content yields that content unchanged and never adds a
+    # thinking field.
     @patch("API.openai._get_client")
-    # Verify generate stream does not duplicate plain content into thinking.
     def test_generate_stream_does_not_duplicate_plain_content_into_thinking(self, mock_get_client):
         client = Mock()
         client.chat.completions.create.return_value = [
@@ -259,15 +274,16 @@ class OpenAiAdapterTests(SimpleTestCase):
         self.assertEqual([chunk["message"]["content"] for chunk in chunks], ["Hello", " world"])
         self.assertTrue(all("thinking" not in chunk["message"] for chunk in chunks))
 
-    # Test get model settings reads companion metadata without generation.
+    # Verify that get_model_settings takes capabilities from the companion model payload when the model list has
+    # none, without sending a generation request.
     @patch("API.openai._get_companion_model_payload")
     @patch("API.openai._get_client")
-    # Verify get model settings reads companion metadata without generation.
     def test_get_model_settings_reads_companion_metadata_without_generation(
         self,
         mock_get_client,
         mock_get_companion_payload,
     ):
+        # Arrange: the provider payloads carry no capabilities; only the companion payload describes the model.
         client = Mock()
         client.models.list.return_value = Mock(data=[{"id": "gpt-probe", "object": "model", "owned_by": "org"}])
         client.models.retrieve.return_value = {"id": "gpt-probe", "object": "model", "owned_by": "org"}
@@ -286,8 +302,10 @@ class OpenAiAdapterTests(SimpleTestCase):
         }
         mock_get_client.return_value = client
 
+        # Act: read the model settings.
         payload = get_openai_model_settings("gpt-probe")
 
+        # Assert: the companion capabilities are used and no generation request was sent.
         self.assertTrue(payload["supports_tool_calling"])
         self.assertTrue(payload["supports_thinking"])
         self.assertTrue(payload["supports_vision"])

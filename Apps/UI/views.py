@@ -25,11 +25,13 @@ from django.http import FileResponse, HttpResponse, JsonResponse, StreamingHttpR
 from django.utils import timezone
 from django.views.generic import TemplateView
 
+# Optional dependencies: favicon resolution degrades gracefully when requests or BeautifulSoup is missing.
 try:
     import requests
 except Exception:  # pragma: no cover - optional dependency guard.
     requests = None
 
+# BeautifulSoup is optional too; without it only the well-known root icon paths are tried.
 try:
     from bs4 import BeautifulSoup
 except Exception:  # pragma: no cover - optional dependency guard.
@@ -139,17 +141,19 @@ from Tools.deep_research import service as deep_research_service
 
 logger = logging.getLogger(__name__)
 
+# Make the bundled tool packages importable; the path is added once at import time.
 TOOLS_PATH = settings.BASE_DIR / "Tools"
 if str(TOOLS_PATH) not in sys.path:
     sys.path.insert(0, str(TOOLS_PATH))
 
-# For saving read results to user_files in the same style as uploads
+# Aliased imports used when saving read results to user_files in the same style as uploads.
 import re as _re
 import hashlib as _hashlib
 import uuid as _uuid
 
 # Direct access to WebSearch read_page for URL attachments.
 # Performed for every URL attachment regardless of whether "web_search" tool is enabled in UI.
+# When the WebSearch tool cannot be imported, run_read_page is None and the event logger is a no-op.
 try:
     _mcp_ws_dir = TOOLS_PATH / "mcp-web-search"
     if str(_mcp_ws_dir) not in sys.path:
@@ -162,11 +166,10 @@ except Exception:
     logger.warning("WebSearch read_page / io_logger not importable — URL attachments will have limited support")
 
 
+# Save a read_page result to Tools/user_files the same way search/read_page results are persisted.
+# Write the markdown content and a manifest so the result is available like other user/search files.
+# Error and warning texts are not saved, and any failure is only logged.
 def _save_url_read_result_to_user_files(url: str, content: str) -> None:
-    """Save read_page result to Tools/user_files the same way search/read_page results are persisted.
-
-    Writes the markdown content and a manifest so the result is available like other user/search files.
-    """
     if not content or str(content).lower().startswith(("error", "warning")):
         return
     try:
@@ -179,6 +182,7 @@ def _save_url_read_result_to_user_files(url: str, content: str) -> None:
         from pathlib import Path as _PPath
         import json as _json
 
+        # Store the page under a per-URL scope directory with a unique, filesystem-safe file name.
         safe_hash = _re.sub(r"[^a-fA-F0-9]+", "", _hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]) or "url"
         scope = _safe_scope(safe_hash)
         target_dir = USER_FILE_MANIFEST_ROOT / scope
@@ -191,7 +195,7 @@ def _save_url_read_result_to_user_files(url: str, content: str) -> None:
         file_bytes = content.encode("utf-8")
         file_path.write_bytes(file_bytes)
 
-        # Create manifest using the same builder as uploads/user files
+        # Create the manifest using the same builder as uploads/user files.
         manifest = build_uploaded_file_manifest(
             file_bytes,
             name=safe_name,
@@ -203,7 +207,7 @@ def _save_url_read_result_to_user_files(url: str, content: str) -> None:
         )
         _write_manifest(manifest)
 
-        # Augment manifest with URL source info (written next to the .manifest.json)
+        # Augment the manifest with URL source info (written next to the .manifest.json).
         try:
             mpath = file_path.with_name(file_path.name + ".manifest.json")
             if mpath.exists():
@@ -218,14 +222,16 @@ def _save_url_read_result_to_user_files(url: str, content: str) -> None:
             })
             mpath.write_text(_json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception:
+            # The source info is optional metadata; the file and its base manifest are already saved.
             pass
     except Exception as e:
         logger.warning("Failed to save URL read result to user_files for %s: %s", url, e)
 
 
-# Favicon resolution helpers.
+# Favicon resolution helpers
 
-# Normalize one domain string for favicon lookup.
+# Normalize one domain string for favicon lookup: return the lower-case ASCII (IDNA) host, or an empty
+# string when the value is not a valid public-looking host name (localhost is rejected).
 def _normalize_favicon_domain(value: str) -> str:
     raw_value = str(value or "").strip()
     if not raw_value:
@@ -253,7 +259,8 @@ def _normalize_favicon_domain(value: str) -> str:
     return host
 
 
-# Return whether the host resolves to a public address.
+# Return whether the host resolves to a public address. Any private, loopback, link-local, multicast,
+# reserved or unspecified result (or a resolution failure) makes it unsafe, which guards against SSRF.
 def _is_public_favicon_host(host: str) -> bool:
     try:
         addresses = socket.getaddrinfo(host, None)
@@ -289,12 +296,15 @@ def _favicon_url_is_safe(url: str) -> bool:
     return _is_public_favicon_host(parsed.hostname)
 
 
-# Infer the favicon MIME type from headers and bytes.
+# Infer the favicon MIME type from the response header, falling back to the magic bytes of the content.
+# Return an empty string when the payload is not a recognized image.
 def _favicon_content_type(response: Any, content: bytes) -> str:
+    # Trust the Content-Type header when it names an accepted image type.
     content_type = str(response.headers.get("content-type", "") or "").split(";")[0].strip().lower()
     if content_type in FAVICON_IMAGE_TYPES:
         return content_type
 
+    # Sniff the content signature.
     probe = content[:256].lstrip()
     if content.startswith(b"\x00\x00\x01\x00"):
         return "image/x-icon"
@@ -312,7 +322,9 @@ def _favicon_content_type(response: Any, content: bytes) -> str:
     return ""
 
 
-# Perform one bounded HTTP GET with redirect validation.
+# Perform one bounded HTTP GET with redirect validation. Redirects are followed manually (at most 5) and
+# every target must pass the public-host check; return None for an unsafe URL, a request error or too
+# many redirects.
 def _favicon_safe_get(session: Any, url: str, *, stream: bool = False) -> Any | None:
     current_url = url
     for _redirect_index in range(5):
@@ -336,17 +348,20 @@ def _favicon_safe_get(session: Any, url: str, *, stream: bool = False) -> Any | 
     return None
 
 
-# Download one favicon candidate when it is within size limits.
+# Download one favicon candidate when it is within size limits. Return (content type, bytes), or None
+# when the request fails, the final URL is unsafe, the body is too large or it is not a known image.
 def _fetch_favicon_candidate(session: Any, url: str) -> tuple[str, bytes] | None:
     response = _favicon_safe_get(session, url, stream=True)
     if response is None:
         return None
 
     try:
+        # Reject error statuses and redirects that ended on an unsafe host.
         final_url = str(response.url or url)
         if response.status_code >= 400 or not _favicon_url_is_safe(final_url):
             return None
 
+        # Read the body in chunks and give up as soon as it exceeds the size limit.
         chunks: list[bytes] = []
         total = 0
         for chunk in response.iter_content(chunk_size=16384):
@@ -357,6 +372,7 @@ def _fetch_favicon_candidate(session: Any, url: str) -> tuple[str, bytes] | None
                 return None
             chunks.append(chunk)
 
+        # Only accept payloads that are recognizable images.
         content = b"".join(chunks)
         content_type = _favicon_content_type(response, content)
         if not content_type:
@@ -366,7 +382,8 @@ def _fetch_favicon_candidate(session: Any, url: str) -> tuple[str, bytes] | None
         response.close()
 
 
-# Rank one favicon candidate by rel, size, and format.
+# Rank one favicon candidate by rel, size, and format: apple-touch icons and plain icons score highest,
+# then SVG, PNG and ICO files, plus the declared pixel width capped at 256.
 def _score_favicon_candidate(candidate: dict[str, str]) -> int:
     rel = candidate.get("rel", "")
     sizes = candidate.get("sizes", "")
@@ -391,7 +408,9 @@ def _score_favicon_candidate(candidate: dict[str, str]) -> int:
     return score
 
 
-# Collect favicon candidates from HTML, manifests, and fallbacks.
+# Collect favicon candidates from HTML, manifests, and fallbacks. Return dicts with href, rel and sizes,
+# sorted by descending score; the page's own link tags and web manifest icons come first in the HTML,
+# and well-known root paths are always appended as last resorts.
 def _collect_favicon_candidates(session: Any, base_url: str) -> list[dict[str, str]]:
     candidates: list[dict[str, str]] = []
     final_url = base_url
@@ -399,6 +418,7 @@ def _collect_favicon_candidates(session: Any, base_url: str) -> list[dict[str, s
     if not _favicon_url_is_safe(base_url):
         return candidates
 
+    # Fetch the page itself (following safe redirects); a failure only means no HTML candidates.
     try:
         response = _favicon_safe_get(session, base_url)
     except Exception:
@@ -410,6 +430,7 @@ def _collect_favicon_candidates(session: Any, base_url: str) -> list[dict[str, s
             if response.status_code < 400 and _favicon_url_is_safe(final_url):
                 html = response.text[:400000]
                 if BeautifulSoup is not None:
+                    # Icon link tags declared in the HTML head.
                     soup = BeautifulSoup(html, "html.parser")
                     for tag in soup.find_all("link"):
                         rels = tag.get("rel") or []
@@ -423,6 +444,7 @@ def _collect_favicon_candidates(session: Any, base_url: str) -> list[dict[str, s
                                     "sizes": str(tag.get("sizes", "") or ""),
                                 })
 
+                    # Icons listed in the web app manifest, when the page links one.
                     manifest_tag = soup.find("link", rel=lambda value: value and "manifest" in str(value).lower())
                     manifest_href = manifest_tag.get("href") if manifest_tag else ""
                     if manifest_href:
@@ -451,6 +473,7 @@ def _collect_favicon_candidates(session: Any, base_url: str) -> list[dict[str, s
         finally:
             response.close()
 
+    # Well-known icon paths on the site origin, tried even when the page offered nothing.
     parsed = urlparse(final_url)
     if parsed.scheme and parsed.netloc:
         origin = f"{parsed.scheme}://{parsed.netloc}"
@@ -460,13 +483,15 @@ def _collect_favicon_candidates(session: Any, base_url: str) -> list[dict[str, s
     return sorted(candidates, key=_score_favicon_candidate, reverse=True)
 
 
-# Resolve the best favicon bytes for one domain.
+# Resolve the best favicon bytes for one domain. Return (content type, bytes) of the first candidate that
+# downloads successfully, then the Google and DuckDuckGo favicon services as external fallbacks, or None.
 def _resolve_favicon_content(domain: str) -> tuple[str, bytes] | None:
     if requests is None:
         return None
     if not domain or not _is_public_favicon_host(domain):
         return None
 
+    # One session with browser-like headers is shared by all requests of this lookup.
     base_url = f"https://{domain}/"
     headers = {
         "User-Agent": "Mozilla/5.0 (compatible; ASLM-FaviconResolver/1.0)",
@@ -475,6 +500,8 @@ def _resolve_favicon_content(domain: str) -> tuple[str, bytes] | None:
 
     with requests.Session() as session:
         session.headers.update(headers)
+
+        # Try the site's own candidates in score order, skipping duplicate URLs.
         seen: set[str] = set()
         for candidate in _collect_favicon_candidates(session, base_url):
             href = candidate.get("href", "")
@@ -486,6 +513,7 @@ def _resolve_favicon_content(domain: str) -> tuple[str, bytes] | None:
             if resolved:
                 return resolved
 
+        # Third-party favicon services as the last resort.
         for fallback_url in (
             f"https://www.google.com/s2/favicons?domain={domain}&sz=128",
             f"https://icons.duckduckgo.com/ip3/{domain}.ico",
@@ -497,13 +525,15 @@ def _resolve_favicon_content(domain: str) -> tuple[str, bytes] | None:
     return None
 
 
-# Return on-disk cache paths for one favicon domain.
+# Return the on-disk cache paths (content file, metadata file) for one favicon domain, named by the
+# SHA-256 of the domain.
 def _favicon_cache_paths(domain: str) -> tuple[Path, Path]:
     key = hashlib.sha256(domain.encode("utf-8")).hexdigest()
     return FAVICON_CACHE_DIR / f"{key}.bin", FAVICON_CACHE_DIR / f"{key}.json"
 
 
-# Read a cached favicon when the entry is still valid.
+# Read a cached favicon when the entry is still valid. Return None when it is missing, expired,
+# malformed, of an unknown type or larger than the size limit.
 def _read_favicon_disk_cache(domain: str, now: float) -> tuple[str, bytes] | None:
     content_path, meta_path = _favicon_cache_paths(domain)
     try:
@@ -522,7 +552,8 @@ def _read_favicon_disk_cache(domain: str, now: float) -> tuple[str, bytes] | Non
     return content_type, content
 
 
-# Persist one favicon payload to the disk cache.
+# Persist one favicon payload and its metadata (including the expiry time) to the disk cache. Failures
+# are only logged: the cache is an optimization.
 def _write_favicon_disk_cache(domain: str, content_type: str, content: bytes, expires_at: float) -> None:
     if not content or len(content) > FAVICON_MAX_BYTES:
         return
@@ -547,12 +578,17 @@ def _write_favicon_disk_cache(domain: str, content_type: str, content: bytes, ex
         logger.debug("Failed to write favicon disk cache for %s", domain, exc_info=True)
 
 
+# In-memory favicon cache (domain -> expiry time, content type, bytes) guarded by a re-entrant lock.
 _favicon_cache_lock = threading.RLock()
 _favicon_cache: dict[str, tuple[float, str, bytes]] = {}
+
+# Disk cache location, entry lifetimes (found: 7 days, not found: 1 hour) and the maximum icon size.
 FAVICON_CACHE_DIR = settings.BASE_DIR / "Data" / "favicon_cache"
 FAVICON_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
 FAVICON_NEGATIVE_CACHE_TTL_SECONDS = 60 * 60
 FAVICON_MAX_BYTES = 384 * 1024
+
+# Image MIME types accepted as a favicon.
 FAVICON_IMAGE_TYPES = {
     "image/x-icon",
     "image/vnd.microsoft.icon",
@@ -562,6 +598,8 @@ FAVICON_IMAGE_TYPES = {
     "image/webp",
     "image/gif",
 }
+
+# Link rel values that mark a page's favicon link tag.
 FAVICON_ICON_RELS = {
     "icon",
     "shortcut icon",
@@ -570,6 +608,8 @@ FAVICON_ICON_RELS = {
     "mask-icon",
     "fluid-icon",
 }
+
+# Well-known icon paths tried on the site origin when the page declares no usable icon.
 FAVICON_ROOT_FALLBACKS = (
     "/favicon.ico",
     "/favicon.png",
@@ -578,7 +618,8 @@ FAVICON_ROOT_FALLBACKS = (
 )
 
 
-# Build shared template context
+# Build the template context shared by the chat pages: engine, supported engines, tool servers, chats,
+# cache version and the host theme and locale values.
 def _build_base_context() -> dict[str, Any]:
     runtime_settings = settings.get_runtime_engine_settings()
     engine = _get_active_engine(runtime_settings.get("llm-engine"))
@@ -596,7 +637,8 @@ def _build_base_context() -> dict[str, Any]:
     return base
 
 
-# Build runtime settings payload
+# Build the runtime settings payload of the UI: the runtime engine settings completed with the active
+# engine, its URL, whether it has an API key and the supported engines.
 def _build_runtime_settings_payload() -> dict[str, Any]:
     runtime_settings = settings.get_runtime_engine_settings()
     active_engine = _get_active_engine(runtime_settings.get("llm-engine"))
@@ -610,7 +652,8 @@ def _build_runtime_settings_payload() -> dict[str, Any]:
     return runtime_settings
 
 
-# Build chat title
+# Build a chat title from the first 30 characters of the message, or a localized placeholder title for
+# an attachment-only or empty request.
 def _build_chat_title(message: str, has_attachments: bool) -> str:
     from Apps.UI.locale_catalog import translate
 
@@ -621,7 +664,8 @@ def _build_chat_title(message: str, has_attachments: bool) -> str:
     return translate("chat.newChat")
 
 
-# Resolve chat instance
+# Resolve the chat instance: create a new chat when no id is given, otherwise load it and raise
+# LookupError when it does not exist.
 def _resolve_chat(chat_id: str, user_message: str, attachments: list[dict[str, Any]]) -> Chat:
     if not chat_id:
         return Chat.objects.create(title=_build_chat_title(user_message, bool(attachments)))
@@ -631,7 +675,8 @@ def _resolve_chat(chat_id: str, user_message: str, attachments: list[dict[str, A
     except Chat.DoesNotExist as exc:
         raise LookupError("Chat not found") from exc
 
-# Save message images
+
+# Save the normalized attachments of a request as MessageAttachment rows of the message.
 def _store_message_attachments(message_record: Message, attachments: list[dict[str, Any]]) -> None:
     for attachment in attachments:
         MessageAttachment.objects.create(
@@ -645,7 +690,7 @@ def _store_message_attachments(message_record: Message, attachments: list[dict[s
         )
 
 
-# Chat page views.
+# Chat page views
 
 # Render the main chat page.
 class MainView(TemplateView):
@@ -658,9 +703,10 @@ class MainView(TemplateView):
         return context
 
 
-# Chat session APIs.
+# Chat session APIs
 
-# Store uploaded files and return UI-facing file cards.
+# Store uploaded files and return UI-facing file cards. A file that fails to store is reported as an
+# error card instead of failing the whole request.
 def upload_files_api(request):
     if request.method != "POST":
         return JsonResponse({"error": "Invalid request method"}, status=405)
@@ -669,6 +715,8 @@ def upload_files_api(request):
     if not uploaded_files:
         return JsonResponse({"error": "No files uploaded"}, status=400)
 
+    # Read the upload options: the storage scope, vision support and the tool servers that get the files
+    # (a form list, or a JSON array in a single field).
     scope = request.POST.get("chat_id") or request.POST.get("scope") or "pending"
     model_supports_vision = str(request.POST.get("supports_vision", "")).lower() in {"1", "true", "yes"}
     tool_server_ids = request.POST.getlist("tool_server_ids")
@@ -681,6 +729,8 @@ def upload_files_api(request):
                 parsed_tool_server_ids = []
             if isinstance(parsed_tool_server_ids, list):
                 tool_server_ids = [str(item) for item in parsed_tool_server_ids if str(item).strip()]
+
+    # Save each file to the sandbox storage, collecting its public card or an error card.
     public_files: list[dict[str, Any]] = []
     for uploaded_file in uploaded_files:
         try:
@@ -706,7 +756,8 @@ def upload_files_api(request):
     return JsonResponse({"files": public_files})
 
 
-# Build a non-empty Deep Research topic and preserve attached model context.
+# Build a non-empty Deep Research topic and preserve attached model context. Return the topic and the
+# user message entry (with attachments and uploaded files applied) that the research run receives.
 def _build_deep_research_request_message(
     user_message: str,
     attachments: list[dict[str, Any]],
@@ -715,6 +766,7 @@ def _build_deep_research_request_message(
     engine: str,
     model_info_payload: dict[str, Any] | None,
 ) -> tuple[str, dict[str, Any]]:
+    # Without a typed message, the topic falls back to the names of the attached files.
     attachment_names = [
         str(item.get("name") or "").strip()
         for item in [*(attachments or []), *(upload_manifests or [])]
@@ -730,6 +782,7 @@ def _build_deep_research_request_message(
             else "Research the user-provided attachments."
         )
 
+    # Attach images and uploaded files to the user entry, limited to what the model supports.
     request_message: dict[str, Any] = {"role": "user", "content": topic}
     request_message = _apply_attachments_to_llm_entry(request_message, attachments or [])
     request_message = _apply_uploaded_file_manifests_to_llm_entry(
@@ -741,7 +794,9 @@ def _build_deep_research_request_message(
 
 
 # Stream a first-class Deep Research run without routing the request through the
-# parent model's tool-selection loop.
+# parent model's tool-selection loop. Yield a tool-call marker first, then a tool-result marker and the
+# final visible text; the assistant message is persisted in a pending state before the (blocking) run
+# starts and completed afterwards. A failed run is reported as a "failed" result instead of raising.
 def _stream_deep_research_response(
     *,
     chat: Chat,
@@ -751,6 +806,7 @@ def _stream_deep_research_response(
     model_name: str,
     request_message: dict[str, Any] | None = None,
 ):
+    # Describe the research as a synthetic tool call so the UI renders it like any other tool card.
     arguments = dict(prepared_research.get("arguments") or {})
     initial_ui = dict(prepared_research.get("tool_ui") or {})
     alias = "research__deep_research"
@@ -766,6 +822,7 @@ def _stream_deep_research_response(
             }
         ],
     }
+
     # Persist the pending artifact before the blocking orchestrator begins so a
     # reload can reconstruct the card and continue polling the durable session.
     assistant_message_record.llm_transcript = [call_entry]
@@ -783,6 +840,7 @@ def _stream_deep_research_response(
         }
     )
 
+    # Run the research to completion; on failure, build a failed result that keeps any saved session state.
     result: dict[str, Any]
     try:
         result = deep_research_service.run_research(
@@ -817,6 +875,7 @@ def _stream_deep_research_response(
             },
         }
 
+    # Emit the tool result and record it in the transcript.
     tool_ui = result.get("ui") if isinstance(result.get("ui"), dict) else initial_ui
     model_context = str(result.get("model_context") or result.get("report") or "").strip()
     tool_entry = {
@@ -838,6 +897,7 @@ def _stream_deep_research_response(
         structured_content=result,
     )
 
+    # Finish the message with a short visible line that depends on the research status.
     status = str(tool_ui.get("status") or "").strip().lower()
     ready_text = "Your research is ready" if status in {"completed", "partial"} else "Research could not be completed"
     visible_entry = {"role": "assistant", "content": ready_text}
@@ -848,7 +908,8 @@ def _stream_deep_research_response(
     yield f"\n{ready_text}"
 
 
-# Handle a chat generation request.
+# Handle a chat generation request: validate the payload, prepare the chat, tools, uploads and system
+# prompt, store the user message and return a streaming response (normal or Deep Research).
 def chat_api(request):
     if request.method != "POST":
         return JsonResponse({"error": "Invalid request method"}, status=405)
@@ -868,6 +929,9 @@ def chat_api(request):
         engine, engine_error = _resolve_request_engine_or_response(request, data)
         if engine_error is not None:
             return engine_error
+
+        # Collect the requested tool server ids; Deep Research is a separate flag, not a tool server.
+        # Slash commands in the message may select further tools in the command plan below.
         raw_tool_ids = data.get("tool_server_ids") or data.get("tool_server_id") or data.get("tool_id") or []
         if isinstance(raw_tool_ids, str):
             raw_tool_ids = [raw_tool_ids] if raw_tool_ids.strip() else []
@@ -884,16 +948,19 @@ def chat_api(request):
                 and tool_registry.get_server(tool_id, engine=engine, model_name=model_name) is not None
             ),
         )
+
         # The stored message keeps the raw slash commands the user typed; the model
         # receives the command_plan.message variant with inline command markers.
         user_message = str(user_message or "")
         llm_user_message = command_plan.message
 
+        # Reject requests without a model or without any content.
         if not model_name:
             return JsonResponse({"error": "Missing model parameter"}, status=400)
         if not user_message and not attachments and not uploaded_file_ids:
             return JsonResponse({"error": "Missing message or attachments"}, status=400)
 
+        # Remember the model, resolve the selected tool servers and refresh the model capabilities.
         _remember_active_model(engine, model_name)
         selected_tool_servers = _resolve_tool_servers(
             engine,
@@ -908,6 +975,8 @@ def chat_api(request):
             source="generation",
             route="/api/chat/",
         )
+
+        # Refuse image attachments only when the model is explicitly known not to support vision.
         has_image_attachments = any(
             attachment.get("kind") == MessageAttachmentKind.IMAGE
             for attachment in attachments
@@ -925,6 +994,8 @@ def chat_api(request):
                 },
                 status=400,
             )
+
+        # Check that the model supports the chosen tools, then load uploaded files and generation options.
         _validate_tool_server_support(
             engine,
             model_name,
@@ -949,6 +1020,7 @@ def chat_api(request):
         except LookupError as exc:
             return JsonResponse({"error": str(exc)}, status=404)
 
+        # Compose the system prompt with the skills baseline (first turn only) and the command directives.
         system_prompt = _compose_system_prompt(
             data.get("system_prompt", ""),
             include_skills_baseline=_chat_is_first_user_turn(chat),
@@ -960,6 +1032,7 @@ def chat_api(request):
             _command_directives_for_mode(command_plan, instant_mode=instant_mode),
         )
 
+        # Remember the selected tool servers on the chat so the UI restores them when it is reopened.
         import json as _json
         active_slug = _json.dumps([s["id"] for s in selected_tool_servers], ensure_ascii=False)
         if chat.active_tool_slug != active_slug:
@@ -976,6 +1049,7 @@ def chat_api(request):
         _store_message_attachments(user_message_record, attachments)
         Chat.objects.filter(pk=chat.pk).update(updated_at=timezone.now())
 
+        # Replace the provisional title of a new chat with a model-generated one, when enabled.
         if is_new_chat and settings.get("generate-chat-titles", True):
             generated_title = llm_api.generate_chat_title(
                 engine,
@@ -1014,6 +1088,8 @@ def chat_api(request):
                         "arguments": {"url": u},
                         "context": {"chat_id": str(chat.id) if chat else ""},
                     }
+
+                    # Prefer the persistent worker session; fall back to a one-shot worker process.
                     try:
                         from API.mcp import _get_worker_session
                         session = _get_worker_session(server_file)
@@ -1024,12 +1100,14 @@ def chat_api(request):
                         )
                     except Exception as worker_exc:
                         logger.warning("Persistent worker call failed for read_page, falling back to one-shot: %s", worker_exc)
-                        # Fallback one-shot using the worker script
+
+                        # Fallback one-shot using the worker script.
                         python_path = None
                         try:
                             from API.mcp import _get_worker_python
                             python_path = _get_worker_python(server_file)
                         except Exception:
+                            # Without a dedicated worker interpreter the current one is used below.
                             pass
                         if python_path is None:
                             python_path = sys.executable
@@ -1046,6 +1124,8 @@ def chat_api(request):
                             timeout=60,
                             check=False,
                         )
+
+                        # The worker prints log lines and then one JSON envelope: take the last valid JSON line.
                         stdout = (res.stdout or "").strip()
                         envelope = None
                         for line in reversed(stdout.splitlines()):
@@ -1053,12 +1133,13 @@ def chat_api(request):
                                 envelope = _json.loads(line)
                                 break
                             except Exception:
+                                # Not a JSON line (log output); keep looking further up.
                                 continue
                         if not isinstance(envelope, dict) or not envelope.get("ok"):
                             raise RuntimeError(f"Worker failed: {stdout[:300]} {res.stderr[:300]}")
                         envelope = envelope.get("result") or envelope
 
-                    # Extract content from the read_page payload (same shape as mcp-server _call_read_page)
+                    # Extract content from the read_page payload (same shape as mcp-server _call_read_page).
                     if isinstance(envelope, dict):
                         if "model_context" in envelope:
                             content = envelope.get("model_context") or ""
@@ -1069,6 +1150,7 @@ def chat_api(request):
                     else:
                         content = str(envelope)
 
+                    # Log the result to the search IO log and to the tool IO log.
                     elapsed = time.perf_counter() - started
                     write_search_io_event({
                         "layer": "url_attachment",
@@ -1088,6 +1170,7 @@ def chat_api(request):
                             elapsed_seconds=elapsed,
                         )
                     except Exception:
+                        # Tool IO logging is diagnostic only and must not fail the attachment read.
                         pass
 
                     # Save the result to Tools/user_files like the search tool itself does for read_page results.
@@ -1096,13 +1179,14 @@ def chat_api(request):
                     except Exception as save_exc:
                         logger.warning("Failed to persist read_page result to user_files for %s: %s", u, save_exc)
 
-                    # Update DB attachment so it gets injected into prompt context via extracted_text
+                    # Update the DB attachment so it gets injected into the prompt context via extracted_text.
                     MessageAttachment.objects.filter(
                         message=user_message_record,
                         name=u,
                         kind="url",
                     ).update(extracted_text=content or "", extracted_text_ready=True)
                 except Exception as exc:
+                    # Report the failure to the model as the attachment's text instead of failing the request.
                     logger.warning("Failed to read_page for URL attachment %s: %s", u, exc)
                     write_search_io_event({
                         "layer": "url_attachment",
@@ -1116,6 +1200,7 @@ def chat_api(request):
                             extracted_text=f"Error: could not fetch page content: {exc}", extracted_text_ready=True
                         )
                     except Exception:
+                        # Recording the error text is best effort; the failure is already logged above.
                         pass
 
         # Pre-create the assistant row so the client knows its ID up front
@@ -1127,6 +1212,7 @@ def chat_api(request):
             llm_transcript=[],
         )
 
+        # Deep Research bypasses the normal tool loop: it streams a dedicated research run instead.
         if deep_research_requested:
             current_attachments = _get_message_attachments(user_message_record)
             research_topic, research_request_message = _build_deep_research_request_message(
@@ -1141,6 +1227,8 @@ def chat_api(request):
                 instructions=str(data.get("deep_research_instructions") or ""),
                 max_rounds=data.get("deep_research_max_rounds") or 6,
             )
+
+            # Stream the research and expose the chat, message and research session ids in headers.
             generation_id = uuid.uuid4().hex
             response = StreamingHttpResponse(
                 _stream_deep_research_response(
@@ -1177,6 +1265,7 @@ def chat_api(request):
             upload_manifests,
             sandbox_enabled=sandbox_enabled,
         )
+
         # Build the final generation payload for the adapter layer.
         external_tool_context = {}
         _apply_command_tool_context(
@@ -1205,6 +1294,7 @@ def chat_api(request):
             instant_mode=instant_mode,
         )
 
+        # Stream the model output and expose the chat, message and generation ids in response headers.
         generation_id = uuid.uuid4().hex
         response = StreamingHttpResponse(
             _stream_chat_response(
@@ -1231,14 +1321,16 @@ def chat_api(request):
         return response
 
     except ValueError as exc:
+        # Invalid input becomes a 400; anything unexpected is logged and reported as a 500.
         return JsonResponse({"error": str(exc)}, status=400)
     except Exception as exc:
         logger.exception("Unhandled exception in chat_api")
         return JsonResponse({"error": str(exc)}, status=500)
 
 
-# Message and chat management APIs.
+# Message and chat management APIs
 
+# Return whether the resolved path lies inside the resolved root directory.
 def _path_is_within(path: Path, root: Path) -> bool:
     try:
         path.resolve().relative_to(root.resolve())
@@ -1247,7 +1339,9 @@ def _path_is_within(path: Path, root: Path) -> bool:
         return False
 
 
-# Shared file allowed roots.
+# Return the directories that model-shared files may be served from: the bundled sandbox folder and,
+# when configured through the environment, the host sandbox workspace. Roots are resolved and
+# de-duplicated case-insensitively, and roots that cannot be resolved are skipped.
 def _shared_file_allowed_roots() -> list[Path]:
     roots = [
         settings.BASE_DIR / "Tools" / "mcp-sandbox" / "_sandbox",
@@ -1264,6 +1358,7 @@ def _shared_file_allowed_roots() -> list[Path]:
         try:
             resolved = root.resolve()
         except OSError:
+            # An unresolvable root cannot contain a valid file, so it is skipped.
             continue
         key = str(resolved).lower()
         if key not in seen:
@@ -1272,12 +1367,16 @@ def _shared_file_allowed_roots() -> list[Path]:
     return normalized
 
 
-# Resolve shared file path.
+# Resolve a path shared by the model (absolute, relative, or a "/workspace/_sandbox" or "/home/sandbox"
+# container path) to an existing file on the host. Several candidate locations are tried, and a file is
+# returned only when it lies inside an allowed root. Raise ValueError for an empty path and
+# FileNotFoundError when no allowed file matches.
 def _resolve_shared_file_path(raw_path: str) -> Path:
     cleaned = str(raw_path or "").strip().strip('"')
     if not cleaned or "\x00" in cleaned:
         raise ValueError("Missing shared file path.")
 
+    # Normalize the path into parts and strip the container prefixes that map to the sandbox root.
     raw = Path(cleaned)
     allowed_roots = _shared_file_allowed_roots()
     sandbox_root = settings.BASE_DIR / "Tools" / "mcp-sandbox" / "_sandbox"
@@ -1294,6 +1393,7 @@ def _resolve_shared_file_path(raw_path: str) -> Path:
     if mapped_parts and mapped_parts[0] == "_sandbox":
         mapped_parts = mapped_parts[1:]
 
+    # Files shared with the model live under the sandbox "User" folder; add it when the path omits it.
     if mapped_parts and mapped_parts[0].lower() == "user":
         mapped_relative = Path(*mapped_parts)
     else:
@@ -1309,6 +1409,7 @@ def _resolve_shared_file_path(raw_path: str) -> Path:
             seen.add(key)
             candidate_set.append(path)
 
+    # Collect candidate locations from the most literal to the most mapped interpretation.
     if raw.is_absolute():
         push_candidate(raw)
     push_candidate(settings.BASE_DIR / cleaned)
@@ -1319,10 +1420,12 @@ def _resolve_shared_file_path(raw_path: str) -> Path:
         push_candidate(root / mapped_relative)
         push_candidate(root / Path(*mapped_parts) if mapped_parts else root)
 
+    # Return the first candidate that is an existing file inside an allowed root.
     for candidate in candidate_set:
         try:
             resolved = candidate.resolve()
         except OSError:
+            # A candidate that cannot be resolved cannot be the file; try the next one.
             continue
         if not resolved.is_file():
             continue
@@ -1337,11 +1440,13 @@ def _resolve_uploaded_file_content_path(manifest: dict[str, Any]) -> Path:
     return resolve_uploaded_file_host_path(manifest)
 
 
+# Size limits for media streaming: the largest chunk served for an open-ended Range request, and the
+# block size read from disk while streaming a range.
 MEDIA_RANGE_CHUNK_BYTES = 64 * 1024 * 1024
 MEDIA_STREAM_READ_BYTES = 1024 * 1024
 
 
-# Range not satisfiable response.
+# Build the 416 response for an unsatisfiable Range request, reporting the real file size.
 def _range_not_satisfiable_response(file_size: int) -> HttpResponse:
     resp = HttpResponse(status=416)
     resp["Content-Range"] = "bytes */" + str(max(0, int(file_size or 0)))
@@ -1349,7 +1454,8 @@ def _range_not_satisfiable_response(file_size: int) -> HttpResponse:
     return resp
 
 
-# Return one satisfiable byte range, including suffix ranges.
+# Return one satisfiable inclusive (start, end) byte range, including suffix ranges, or None when the
+# header is malformed or cannot be satisfied. Open-ended ranges are capped at MEDIA_RANGE_CHUNK_BYTES.
 def _parse_single_byte_range(range_header: str, file_size: int) -> tuple[int, int] | None:
     if file_size <= 0:
         return None
@@ -1361,6 +1467,7 @@ def _parse_single_byte_range(range_header: str, file_size: int) -> tuple[int, in
     if not raw_start and not raw_end:
         return None
 
+    # Suffix range ("bytes=-N"): the last N bytes of the file.
     if not raw_start:
         suffix_length = int(raw_end)
         if suffix_length <= 0:
@@ -1369,6 +1476,7 @@ def _parse_single_byte_range(range_header: str, file_size: int) -> tuple[int, in
         end = file_size - 1
         return start, end
 
+    # Explicit start, with an optional explicit end.
     start = int(raw_start)
     if start >= file_size:
         return None
@@ -1382,7 +1490,8 @@ def _parse_single_byte_range(range_header: str, file_size: int) -> tuple[int, in
     return start, end
 
 
-# Stream a local file with HTTP Range support for media playback.
+# Stream a local file with HTTP Range support for media playback. A Range request gets a 206 response
+# (or 416 when unsatisfiable), a plain request gets the whole file, and HEAD requests get headers only.
 def _stream_local_file_response(
     request,
     target: Path,
@@ -1395,6 +1504,7 @@ def _stream_local_file_response(
     range_header = request.META.get("HTTP_RANGE", "").strip()
     is_head = request.method == "HEAD"
 
+    # Partial content for a Range request: the file handle is closed by the iterator when it finishes.
     if range_header:
         parsed_range = _parse_single_byte_range(range_header, file_size)
         if parsed_range is None:
@@ -1423,12 +1533,14 @@ def _stream_local_file_response(
         response["Content-Range"] = "bytes " + str(start) + "-" + str(end) + "/" + str(file_size)
         response["Content-Length"] = str(chunk_size)
     else:
+        # No Range header: serve the whole file.
         if is_head:
             response = HttpResponse(content_type=mime_type)
         else:
             response = FileResponse(target.open("rb"), content_type=mime_type)
         response["Content-Length"] = str(file_size)
 
+    # Headers shared by both cases: advertise range support and allow short private caching.
     response["Accept-Ranges"] = "bytes"
     response["Cache-Control"] = "private, max-age=300"
     response["Content-Disposition"] = f'{disposition}; filename="{safe_name}"'
@@ -1531,10 +1643,11 @@ def deep_research_export_api(request):
         export_format = str(data.get("format") or "md").strip().lower()
         if export_format not in {"md", "pdf", "docx"}:
             return JsonResponse({"error": "Unsupported research export format."}, status=400)
+
+        # Load the durable report. Older chats can retain a complete report in their transcript after
+        # the retention policy removes the durable control snapshot.
         snapshot = deep_research_control.read_state(session_id)
         fallback_report = str(data.get("report") or "").strip()
-        # Older chats can retain a complete report in their transcript after
-        # the retention policy removes the durable control snapshot.
         report = str(
             (snapshot or {}).get("report")
             or (snapshot or {}).get("model_context")
@@ -1542,6 +1655,8 @@ def deep_research_export_api(request):
         ).strip()
         if not report:
             return JsonResponse({"error": "The research report is not ready yet."}, status=409)
+
+        # Render the report in the requested format and send it as a download.
         title = str((snapshot or {}).get("topic") or data.get("title") or "Research report").strip()
         if export_format == "md":
             payload = research_export.markdown_bytes(report)
@@ -1564,11 +1679,11 @@ def deep_research_export_api(request):
         return JsonResponse({"error": str(exc)}, status=500)
 
 
-# Read or control one durable Deep Research session.
+# Read or control one durable Deep Research session: a GET inspects the state of an isolated run, a POST
+# approves, revises or cancels it.
 def deep_research_control_api(request):
-    """Approve, revise, stop, or inspect an isolated Deep Research run."""
-
     try:
+        # Read the current state of the session.
         if request.method == "GET":
             session_id = str(request.GET.get("session_id") or "").strip()
             if not session_id:
@@ -1581,6 +1696,7 @@ def deep_research_control_api(request):
         if request.method != "POST":
             return JsonResponse({"error": "Invalid request method"}, status=405)
 
+        # Validate the command and check that the session is in a state that accepts it.
         data = _read_json_request_body(request)
         session_id = str(data.get("session_id") or "").strip()
         action = str(data.get("action") or "").strip().lower()
@@ -1603,6 +1719,7 @@ def deep_research_control_api(request):
                 status=409,
             )
 
+        # Optional optimistic-concurrency version of the plan the client is acting on.
         expected_version = data.get("expected_plan_version")
         if expected_version in (None, ""):
             expected_plan_version = None
@@ -1612,6 +1729,7 @@ def deep_research_control_api(request):
             except (TypeError, ValueError):
                 return JsonResponse({"error": "expected_plan_version must be an integer."}, status=400)
 
+        # An approve or revise command may carry an edited plan (bounded in size; a revision needs one).
         payload: dict[str, Any] = {}
         if action in {"approve", "revise"} and data.get("plan") is not None:
             plan = str(data.get("plan") or "").strip()
@@ -1622,6 +1740,7 @@ def deep_research_control_api(request):
             if plan:
                 payload["plan"] = plan
 
+        # Queue the command for the research worker.
         result = deep_research_control.submit_command(
             session_id,
             action,
@@ -1644,6 +1763,7 @@ def deep_research_control_api(request):
                 stop_requested_at=time.time(),
             )
             result = {**result, "state": stopping_state}
+
             # The durable command remains the cooperative cancellation path.
             # When this Django process also owns the active tool worker, stop
             # that exact process immediately so a hung provider/read cannot
@@ -1674,6 +1794,8 @@ def deep_research_control_api(request):
     except FileNotFoundError as exc:
         return JsonResponse({"error": str(exc)}, status=404)
     except RuntimeError as exc:
+        # Known conflicts from the control layer become 409 responses carrying the latest state;
+        # any other RuntimeError is re-raised.
         if str(exc) == "STALE_PLAN_VERSION":
             state = deep_research_control.read_state(
                 str(request.GET.get("session_id") or "")
@@ -1696,12 +1818,14 @@ def deep_research_control_api(request):
         return JsonResponse({"error": str(exc)}, status=500)
 
 
-# Return stored attachment bytes on demand.
+# Return stored attachment bytes on demand. record_type selects the table: "attachment" for
+# MessageAttachment rows and "image" for legacy MessageImage rows.
 def attachment_content_api(request, record_type: str, attachment_id: int):
     if request.method != "GET":
         return JsonResponse({"error": "Invalid request method"}, status=405)
 
     try:
+        # Load the record and its name, MIME type and base64 payload.
         normalized_type = str(record_type or "").strip().lower()
         if normalized_type == "attachment":
             attachment = MessageAttachment.objects.get(id=attachment_id)
@@ -1716,6 +1840,7 @@ def attachment_content_api(request, record_type: str, attachment_id: int):
         else:
             return JsonResponse({"error": "Unknown attachment type"}, status=404)
 
+        # Serve the decoded bytes inline with a sanitized file name and a one-hour private cache.
         safe_name = re.sub(r'["\\\r\n]', "_", Path(name).name or "attachment")
         response = HttpResponse(_decode_base64_payload(encoded), content_type=mime_type)
         response["Cache-Control"] = "private, max-age=3600"
@@ -1752,6 +1877,8 @@ def edit_message_api(request, message_id):
     try:
         data = _read_json_request_body(request)
         content = str(data.get("content", ""))
+
+        # Validate the edit, drop every later message of the chat and save the new content atomically.
         with transaction.atomic():
             message = Message.objects.select_related("chat").get(id=message_id)
             if message.role != "user":
@@ -1764,6 +1891,7 @@ def edit_message_api(request, message_id):
                     created_at__gt=message.created_at,
                 ).values_list("id", flat=True)
             )
+
             # IDs are a stable tie-breaker for records created in the same timestamp tick.
             later_ids.extend(
                 message.chat.messages.filter(created_at=message.created_at, id__gt=message.id)
@@ -1790,6 +1918,7 @@ def branch_message_api(request, message_id):
 
     try:
         with transaction.atomic():
+            # Collect the source messages up to and including the selected one, in chronological order.
             source_message = Message.objects.select_related("chat").get(id=message_id)
             source_chat = source_message.chat
             source_messages = list(
@@ -1802,6 +1931,8 @@ def branch_message_api(request, message_id):
             )
             source_messages.sort(key=lambda item: (item.created_at, item.id))
 
+            # Create the child chat and clone every message with its original timestamp, transcript,
+            # attachments and legacy images.
             child_title = f"Branch: {source_chat.title}"[:255]
             child_chat = Chat.objects.create(
                 title=child_title,
@@ -1843,6 +1974,7 @@ def branch_message_api(request, message_id):
                     for image in original.images.all()
                 ])
 
+            # Link the two chats at the branch point so both sides can navigate to each other.
             child_message = cloned_by_source_id[source_message.id]
             ChatBranch.objects.create(
                 source_chat=source_chat,
@@ -1909,6 +2041,7 @@ def regenerate_chat_api(request, chat_id):
         return JsonResponse({"error": "Invalid request method"}, status=405)
 
     try:
+        # Read the request and validate the model and the chat.
         data = _read_json_request_body(request)
 
         model_name = data.get("model", "")
@@ -1929,6 +2062,7 @@ def regenerate_chat_api(request, chat_id):
         except Chat.DoesNotExist:
             return JsonResponse({"error": "Chat not found"}, status=404)
 
+        # Find the user message to regenerate from: the requested one, or the last user message.
         target_id = data.get("user_message_id")
         ordered = list(chat.messages.order_by("created_at", "id"))
         if target_id:
@@ -1953,6 +2087,7 @@ def regenerate_chat_api(request, chat_id):
                     continue
                 message.delete()
 
+        # Remember the model, resolve the tool servers and check that the model supports them.
         _remember_active_model(engine, model_name)
         selected_tool_servers = _resolve_tool_servers(engine, model_name, tool_server_ids)
         model_info_payload = _build_model_info_payload(engine, model_name, allow_fallback=True)
@@ -1971,12 +2106,15 @@ def regenerate_chat_api(request, chat_id):
         )
         sandbox_enabled = _selected_tools_include_sandbox(selected_tool_servers)
 
+        # Remember the selected tool servers on the chat so the UI restores them when it is reopened.
         import json as _json
         active_slug = _json.dumps([s["id"] for s in selected_tool_servers], ensure_ascii=False)
         if chat.active_tool_slug != active_slug:
             chat.active_tool_slug = active_slug
             chat.save(update_fields=["active_tool_slug", "updated_at"])
 
+        # Prepare the generation options, the system prompt (no skills baseline on a regeneration) and
+        # the rebuilt message history.
         think_value, think_level_value, clean_options = _split_generation_options(
             options,
             think_param_name=str(model_info_payload.get("think_param_name", "think") or "think"),
@@ -2019,6 +2157,7 @@ def regenerate_chat_api(request, chat_id):
             instant_mode=instant_mode,
         )
 
+        # Pre-create the empty assistant message that the stream fills in.
         assistant_message_record = Message.objects.create(
             chat=chat,
             role="assistant",
@@ -2026,6 +2165,7 @@ def regenerate_chat_api(request, chat_id):
             llm_transcript=[],
         )
 
+        # Stream the new reply and expose the chat, message and generation ids in response headers.
         generation_id = uuid.uuid4().hex
         response = StreamingHttpResponse(
             _stream_chat_response(
@@ -2117,12 +2257,14 @@ def load_chat_api(request, chat_id):
         return JsonResponse({"error": "Invalid request method"}, status=405)
 
     try:
+        # Serialize the messages without attachment bytes (those are fetched on demand).
         chat = Chat.objects.get(id=chat_id)
         messages = chat.messages.order_by("created_at", "id").prefetch_related("attachments", "images")
         message_records = list(messages)
         payload = [_serialize_message(message, include_attachment_data=False) for message in message_records]
         payload_by_id = {item["id"]: item for item in payload}
 
+        # Attach navigation links to the messages where this chat branches into or out of another chat.
         for branch in chat.outgoing_branches.select_related("child_chat").all():
             if branch.source_message_id in payload_by_id:
                 payload_by_id[branch.source_message_id].setdefault("branch_links", []).append({
@@ -2140,6 +2282,8 @@ def load_chat_api(request, chat_id):
                 "chat_id": str(incoming_branch.source_chat_id),
                 "title": incoming_branch.source_chat.title,
             })
+
+        # Include the tool servers that were active in the chat (the first one for older clients).
         active_tool_server_ids = _parse_active_tool_slugs(chat.active_tool_slug)
         return JsonResponse({
             "chat_id": str(chat.id),
@@ -2155,10 +2299,10 @@ def load_chat_api(request, chat_id):
         return JsonResponse({"error": str(exc)}, status=500)
 
 
-# Model and tool discovery APIs.
+# Model and tool discovery APIs
 
-
-# Return discovered tool servers.
+# Read or replace the raw text of the user MCP configuration file. A GET returns the current text; a
+# PUT or PATCH validates and saves the new text and drops the tool server caches so it takes effect.
 def mcp_config_api(request):
     mcp_json.ensure_default_mcp_json()
 
@@ -2168,6 +2312,7 @@ def mcp_config_api(request):
     if request.method not in {"PUT", "PATCH"}:
         return JsonResponse({"error": "Invalid request method"}, status=405)
 
+    # Read the new configuration text from the request body.
     try:
         payload = _read_json_request_body(request)
     except ValueError as exc:
@@ -2177,11 +2322,13 @@ def mcp_config_api(request):
     if not isinstance(content, str):
         return JsonResponse({"error": "Expected JSON object with string field 'content'"}, status=400)
 
+    # Save it; save_raw_text rejects invalid configuration with a ValueError.
     try:
         mcp_json.save_raw_text(content)
     except ValueError as exc:
         return JsonResponse({"error": str(exc)}, status=400)
 
+    # Force tool servers to be rediscovered from the new configuration.
     tool_registry.reset_cache()
     _clear_tool_server_cache()
 
@@ -2389,7 +2536,7 @@ def docker_status_refresh_api(request):
 
 # Resolve and proxy a stable favicon for a search result domain.
 def favicon_api(request):
-    # Build one inline image HTTP response for a byte range.
+    # Build one inline image HTTP response from the icon bytes, cacheable for a week.
     def image_response(content_type: str, content: bytes) -> HttpResponse:
         response = HttpResponse(content, content_type=content_type)
         response["Cache-Control"] = "public, max-age=604800"
@@ -2403,6 +2550,7 @@ def favicon_api(request):
     if not domain:
         return JsonResponse({"error": "Domain is required"}, status=400)
 
+    # Serve from the in-memory cache first (an empty entry is a cached "not found"), then the disk cache.
     now = time.time()
     with _favicon_cache_lock:
         cached = _favicon_cache.get(domain)
@@ -2418,6 +2566,7 @@ def favicon_api(request):
             _favicon_cache[domain] = (now + FAVICON_CACHE_TTL_SECONDS, content_type, content)
             return image_response(content_type, content)
 
+    # Cache miss: resolve over the network outside the lock, then cache the icon (or the failure).
     resolved = _resolve_favicon_content(domain)
     with _favicon_cache_lock:
         if resolved:
@@ -2432,9 +2581,9 @@ def favicon_api(request):
     return HttpResponse(status=404)
 
 
-# Preset APIs.
+# Preset APIs
 
-# Return Ollama preset metadata.
+# Return Ollama preset metadata for the requested model.
 def get_ollama_presets_api(request):
     if request.method != "GET":
         return JsonResponse({"error": "Invalid request method"}, status=405)
@@ -2958,9 +3107,10 @@ def delete_google_genai_preset_api(request):
         return JsonResponse({"error": str(exc)}, status=500)
 
 
-# Runtime settings API.
+# Runtime settings API
 
-# Read or update runtime settings.
+# Read or update runtime settings. A GET returns the runtime settings payload; a POST saves the allowed
+# keys, applies the engine transition and returns the refreshed payload.
 def runtime_settings_api(request):
     if request.method == "GET":
         return JsonResponse(_build_runtime_settings_payload())
@@ -2973,6 +3123,7 @@ def runtime_settings_api(request):
     except ValueError as exc:
         return JsonResponse({"error": str(exc)}, status=400)
 
+    # Only these settings can be changed through this endpoint.
     allowed_keys = {
         "llm-engine",
         "lms_url",
@@ -2982,6 +3133,7 @@ def runtime_settings_api(request):
         "google_genai_api_key",
     }
 
+    # The engine change (if any) is applied after saving, so remember the engine before the update.
     previous_engine = settings.get_llm_engine()
     next_engine = previous_engine
 
@@ -3030,25 +3182,29 @@ def runtime_settings_api(request):
     return JsonResponse(_build_runtime_settings_payload())
 
 
-# Browser portal control APIs.
+# Browser portal control APIs
 
+# Throttle state for logging repeated "no frame" 404 responses: the current burst length and the time of
+# the last logged one.
 _frame404_burst_log_count = 0
 _frame404_burst_log_last_ts = 0.0
 
 
-# Browser portal roots.
+# Return the runtime folders that hold browser portal sessions (state.json and events).
 def _browser_portal_roots() -> list[Path]:
     return [
         settings.BASE_DIR / "Data" / "runtime" / "browser_portal",
     ]
 
 
-# Browser portal debug log path.
+# Return the path of the portal debug.jsonl file, inside the given root or the first portal root.
 def _browser_portal_debug_log_path(root: Path | None = None) -> Path:
     return (root or _browser_portal_roots()[0]) / "debug.jsonl"
 
 
-# Browser portal debug safe.
+# Convert a value into a JSON-safe, size-bounded form for debug logs: strings are cut to 4000 characters,
+# containers to 50 items, nesting beyond depth 4 becomes repr text, and bulky "data_base64" and "preview"
+# keys are dropped.
 def _browser_portal_debug_safe(value: Any, *, depth: int = 0) -> Any:
     if depth > 4:
         return repr(value)[:4000]
@@ -3067,7 +3223,8 @@ def _browser_portal_debug_safe(value: Any, *, depth: int = 0) -> Any:
     return repr(value)[:4000]
 
 
-# Compact portal POST body for debug.jsonl (typing floods the log otherwise).
+# Compact a portal POST body for debug.jsonl (typing floods the log otherwise): keep the identifying
+# fields and replace typed text and key presses by their length or a bounded key name.
 def _browser_portal_http_event_body_for_log(data: dict[str, Any] | None) -> dict[str, Any]:
     if not isinstance(data, dict):
         return {}
@@ -3096,7 +3253,7 @@ def _write_browser_portal_debug_event(root: Path | None, event: str, **fields: A
     return None
 
 
-# Return browser portal state from.
+# Read state.json from a portal root; return None when it is missing, unreadable or not a JSON object.
 def _read_browser_portal_state_from(root: Path) -> dict[str, Any] | None:
     try:
         payload = json.loads((root / "state.json").read_text(encoding="utf-8"))
@@ -3105,7 +3262,8 @@ def _read_browser_portal_state_from(root: Path) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
-# Is active browser portal state.
+# Return whether a portal state is a "waiting" session that has not passed its deadline (or, without
+# one, its last update plus the timeout) by more than a 10 second grace period.
 def _is_active_browser_portal_state(payload: dict[str, Any]) -> bool:
     if str(payload.get("status") or "").lower() != "waiting":
         return False
@@ -3120,7 +3278,7 @@ def _is_active_browser_portal_state(payload: dict[str, Any]) -> bool:
     return updated_at > 0 and time.time() <= updated_at + timeout_seconds + 10
 
 
-# Active browser portal root.
+# Return the portal root of the most recently updated active session, or None when none is active.
 def _active_browser_portal_root() -> Path | None:
     candidates: list[tuple[float, Path]] = []
     for root in _browser_portal_roots():
@@ -3129,6 +3287,7 @@ def _active_browser_portal_root() -> Path | None:
             try:
                 candidates.append((float(payload.get("updated_at") or 0), root))
             except (TypeError, ValueError):
+                # An unparsable timestamp makes the root impossible to rank, so it is skipped.
                 continue
     if not candidates:
         return None
@@ -3136,7 +3295,7 @@ def _active_browser_portal_root() -> Path | None:
     return candidates[0][1]
 
 
-# Browser portal state path.
+# Return the state.json path of the active portal session, or of the first root when none is active.
 def _browser_portal_state_path() -> Path:
     root = _active_browser_portal_root()
     if root is None:
@@ -3144,7 +3303,7 @@ def _browser_portal_state_path() -> Path:
     return root / "state.json"
 
 
-# Browser portal events dir.
+# Return the events folder of the active portal session, or of the first root when none is active.
 def _browser_portal_events_dir() -> Path:
     root = _active_browser_portal_root()
     if root is None:
@@ -3152,7 +3311,8 @@ def _browser_portal_events_dir() -> Path:
     return root / "events"
 
 
-# Return browser portal state.
+# Return the state of the active portal session, or an {"ok": False, "error": ...} payload when there is
+# no active session or its state is invalid.
 def _read_browser_portal_state() -> dict[str, Any]:
     root = _active_browser_portal_root()
     if root is None:
@@ -3168,11 +3328,14 @@ def browser_portal_frame_api(request):
     if request.method != "GET":
         _write_browser_portal_debug_event(None, "frame_rejected_method", method=request.method)
         return JsonResponse({"error": "Invalid request method"}, status=405)
+
+    # A missing portal state is a 404, and a successful read resets the burst counter.
     payload = _read_browser_portal_state()
     status = 200 if payload.get("ok") else 404
     if status == 200:
         _frame404_burst_log_count = 0
     if status != 200:
+        # Throttle debug logging of repeated 404s: log the first 8, then at most one every 5 seconds.
         should_log_frame = True
         if status == 404:
             now_ts = time.time()
@@ -3211,6 +3374,7 @@ def browser_portal_event_api(request):
         _write_browser_portal_debug_event(None, "event_rejected_invalid_json", error=str(exc))
         return JsonResponse({"error": str(exc)}, status=400)
 
+    # Validate the event type and that a portal session is waiting for input.
     event_type = str(data.get("type") or "").strip().lower()
     _write_browser_portal_debug_event(
         _active_browser_portal_root(),
@@ -3228,6 +3392,7 @@ def browser_portal_event_api(request):
         _write_browser_portal_debug_event(None, "event_rejected_no_active_session", event_type=event_type, payload=_browser_portal_http_event_body_for_log(data))
         return JsonResponse({"error": "No active browser_wait_for_user session is available."}, status=409)
 
+    # Reject events addressed to a session other than the active one.
     active_state = _read_browser_portal_state_from(active_root) or {}
     active_session_id = str(active_state.get("session_id") or "").strip()
     requested_session_id = str(data.get("session_id") or "").strip()
@@ -3242,6 +3407,7 @@ def browser_portal_event_api(request):
         )
         return JsonResponse({"error": "This browser_wait_for_user session is no longer active."}, status=409)
 
+    # Write the event as a file in the session's events folder, where the waiting tool loop picks it up.
     events_dir = active_root / "events"
     events_dir.mkdir(parents=True, exist_ok=True)
     event_id = uuid.uuid4().hex
@@ -3266,6 +3432,8 @@ def browser_portal_event_api(request):
         payload=_browser_portal_http_event_body_for_log(event_payload),
     )
 
+    # Build the response: a "finish" event marks the portal session as done immediately, any other event
+    # returns the current portal state, flagged as queued.
     if event_type == "finish":
         payload = {
             **active_state,
@@ -3292,7 +3460,9 @@ def browser_portal_event_api(request):
     return JsonResponse(payload)
 
 
-# Render the preloaded chat page.
+# Preloaded chat page
+
+# Render the main page with a chat id that the client loads on startup.
 class ChatView(TemplateView):
     template_name = "main/main.html"
 
@@ -3304,19 +3474,19 @@ class ChatView(TemplateView):
         return context
 
 
-# Resolve an inline [[images: ...]] token from an assistant message into a photo row.
+# Image search API
+
+# Resolve an inline [[images: ...]] token from an assistant message into a photo row by running the
+# mcp-web-search image vertical for one query.
+# Deliberately NOT gated on the active model's vision capability: the gallery is
+# user-facing chat content — history written by a multimodal model must keep
+# rendering after switching to a text-only model. The multimodality gate lives
+# where it belongs, on the tool offered to the model (build_ollama_tools).
 def image_search_api(request):
-    """Run the mcp-web-search image vertical for one query.
-
-    Deliberately NOT gated on the active model's vision capability: the gallery is
-    user-facing chat content — history written by a multimodal model must keep
-    rendering after switching to a text-only model. The multimodality gate lives
-    where it belongs, on the tool offered to the model (build_ollama_tools).
-    """
-
     if request.method != "POST":
         return JsonResponse({"error": "Invalid request method"}, status=405)
 
+    # Read and bound the query parameters (the result limit is clamped to 1..24, default 12).
     data = _read_json_request_body(request)
     query = " ".join(str(data.get("query") or "").split())
     if not query:
@@ -3330,6 +3500,8 @@ def image_search_api(request):
     except (TypeError, ValueError):
         limit = 12
 
+    # Call the web search image tool directly; its failure is reported as a 502 so one bad token never
+    # breaks the chat UI.
     try:
         _tools, tool_lookup = tool_registry.build_ollama_tools(
             ["web_search"], engine=engine, model_name=model_name, model_vision=True
@@ -3359,6 +3531,8 @@ def image_search_api(request):
         ui = structured.get("ui") if isinstance(structured.get("ui"), dict) else structured
     else:
         ui = payload.get("ui") if isinstance(payload, dict) else None
+
+    # Log the outcome and return the gallery images with the tool status.
     images = (ui or {}).get("images") if isinstance(ui, dict) else None
     logger.info(
         "Inline image token resolved: query=%r status=%s count=%d",

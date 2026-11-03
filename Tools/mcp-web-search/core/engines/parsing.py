@@ -10,6 +10,7 @@ from selectolax.lexbor import LexborHTMLParser, LexborNode
 
 from .models import EngineParseResult, ParseStatus, SearchResult
 
+# Matches any run of whitespace so it can be collapsed into a single space.
 _SPACE_RE = re.compile(r"\s+")
 
 
@@ -86,7 +87,10 @@ def deduplicate(results: Iterable[SearchResult]) -> list[SearchResult]:
     return output
 
 
-# Classify parse outcomes and build an EngineParseResult from raw parse metrics.
+# Classify a parse outcome and build an EngineParseResult from raw parse metrics. A block marker wins over
+# results; results become PARTIAL when any card was malformed or fewer than 65% of the seen cards parsed;
+# no results with an explicit empty marker is EMPTY, and no results without one means the page layout
+# changed.
 def classify_parse(
     *,
     engine: str,
@@ -98,7 +102,10 @@ def classify_parse(
     explicit_empty: bool = False,
     diagnostics: list[str] | None = None,
 ) -> EngineParseResult:
+    # Copy the diagnostics so the caller's list is never mutated.
     diagnostics = list(diagnostics or [])
+
+    # Pick the status in priority order: blocked, results, explicit empty, unknown layout.
     if blocked:
         status = ParseStatus.BLOCKED
     elif results:
@@ -109,6 +116,8 @@ def classify_parse(
     else:
         status = ParseStatus.CHANGED
         diagnostics.append("No usable results and no explicit empty-result marker.")
+
+    # Deduplicate by URL so repeated cards do not inflate the result list.
     return EngineParseResult(
         engine=engine,
         status=status,

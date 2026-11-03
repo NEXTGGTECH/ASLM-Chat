@@ -7,6 +7,8 @@ import pytest
 from core.fetch.shopping.parse import parse_amount_value, parse_price
 
 
+# Verify that parse_price accepts common precise price formats (symbol or code before or after the
+# amount, comma, dot and space separators) and returns the matching amount and currency.
 @pytest.mark.unit
 @pytest.mark.parametrize(
     ("text", "amount", "currency"),
@@ -42,6 +44,8 @@ def test_parse_price_accepts_common_precise_formats(text: str, amount: float, cu
     assert parsed_currency == currency
 
 
+# Verify that parse_amount_value accepts unambiguous number formats with dot, comma, space and no-break
+# space separators and returns the amount.
 @pytest.mark.unit
 @pytest.mark.parametrize(
     ("text", "amount"),
@@ -70,6 +74,8 @@ def test_parse_amount_value_accepts_precise_number_formats(text: str, amount: fl
     assert parse_amount_value(text) == pytest.approx(amount)
 
 
+# Verify that parse_amount_value returns None for ambiguous or invalid numbers (misplaced separators,
+# too many decimals, letters).
 @pytest.mark.unit
 @pytest.mark.parametrize(
     "text",
@@ -94,6 +100,8 @@ def test_parse_amount_value_rejects_ambiguous_or_invalid_numbers(text: str) -> N
     assert parse_amount_value(text) is None
 
 
+# Verify that parse_price returns an empty price when the text is not a price: no currency marker,
+# malformed numbers, a currency code instead of a symbol, or text with no amount.
 @pytest.mark.unit
 @pytest.mark.parametrize(
     "text",
@@ -120,6 +128,8 @@ def test_parse_price_returns_empty_when_format_is_not_a_price(text: str) -> None
     assert parse_price(text) == ("", None, "")
 
 
+# Verify that a bare number inside a sentence does not get a currency from the default: the price stays
+# empty.
 @pytest.mark.unit
 def test_parse_price_does_not_infer_missing_currency() -> None:
     price_text, price_value, currency = parse_price("The product costs 1299 today", default_currency="USD")
@@ -129,6 +139,7 @@ def test_parse_price_does_not_infer_missing_currency() -> None:
     assert currency == ""
 
 
+# Verify that a currency marked in the text ($) wins over the provider default currency (GBP).
 @pytest.mark.unit
 def test_parse_price_prefers_marked_html_currency_over_provider_default() -> None:
     price_text, price_value, currency = parse_price("5,58$", default_currency="GBP")
@@ -138,6 +149,8 @@ def test_parse_price_prefers_marked_html_currency_over_provider_default() -> Non
     assert currency == "USD"
 
 
+# Verify that a bare amount without a currency marker is a price only when allow_bare is set (for
+# structured fields), in which case the default currency is used.
 @pytest.mark.unit
 def test_parse_price_allows_bare_amount_only_for_structured_fields() -> None:
     assert parse_price("1299", default_currency="USD") == ("", None, "")
@@ -149,6 +162,8 @@ def test_parse_price_allows_bare_amount_only_for_structured_fields() -> None:
     assert currency == "USD"
 
 
+# Verify that a shop rating ("5.0 Рейтинг магазина") is not read as a ruble price even with RUB as the
+# default currency.
 @pytest.mark.unit
 def test_parse_price_rejects_rating_as_ruble_price() -> None:
     assert parse_price("Видеокарта RTX 5070 5.0 Рейтинг магазина", default_currency="RUB") == ("", None, "")

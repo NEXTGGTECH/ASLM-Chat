@@ -16,22 +16,30 @@ from types import ModuleType
 from typing import Any
 
 
+# Project root. The worker runs as a standalone script, so the root is put on sys.path to make
+# the project packages (Settings, ...) importable.
 BASE_DIR = Path(__file__).resolve().parent.parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
 from Settings.proxy_policy import apply_loopback_proxy_bypass
 
+# Names a tool server module may export, in lookup order: generic dispatcher functions, server
+# metadata dicts, per-tool handler maps and per-tool argument preparer maps.
 SERVER_DISPATCHER_NAMES = ("call_tool", "run_tool", "execute_tool", "execute")
 SERVER_METADATA_NAMES = ("MCP_SERVER", "SERVER")
 TOOL_HANDLER_NAMES = ("TOOL_HANDLERS", "TOOL_EXECUTORS")
 TOOL_PREPARER_NAMES = ("TOOL_PREPARERS", "TOOL_ARGUMENT_PREPARERS")
+
+# Seconds between heartbeat lines the persistent worker prints while a request is running.
 WORKER_HEARTBEAT_SECONDS = 5.0
 
 
+# Send structured realtime tool events over a dedicated local socket.
+# The connection is opened lazily on the first event. The emitter is disabled when the channel
+# config is missing or not loopback, and after the first send failure.
 class WorkerEventEmitter:
-    """Send structured realtime tool events over a dedicated local socket."""
-
+    # Read the host, port and token of the event channel from its config dict.
     def __init__(self, config: dict[str, Any] | None) -> None:
         config = config if isinstance(config, dict) else {}
         self.host = str(config.get("host") or "127.0.0.1")
@@ -41,6 +49,8 @@ class WorkerEventEmitter:
         self.lock = threading.Lock()
         self.disabled = not (self.host == "127.0.0.1" and self.port > 0 and self.token)
 
+    # Send one event as a token-authenticated JSON line. Any socket error disables the emitter
+    # so a broken channel never fails the tool call itself.
     def emit(self, event: dict[str, Any]) -> None:
         if self.disabled or not isinstance(event, dict):
             return
@@ -57,6 +67,7 @@ class WorkerEventEmitter:
                 self.close()
                 self.disabled = True
 
+    # Close the event socket if it is open.
     def close(self) -> None:
         connection = self.connection
         self.connection = None
@@ -67,6 +78,7 @@ class WorkerEventEmitter:
 
 # Run async tool handlers on one persistent background event loop.
 class AsyncCallableRunner:
+    # Create the runner without starting the loop thread.
     def __init__(self) -> None:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
@@ -121,6 +133,7 @@ class AsyncCallableRunner:
             thread.join(timeout=3)
 
 
+# Shared runner for all async tool handlers of this worker process.
 _ASYNC_CALLABLE_RUNNER = AsyncCallableRunner()
 
 
@@ -190,6 +203,7 @@ def _normalize_schema(schema: Any) -> dict[str, Any]:
 
 # Build normalized tool definitions from a module TOOLS export.
 def _server_tools(module: ModuleType, server_id: str) -> list[dict[str, Any]]:
+    # Read the TOOLS list, falling back to the legacy single TOOL dict.
     raw_tools = getattr(module, "TOOLS", None)
     if raw_tools is None:
         legacy_tool = getattr(module, "TOOL", None)
@@ -198,6 +212,8 @@ def _server_tools(module: ModuleType, server_id: str) -> list[dict[str, Any]]:
     if not isinstance(raw_tools, list) or not raw_tools:
         raise ValueError("MCP server module must expose a non-empty TOOLS list")
 
+    # Normalize each tool: slug id (duplicates and non-dict entries are skipped), alias prefixed
+    # with the server id, schema, and a flag when the tool has an argument preparer.
     tools: list[dict[str, Any]] = []
     preparers = _tool_preparers(module)
     seen_ids: set[str] = set()
@@ -242,6 +258,7 @@ def _tool_handlers(module: ModuleType) -> dict[str, Any]:
     }
 
 
+# Collect explicit per-tool argument preparer callables from the module, keyed by tool id slug.
 def _tool_preparers(module: ModuleType) -> dict[str, Any]:
     raw_preparers: Any = None
     for attr_name in TOOL_PREPARER_NAMES:
@@ -314,8 +331,9 @@ def describe(server_file: Path) -> dict[str, Any]:
     return metadata
 
 
+# Read explicitly exported, model-safe environment details without executing a tool.
+# Return an empty string when the module has no get_model_context or it returns a non-string.
 def model_context(server_file: Path) -> str:
-    """Read explicitly exported, model-safe environment details without executing a tool."""
     module = _load_module(server_file)
     provider = getattr(module, "get_model_context", None)
     result = _execute_callable(provider) if callable(provider) else ""
@@ -334,11 +352,14 @@ def supports(server_file: Path, payload: dict[str, Any]) -> bool:
     try:
         return bool(supports_fn(engine=engine, model_name=model_name))
     except TypeError:
+        # The module's supports() does not take these keyword names; retry positionally.
         return bool(supports_fn(engine, model_name))
 
 
 # Execute one tool call against a server module.
 def call(server_file: Path, payload: dict[str, Any]) -> Any:
+    # Read the request and, when the caller opened an event channel, expose it to the tool as
+    # context["event_callback"].
     module = _load_module(server_file)
     tool_id = _slugify(str(payload.get("tool_id") or ""))
     arguments = payload.get("arguments") if isinstance(payload.get("arguments"), dict) else {}
@@ -347,6 +368,7 @@ def call(server_file: Path, payload: dict[str, Any]) -> Any:
     if not event_emitter.disabled:
         context["event_callback"] = event_emitter.emit
 
+    # Prefer the handler registered for this tool; otherwise use the module's generic dispatcher.
     try:
         handlers = _tool_handlers(module)
         handler = handlers.get(tool_id)
@@ -365,9 +387,10 @@ def call(server_file: Path, payload: dict[str, Any]) -> Any:
         event_emitter.close()
 
 
+# Prepare one tool call without performing its external work. Return the preparer's result, or
+# the unchanged arguments when the tool has no preparer. Raise ValueError when a preparer
+# returns something other than an object.
 def prepare(server_file: Path, payload: dict[str, Any]) -> dict[str, Any]:
-    """Prepare one tool call without performing its external work."""
-
     module = _load_module(server_file)
     tool_id = _slugify(str(payload.get("tool_id") or ""))
     arguments = payload.get("arguments") if isinstance(payload.get("arguments"), dict) else {}
@@ -396,6 +419,7 @@ def _worker_heartbeat(output=sys.stdout) -> None:
 
 
 # Execute one worker request without printing the envelope.
+# Return (ok, result) where a failure carries "ExceptionType: message" as the result.
 def _execute_request(operation: str, server_file: Path, payload: dict[str, Any]) -> tuple[bool, Any]:
     try:
         if operation == "describe":
@@ -414,6 +438,10 @@ def _execute_request(operation: str, server_file: Path, payload: dict[str, Any])
 
 
 # Run a persistent newline-delimited JSON worker on stdin until EOF.
+# Each input line is {"operation": ..., "payload": {...}} and is answered by one output line
+# {"ok": ..., "result" | "error": ...}. While a request runs, a {"event": "heartbeat"} line is
+# printed every WORKER_HEARTBEAT_SECONDS, and tool stdout is redirected to stderr so the
+# protocol stream stays clean.
 def serve(server_file: Path) -> int:
     output = sys.stdout
     try:
@@ -422,6 +450,7 @@ def serve(server_file: Path) -> int:
             if not raw_line:
                 continue
 
+            # Parse the request line; a malformed request is answered with an error envelope.
             try:
                 request = json.loads(raw_line)
             except json.JSONDecodeError as exc:
@@ -451,11 +480,14 @@ def serve(server_file: Path) -> int:
                         daemon=True,
                     )
                     worker.start()
+
+                    # Wait for the request, printing a heartbeat on every wait timeout.
                     while not done.wait(WORKER_HEARTBEAT_SECONDS):
                         _worker_heartbeat(output)
                     ok = bool(outcome.get("ok"))
                     payload = outcome.get("payload")
 
+            # Print the response envelope for this request.
             key = "result" if ok else "error"
             print(json.dumps({"ok": ok, key: _to_jsonable(payload)}, ensure_ascii=False), file=output, flush=True)
     finally:
@@ -464,7 +496,10 @@ def serve(server_file: Path) -> int:
     return 0
 
 
-# CLI entry point for one-shot and persistent worker modes.
+# CLI entry point: tool_worker.py <operation> <server_file>.
+# The operation is one of describe, supports, model_context, prepare or call (one-shot: JSON
+# payload on stdin, one JSON envelope on stdout), or serve (persistent mode, see serve).
+# Tool output is redirected to stderr so stdout carries only the protocol envelope.
 def main() -> int:
     apply_loopback_proxy_bypass()
 
@@ -476,6 +511,7 @@ def main() -> int:
     if operation == "serve":
         return serve(server_file)
 
+    # One-shot mode: read the JSON payload from stdin; an invalid payload is treated as empty.
     try:
         payload = json.loads(sys.stdin.read() or "{}")
     except json.JSONDecodeError:
@@ -492,5 +528,6 @@ def main() -> int:
         return _print_response(False, f"{type(exc).__name__}: {exc}")
 
 
+# Run the worker; the exit code is 0 on success and 1 on a reported error.
 if __name__ == "__main__":
     raise SystemExit(main())

@@ -10,10 +10,14 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+# The mcp-sandbox directory, with the sandbox.json source of settings and the sandbox.env file that
+# is generated from it.
 SANDBOX_ROOT = Path(__file__).resolve().parents[2]
 SANDBOX_JSON_FILE = SANDBOX_ROOT / "sandbox.json"
 SANDBOX_ENV_FILE = SANDBOX_ROOT / "sandbox.env"
 
+# Whitelist of settings that may pass from sandbox.json into sandbox.env; the order here is the
+# order of lines in the generated file.
 SANDBOX_CONFIG_KEYS = (
     "SANDBOX_CONTAINER_NAME",
     "SANDBOX_IMAGE",
@@ -94,10 +98,12 @@ def _write_env_if_changed(path: Path, content: str) -> None:
         if path.read_text(encoding="utf-8-sig") == content:
             return
     except FileNotFoundError:
+        # No env file yet, so there is nothing to compare; write it below.
         pass
     except OSError as exc:
         logger.warning("Could not compare generated sandbox env %s: %s", path, exc)
 
+    # Write to a temporary sibling and swap it in, so readers never see a half-written file.
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = path.with_name(path.name + ".tmp")
     try:
@@ -107,11 +113,13 @@ def _write_env_if_changed(path: Path, content: str) -> None:
         try:
             temporary_path.unlink(missing_ok=True)
         except OSError:
+            # Best-effort cleanup of the temporary file; the original error is re-raised below.
             pass
         raise
 
 
-# Synchronize sandbox.env from sandbox.json.
+# Synchronize sandbox.env from sandbox.json: regenerate the env file when the JSON is valid, and
+# remove a stale env file when the JSON is missing or unusable.
 def sync_sandbox_env(
     json_path: Path = SANDBOX_JSON_FILE,
     env_path: Path = SANDBOX_ENV_FILE,

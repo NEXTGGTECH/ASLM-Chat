@@ -1,7 +1,5 @@
 # Copyright NEXTGGTECH. Elastic License 2.0.
 
-"""Offline coverage for model-facing web-search batching."""
-
 from __future__ import annotations
 
 import asyncio
@@ -21,6 +19,9 @@ from core.mcp_contract import (
 )
 
 
+# Verify that in legacy schema mode the query property accepts either a string or an array of at most
+# three strings (the largest vertical batch) and describes itself as a focused search query. These tests
+# run offline.
 def test_legacy_query_schema_advertises_largest_vertical_batch(monkeypatch):
     import core.config as config_module
 
@@ -40,6 +41,9 @@ def test_legacy_query_schema_advertises_largest_vertical_batch(monkeypatch):
     assert "focused search query" in query_schema["description"]
 
 
+# Verify that query coercion collapses whitespace, drops empty items, caps the batch at three queries,
+# accepts a JSON array string or a dict with a "query" key, and that the single-query form takes the
+# first item.
 def test_query_batch_coercion_caps_and_sanitizes_items():
     assert coerce_search_queries(["  first   query  ", "", "second", "third", "fourth"]) == [
         "first query",
@@ -51,6 +55,8 @@ def test_query_batch_coercion_caps_and_sanitizes_items():
     assert coerce_search_query(["alpha", "beta"]) == "alpha"
 
 
+# Verify that in legacy mode the preflight rejects a batch of four queries with an INVALID_SEARCH_PLAN
+# error instead of truncating it.
 def test_legacy_preflight_rejects_oversized_batch_instead_of_truncating(monkeypatch):
     import core.config as config_module
 
@@ -69,6 +75,8 @@ def test_legacy_preflight_rejects_oversized_batch_instead_of_truncating(monkeypa
     ]
 
 
+# Verify that in legacy mode the preflight accepts three queries for the shopping and academic verticals
+# and rejects four shopping queries with an error naming the vertical.
 def test_legacy_preflight_caps_every_vertical_at_three_queries(monkeypatch):
     import core.config as config_module
 
@@ -78,6 +86,7 @@ def test_legacy_preflight_caps_every_vertical_at_three_queries(monkeypatch):
     })()
     monkeypatch.setattr(config_module, "load_search_config", lambda: cfg)
 
+    # Prepare three queries for shopping and academic, and four for shopping.
     shopping = prepare_search_arguments({
         "query": [f"product {index}" for index in range(3)],
         "shopping": True,
@@ -91,6 +100,7 @@ def test_legacy_preflight_caps_every_vertical_at_three_queries(monkeypatch):
         "shopping": True,
     })
 
+    # The three-query batches are accepted, the four-query shopping batch is rejected.
     assert shopping["ok"] is True
     assert len(shopping["search_request"]["queries"]) == 3
     assert academic["ok"] is True
@@ -101,6 +111,8 @@ def test_legacy_preflight_caps_every_vertical_at_three_queries(monkeypatch):
     ]
 
 
+# Verify that both tool descriptions explain the inputs (query, three independent queries, site:,
+# read_page) without leaking research-planning rules.
 def test_tool_descriptions_explain_inputs_without_research_planning_rules():
     for description in (LEGACY_WEB_SEARCH_TOOL_DESCRIPTION, ADVANCED_WEB_SEARCH_TOOL_DESCRIPTION):
         normalized = " ".join(description.split())
@@ -112,6 +124,8 @@ def test_tool_descriptions_explain_inputs_without_research_planning_rules():
         assert "whitespace-separated words" not in normalized
 
 
+# Verify that advanced operators (filetype:, intitle:, inurl:, after:, before:) are recognized as
+# operators, and that their keys and dates do not pollute the scoring terms.
 def test_advanced_operators_are_recognized_without_polluting_scoring_terms():
     for query in (
         "report filetype:pdf",
@@ -129,16 +143,24 @@ def test_advanced_operators_are_recognized_without_polluting_scoring_terms():
     ]
 
 
+# Verify that a batch of two queries runs concurrently and the combined result keeps each source tagged
+# with its batch query, with unique citation ids that all appear in the merged model context.
 def test_batch_runs_concurrently_and_combines_citable_sources(monkeypatch):
+    # Arrange: a fake single search that tracks how many calls overlap and returns one source per query.
     active = 0
     max_active = 0
 
+    # Track the concurrency level and return a canned search result.
     async def fake_search(query: str, **kwargs):
         nonlocal active, max_active
+
+        # Track the overlap: leave the call open briefly so concurrent calls are counted.
         active += 1
         max_active = max(max_active, active)
         await asyncio.sleep(0.01)
         active -= 1
+
+        # Return one citable source whose id repeats across queries ("cold-1").
         return {
             "query": query,
             "search_id": f"srch_{query}",
@@ -161,10 +183,13 @@ def test_batch_runs_concurrently_and_combines_citable_sources(monkeypatch):
         }
 
     monkeypatch.setattr(search_module, "run_web_search", fake_search)
+
+    # Act.
     result = asyncio.run(search_module.run_web_search_batch(
         ["alpha query", "beta query"], effort="medium"
     ))
 
+    # Assert: both searches overlapped and the batch result is combined and citable.
     assert max_active == 2
     assert result["batch"] is True
     assert result["queries"] == ["alpha query", "beta query"]

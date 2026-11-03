@@ -1,14 +1,5 @@
 # Copyright NEXTGGTECH. Elastic License 2.0.
 
-# Pass-through custom-domain layer with a single API (see base.py). read_page asks
-# match(url) for a handler and calls handler.read(url, ctx). Order matters only in that
-# the first matching handler wins; the host tests below do not overlap.
-#
-# Domains needing only a forced fetch method (twitch/flashscore/sofascore → browser,
-# cursor → nextjs_rsc, citilink → browser) are NOT handlers — read_page's generic
-# pipeline picks that up from core.profiles.known_domains. Only domains with bespoke
-# fetching (terminal APIs) or URL-variant logic (dns-shop) get a handler here.
-
 from custom_domains.base import (
     SCOPE_BOTH,
     SCOPE_READ_PAGE,
@@ -31,6 +22,13 @@ from custom_domains.wikipedia import HANDLER as _wikipedia
 from custom_domains.x import HANDLER as _x
 from custom_domains.youtube import HANDLER as _youtube
 
+# Registry of the pass-through custom-domain handlers (single API, see base.py): read_page asks
+# match(url) for a handler and calls handler.read(url, ctx). The first matching handler wins; the
+# host tests of the handlers below do not overlap.
+# Domains needing only a forced fetch method (twitch/flashscore/sofascore -> browser,
+# cursor -> nextjs_rsc, citilink -> browser) are NOT handlers: read_page's generic pipeline
+# picks that up from core.profiles.known_domains. Only domains with bespoke fetching
+# (terminal APIs) or URL-variant logic (dns-shop) get a handler here.
 HANDLERS: list[DomainHandler] = [
     _arxiv,
     _github,
@@ -54,11 +52,12 @@ def match(url: str) -> DomainHandler | None:
             if handler.matches(url):
                 return handler
         except Exception:
+            # A faulty matches() must not break dispatch; skip to the next handler.
             continue
     return None
 
 
-# True when the URL's handler is read_page-only, so web_search must keep it snippet-only
+# Return True when the URL's handler is read_page-only, so web_search must keep it snippet-only
 # rather than parse it inline. Domains without a handler (or scope=both) are not affected.
 def is_read_page_only(url: str) -> bool:
     handler = match(url)

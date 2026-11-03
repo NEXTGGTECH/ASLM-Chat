@@ -13,6 +13,8 @@ from Services import venv_manager
 pytestmark = [pytest.mark.unit]
 
 
+# Redirect the requirements file into a temporary directory and return its path (the file is not
+# created).
 @pytest.fixture
 def fake_requirements(tmp_path, monkeypatch):
     requirements = tmp_path / "venv_requirements.json"
@@ -20,6 +22,7 @@ def fake_requirements(tmp_path, monkeypatch):
     return requirements
 
 
+# Redirect the module base directory into a temporary directory and return it.
 @pytest.fixture
 def isolated_base(tmp_path, monkeypatch):
     base = tmp_path / "module"
@@ -33,23 +36,25 @@ def _write_requirements(path: Path, venvs: list[dict]) -> None:
     path.write_text(json.dumps({"fileVersion": 1, "venvs": venvs}), encoding="utf-8")
 
 
-# Configuration loading.
+# Configuration loading
 
-
-# A missing requirements file yields an empty payload.
+# Verify that a missing requirements file yields an empty payload.
 def test_load_config_returns_empty_payload_for_missing_file(fake_requirements):
     assert venv_manager.load_config() == {"fileVersion": 1, "venvs": []}
 
 
-# A corrupt requirements file degrades to an empty payload.
+# Verify that a corrupt requirements file yields an empty payload instead of raising.
 def test_load_config_degrades_on_corrupt_file(fake_requirements):
     fake_requirements.write_text("{broken", encoding="utf-8")
 
     assert venv_manager.load_config() == {"fileVersion": 1, "venvs": []}
 
 
-# Definitions normalize: blank ids drop, package lists strip and keep values.
+# Verify that definitions are normalized: entries with a blank or missing id and non-dict entries are
+# dropped, package lists keep their values as strings without empty items and the tool lists are
+# cleaned.
 def test_iter_venv_configs_normalizes_definitions(fake_requirements):
+    # Arrange: one valid definition with messy values plus three invalid entries.
     _write_requirements(
         fake_requirements,
         [
@@ -67,6 +72,7 @@ def test_iter_venv_configs_normalizes_definitions(fake_requirements):
         ],
     )
 
+    # Act and assert: only the valid definition survives, in normalized form.
     configs = venv_manager.iter_venv_configs()
 
     assert len(configs) == 1
@@ -78,7 +84,7 @@ def test_iter_venv_configs_normalizes_definitions(fake_requirements):
     assert config["tool"] == ""
 
 
-# Configs resolve by their id.
+# Verify that a venv config is resolved by its id and an unknown id returns None.
 def test_get_venv_config_resolves_by_id(fake_requirements):
     _write_requirements(fake_requirements, [{"id": "server", "path": "Data/venvs/server"}])
 
@@ -86,7 +92,8 @@ def test_get_venv_config_resolves_by_id(fake_requirements):
     assert venv_manager.get_venv_config("missing") is None
 
 
-# Tool directories map to their owning venv id.
+# Verify that a tool directory maps to the id of the venv that lists it (single "tool" or "tools" list)
+# and an unknown tool maps to an empty id.
 def test_get_tool_venv_id_maps_tool_directories(fake_requirements):
     _write_requirements(
         fake_requirements,
@@ -101,17 +108,16 @@ def test_get_tool_venv_id_maps_tool_directories(fake_requirements):
     assert venv_manager.get_tool_venv_id("unknown-tool") == ""
 
 
-# Path resolution.
+# Path resolution
 
-
-# Relative paths resolve against the module root.
+# Verify that a relative venv path resolves against the module root.
 def test_get_venv_path_joins_module_root(isolated_base, fake_requirements):
     _write_requirements(fake_requirements, [{"id": "server", "path": "Data/venvs/server"}])
 
     assert venv_manager.get_venv_path("server") == isolated_base / "Data" / "venvs" / "server"
 
 
-# Absolute configured paths stay absolute.
+# Verify that an absolute configured venv path is returned unchanged.
 def test_get_venv_path_accepts_absolute_paths(isolated_base, fake_requirements):
     absolute = isolated_base.parent / "elsewhere"
     _write_requirements(fake_requirements, [{"id": "abs", "path": str(absolute)}])
@@ -119,13 +125,14 @@ def test_get_venv_path_accepts_absolute_paths(isolated_base, fake_requirements):
     assert venv_manager.get_venv_path("abs") == absolute
 
 
-# Unknown venv ids fail with a clear error.
+# Verify that resolving the path of an unknown venv id raises a KeyError naming the venv.
 def test_get_venv_path_raises_for_unknown_venv(fake_requirements):
     with pytest.raises(KeyError, match="Unknown ASLM-Chat venv"):
         venv_manager.get_venv_path("missing")
 
 
-# The venv Python executable points inside the venv scripts directory.
+# Verify that the venv Python executable lives in the platform's scripts directory (Scripts on
+# Windows, bin elsewhere).
 def test_get_venv_python_points_inside_venv(isolated_base, fake_requirements):
     _write_requirements(fake_requirements, [{"id": "server", "path": "Data/venvs/server"}])
 
@@ -134,14 +141,15 @@ def test_get_venv_python_points_inside_venv(isolated_base, fake_requirements):
     assert python_path.parent.name == ("Scripts" if venv_manager.os.name == "nt" else "bin")
 
 
-# A mapped tool without an existing venv reports no Python.
+# Verify that a tool mapped to a venv whose interpreter does not exist reports no Python.
 def test_get_tool_python_returns_none_when_venv_missing(isolated_base, fake_requirements):
     _write_requirements(fake_requirements, [{"id": "ghost", "path": "Data/venvs/ghost"}])
 
     assert venv_manager.get_tool_python("ghost") is None
 
 
-# The subprocess environment is a copy of the host environment.
+# Verify that the subprocess environment is a copy of the host environment (plus the Linux-specific
+# browser cache and scratch variables on Linux), not the host mapping itself.
 def test_subprocess_environment_copies_host_environment(isolated_base):
     environment = venv_manager.get_subprocess_environment(Path("python"))
 
@@ -163,10 +171,10 @@ def test_subprocess_environment_copies_host_environment(isolated_base):
     assert environment == expected
 
 
-# Package signatures.
+# Package signatures
 
-
-# The signature is order-sensitive and covers the no-deps list.
+# Verify that the package signature is stable for equal input and changes when the package order or
+# the no-deps list changes.
 def test_packages_signature_is_stable_and_sensitive():
     base = venv_manager._packages_signature(["a==1", "b==2"])
 
@@ -175,10 +183,10 @@ def test_packages_signature_is_stable_and_sensitive():
     assert base != venv_manager._packages_signature(["a==1", "b==2"], ["c==3"])
 
 
-# Install state.
+# Install state
 
-
-# The install state round-trips and tolerates a corrupt file.
+# Verify that the install state is empty at first, round-trips the package count and hash after a
+# write, and reads as empty again when the state file is corrupt.
 def test_state_roundtrip_and_corruption(isolated_base, fake_requirements):
     _write_requirements(fake_requirements, [{"id": "server", "path": "Data/venvs/server"}])
     venv_path = venv_manager.get_venv_path("server")
@@ -195,15 +203,19 @@ def test_state_roundtrip_and_corruption(isolated_base, fake_requirements):
     assert venv_manager._read_state(venv_path) == {}
 
 
-# ensure_venv flow.
-
+# Ensure venv flow
 
 # Fake subprocess boundary: record commands and produce venv interpreters.
 class _FakeRunner:
+    # Start with no recorded commands and no commands that fail.
     def __init__(self):
+        # Every command the code under test ran, in order, and the set of last arguments whose
+        # commands report failure.
         self.commands: list[list[str]] = []
         self.fail_commands: set[str] = set()
 
+    # Record the command and report success, unless it is configured to fail. A venv creation command
+    # also creates the interpreter file.
     def __call__(self, command, **kwargs):
         self.commands.append(list(command))
         if command and command[-1] in self.fail_commands:
@@ -228,6 +240,7 @@ class _FakeRunner:
         return [cmd for cmd in self.commands if cmd[1:3] == ["-m", "venv"]]
 
 
+# Replace the venv manager's subprocess runner with a recording fake and return it.
 @pytest.fixture
 def fake_runner(monkeypatch):
     runner = _FakeRunner()
@@ -235,7 +248,8 @@ def fake_runner(monkeypatch):
     return runner
 
 
-# Configure one venv on disk, optionally creating its interpreter.
+# Configure one venv in the temporary module directory and the requirements file, optionally creating
+# its interpreter; return the venv path and the interpreter path.
 def _configure_venv(fake_requirements, isolated_base, venv_id="server", packages=("a==1",), create_python=True):
     venv_path = isolated_base / "Data" / "venvs" / venv_id
     python_dir = venv_path / ("Scripts" if venv_manager.os.name == "nt" else "bin")
@@ -250,7 +264,7 @@ def _configure_venv(fake_requirements, isolated_base, venv_id="server", packages
     return venv_path, python_file
 
 
-# A missing venv is created, packages installed, and state persisted.
+# Verify that ensure_venv creates a missing venv, installs its packages and persists the install state.
 def test_ensure_venv_creates_installs_and_persists_state(isolated_base, fake_requirements, fake_runner):
     _configure_venv(fake_requirements, isolated_base, create_python=False)
 
@@ -263,7 +277,8 @@ def test_ensure_venv_creates_installs_and_persists_state(isolated_base, fake_req
     assert state["packagesHash"] == venv_manager._packages_signature(["a==1"])
 
 
-# A current install state skips both creation and installation.
+# Verify that ensure_venv skips both venv creation and package installation when the stored install
+# state matches the configured packages.
 def test_ensure_venv_skips_reinstall_when_state_matches(isolated_base, fake_requirements, fake_runner):
     venv_path, _python = _configure_venv(fake_requirements, isolated_base)
     venv_manager._write_state(venv_path, ["a==1"])
@@ -274,7 +289,8 @@ def test_ensure_venv_skips_reinstall_when_state_matches(isolated_base, fake_requ
     assert fake_runner.venv_create_commands() == []
 
 
-# Changed packages trigger a reinstall with the new list.
+# Verify that ensure_venv reinstalls with the new package list when the configured packages differ
+# from the stored install state.
 def test_ensure_venv_reinstalls_when_packages_change(isolated_base, fake_requirements, fake_runner):
     venv_path, _python = _configure_venv(fake_requirements, isolated_base, packages=("a==1",))
     venv_manager._write_state(venv_path, ["a==1"])
@@ -290,7 +306,8 @@ def test_ensure_venv_reinstalls_when_packages_change(isolated_base, fake_require
     assert pip_commands and pip_commands[0][-2:] == ["a==1", "b==2"]
 
 
-# The no-deps list installs as a separate pip invocation.
+# Verify that the no-deps package list is installed by a separate pip invocation with --no-deps after
+# the regular install.
 def test_ensure_venv_installs_no_deps_list_separately(isolated_base, fake_requirements, fake_runner):
     venv_path, _python = _configure_venv(fake_requirements, isolated_base)
     _write_requirements(
@@ -313,7 +330,7 @@ def test_ensure_venv_installs_no_deps_list_separately(isolated_base, fake_requir
     assert "--no-deps" in pip_commands[1]
 
 
-# A failed install leaves no state behind.
+# Verify that ensure_venv reports failure when pip install fails and leaves no install state behind.
 def test_ensure_venv_fails_when_pip_install_fails(isolated_base, fake_requirements, fake_runner):
     _configure_venv(fake_requirements, isolated_base)
     fake_runner.fail_commands.add("a==1")
@@ -322,7 +339,7 @@ def test_ensure_venv_fails_when_pip_install_fails(isolated_base, fake_requiremen
     assert venv_manager._read_state(isolated_base / "Data" / "venvs" / "server") == {}
 
 
-# Unknown venv ids fail without running anything.
+# Verify that ensure_venv reports failure for an unknown venv id without running any command.
 def test_ensure_venv_fails_for_unknown_venv(fake_runner, fake_requirements):
     _write_requirements(fake_requirements, [])
 
@@ -330,7 +347,8 @@ def test_ensure_venv_fails_for_unknown_venv(fake_runner, fake_requirements):
     assert fake_runner.commands == []
 
 
-# run_venv_code ensures the venv and executes the snippet.
+# Verify that run_venv_code ensures the venv (already up to date here) and then runs the code snippet
+# through the venv interpreter.
 def test_run_venv_code_ensures_then_executes(isolated_base, fake_requirements, fake_runner):
     _configure_venv(fake_requirements, isolated_base)
     venv_manager._write_state(isolated_base / "Data" / "venvs" / "server", ["a==1"])

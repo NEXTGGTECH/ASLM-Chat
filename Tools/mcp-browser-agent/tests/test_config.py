@@ -7,8 +7,9 @@ import json
 import config
 
 
-# Load browser-agent values from the generated JSON document.
+# Verify that every browser-agent setting is read from a generated JSON config file.
 def test_load_browser_config_reads_generated_values(tmp_path) -> None:
+    # Arrange: a config file that sets every supported key to a non-default value.
     path = tmp_path / "config.json"
     path.write_text(
         json.dumps(
@@ -25,8 +26,10 @@ def test_load_browser_config_reads_generated_values(tmp_path) -> None:
         encoding="utf-8",
     )
 
+    # Act: load the file.
     loaded = config._load_browser_config(path)
 
+    # Assert: each value comes from the file, not from the defaults.
     assert loaded["browser_width"] == 1440
     assert loaded["browser_height"] == 900
     assert loaded["browser_headless"] is True
@@ -36,7 +39,7 @@ def test_load_browser_config_reads_generated_values(tmp_path) -> None:
     assert loaded["auto_text_preview_length"] == 2400
 
 
-# Preserve built-in defaults for missing generated configuration fields.
+# Verify that settings missing from the config file keep their built-in defaults while present ones win.
 def test_load_browser_config_merges_defaults(tmp_path) -> None:
     path = tmp_path / "config.json"
     path.write_text(json.dumps({"browser_width": 1600}), encoding="utf-8")
@@ -48,7 +51,7 @@ def test_load_browser_config_merges_defaults(tmp_path) -> None:
     assert loaded["max_elements"] == config.DEFAULT_CONFIG["max_elements"]
 
 
-# Reject non-positive and malformed numeric values before runtime constants are created.
+# Verify that a zero or non-numeric value falls back to the default (1280 for browser_width).
 def test_positive_int_uses_default_for_invalid_values() -> None:
     assert config._positive_int({"browser_width": 0}, "browser_width") == 1280
     assert config._positive_int({"browser_width": "bad"}, "browser_width") == 1280

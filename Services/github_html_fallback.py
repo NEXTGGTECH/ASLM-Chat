@@ -7,6 +7,7 @@ from typing import Any
 from urllib.parse import urlencode, urljoin, urlparse
 
 
+# Map from GitHub MCP search tool name to the "type" value of the public github.com/search page.
 GITHUB_SEARCH_TYPE_BY_TOOL = {
     "search_code": "code",
     "search_commits": "commits",
@@ -16,11 +17,15 @@ GITHUB_SEARCH_TYPE_BY_TOOL = {
     "search_users": "users",
 }
 
+# Lowercase phrases in a GitHub MCP result that identify an API rate-limit failure.
 _RATE_LIMIT_MARKERS = (
     "api rate limit exceeded",
     "403 rate limit exceeded",
     "secondary rate limit",
 )
+
+# First path segments of github.com site pages, which are never an owner, so a link to them is
+# not a user or repository search result.
 _RESERVED_SINGLE_SEGMENTS = {
     "about", "account", "apps", "collections", "contact", "customer-stories",
     "enterprise", "events", "features", "issues", "login", "marketplace", "mcp",
@@ -30,15 +35,16 @@ _RESERVED_SINGLE_SEGMENTS = {
 }
 
 
+# Return whether a GitHub MCP result represents an API rate-limit failure.
 def is_github_rate_limit_result(value: Any) -> bool:
-    """Return whether a GitHub MCP result represents an API rate-limit failure."""
-
     text = str(value or "").lower()
     return any(marker in text for marker in _RATE_LIMIT_MARKERS) or (
         "rate limit" in text and "docs.github.com/rest" in text
     )
 
 
+# Build the search query string from the tool arguments, scoping it to owner/repo when given and
+# adding the is:issue / is:pr qualifier the issue and pull request tools imply.
 def _search_query(tool_name: str, arguments: dict[str, Any]) -> str:
     query = re.sub(r"\s+", " ", str(arguments.get("query") or "")).strip()
     owner = re.sub(r"\s+", "", str(arguments.get("owner") or "")).strip()
@@ -52,9 +58,9 @@ def _search_query(tool_name: str, arguments: dict[str, Any]) -> str:
     return query
 
 
+# Build the public github.com/search URL corresponding to one MCP search call.
+# Return an empty string when the tool has no HTML equivalent or the query is empty.
 def build_github_html_search_url(tool_name: str, arguments: dict[str, Any]) -> str:
-    """Build the public github.com/search URL corresponding to one MCP search call."""
-
     search_type = GITHUB_SEARCH_TYPE_BY_TOOL.get(str(tool_name or ""))
     if not search_type:
         return ""
@@ -67,6 +73,7 @@ def build_github_html_search_url(tool_name: str, arguments: dict[str, Any]) -> s
         if int(page or 1) > 1:
             params["p"] = int(page)
     except (TypeError, ValueError):
+        # A malformed page number is ignored, which leaves the first page.
         pass
     sort = str(arguments.get("sort") or "").strip()
     order = str(arguments.get("order") or "").strip().lower()
@@ -77,6 +84,8 @@ def build_github_html_search_url(tool_name: str, arguments: dict[str, Any]) -> s
     return "https://github.com/search?" + urlencode(params)
 
 
+# Return whether a link points to a result of the given search type, judged by the shape of its
+# github.com path (owner/repo, /commit/, /blob/, /issues/N or /pull/N).
 def _candidate_href(href: str, search_type: str) -> bool:
     parsed = urlparse(urljoin("https://github.com", str(href or "")))
     if parsed.netloc.lower() not in {"github.com", "www.github.com"}:
@@ -97,16 +106,17 @@ def _candidate_href(href: str, search_type: str) -> bool:
     return False
 
 
+# Extract compact result links and snippets from a GitHub HTML search page.
+# Return at most limit results (clamped to 1..20) as dicts with title, url and snippet.
 def parse_github_html_search(
     html: str,
     *,
     search_type: str,
     limit: int = 10,
 ) -> list[dict[str, str]]:
-    """Extract compact result links and snippets from a GitHub HTML search page."""
-
     from bs4 import BeautifulSoup
 
+    # Locate the results list and the per-result containers (class prefix of the page's CSS module).
     soup = BeautifulSoup(str(html or ""), "html.parser")
     root = soup.select_one('[data-testid="results-list"]') or soup
     containers = []
@@ -115,6 +125,8 @@ def parse_github_html_search(
         if any(value.startswith("Result-module__Result__") for value in classes):
             containers.append(node)
 
+    # Take the first matching link of each container (or of the whole page when no container was
+    # found), skip duplicates, and strip the repeated title from the snippet.
     results: list[dict[str, str]] = []
     seen: set[str] = set()
     search_nodes = containers or [root]
@@ -143,20 +155,23 @@ def parse_github_html_search(
     return results
 
 
+# Execute a rate-limit fallback through GitHub's public HTML search page.
+# Return a Markdown-style result text, a GITHUB_HTML_FALLBACK_NO_RESULTS message, or an empty
+# string when the tool has no HTML equivalent.
 def search_github_html(
     tool_name: str,
     arguments: dict[str, Any],
     *,
     timeout: float = 20.0,
 ) -> str:
-    """Execute a rate-limit fallback through GitHub's public HTML search page."""
-
     import httpx
 
     search_type = GITHUB_SEARCH_TYPE_BY_TOOL.get(str(tool_name or ""))
     url = build_github_html_search_url(tool_name, arguments)
     if not search_type or not url:
         return ""
+
+    # Download the public search page.
     response = httpx.get(
         url,
         headers={
@@ -170,6 +185,8 @@ def search_github_html(
         timeout=max(3.0, float(timeout)),
     )
     response.raise_for_status()
+
+    # Parse the results, honoring the perPage argument as the result limit.
     try:
         requested_limit = int(arguments.get("perPage") or 10)
     except (TypeError, ValueError):
@@ -180,6 +197,7 @@ def search_github_html(
         limit=requested_limit,
     )
     if not results:
+        # Public code search needs a signed-in session, so explain that instead of a bare "no results".
         page_text = response.text.lower()
         if search_type == "code" and ("sign in" in page_text or "code search" in page_text):
             return (
@@ -188,6 +206,7 @@ def search_github_html(
             )
         return f"GITHUB_HTML_FALLBACK_NO_RESULTS: no public results parsed. Search URL: {url}"
 
+    # Format the results as a numbered Markdown list under a fallback notice.
     lines = [
         "GITHUB_API_RATE_LIMIT_FALLBACK: GitHub REST API was rate-limited; public HTML search succeeded.",
         f"Search URL: {url}",
@@ -198,4 +217,3 @@ def search_github_html(
         if result["snippet"]:
             lines.append(f"   {result['snippet']}")
     return "\n".join(lines)
-

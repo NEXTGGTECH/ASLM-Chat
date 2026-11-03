@@ -1,10 +1,5 @@
 # Copyright NEXTGGTECH. Elastic License 2.0.
 
-# Ported from the legacy adapters/mcp/search_io_logger.py: appends each full
-# search / read_page tool IO event to a single readable JSON array, so the exact
-# request and response the model saw can be inspected after the fact. Diagnostics
-# only — it must never break the tool call itself.
-
 from __future__ import annotations
 
 import json
@@ -13,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+# Lock that serializes the read-modify-write of the log file, and the path of the JSON array file.
 _LOG_LOCK = threading.Lock()
 _LOG_PATH = Path(__file__).resolve().parents[1] / "logs" / "model_search_io.json"
 
@@ -23,6 +19,7 @@ def _jsonable(value: Any) -> Any:
         json.dumps(value, ensure_ascii=False, default=str)
         return value
     except Exception:
+        # Not serializable even with default=str, so log its repr instead.
         return repr(value)
 
 
@@ -41,8 +38,11 @@ def _without_duplicate_preview(value: Any) -> Any:
     return cleaned
 
 
-# Append one full search/read-page IO event to a readable JSON array.
+# Append one full search / read_page tool IO event (with a UTC timestamp) to a single readable JSON
+# array, so the exact request and response the model saw can be inspected after the fact. This is
+# diagnostics only: any failure is swallowed so it can never break the tool call itself.
 def write_search_io_event(event: dict[str, Any]) -> None:
+    # Stamp the event and drop previews that duplicate the snippet.
     record = {
         "ts": datetime.now(timezone.utc).isoformat(),
         **dict(event or {}),
@@ -51,6 +51,7 @@ def write_search_io_event(event: dict[str, Any]) -> None:
     try:
         _LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
         with _LOG_LOCK:
+            # Load the existing array; a missing, empty or corrupt file starts a fresh one.
             entries: list[Any] = []
             if _LOG_PATH.exists():
                 try:
@@ -58,7 +59,10 @@ def write_search_io_event(event: dict[str, Any]) -> None:
                     if isinstance(loaded, list):
                         entries = loaded
                 except Exception:
+                    # A corrupt log file is replaced rather than blocking new events.
                     entries = []
+
+            # Append the new event and rewrite the whole file.
             entries.append(_jsonable(record))
             _LOG_PATH.write_text(
                 json.dumps(entries, ensure_ascii=False, default=str, indent=2),

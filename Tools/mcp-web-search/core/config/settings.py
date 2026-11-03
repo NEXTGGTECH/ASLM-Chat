@@ -12,6 +12,7 @@ from typing import Optional
 
 logger = logging.getLogger("config.search")
 
+# JSON file the settings are loaded from, next to this module.
 _CONFIG_PATH = Path(__file__).parent / "search_config.json"
 
 # Warm-browser daemon default port. ASLM assigns one in its port range and passes it via
@@ -20,6 +21,8 @@ _CONFIG_PATH = Path(__file__).parent / "search_config.json"
 _DEFAULT_DAEMON_PORT = 20010
 
 
+# Return the warm-browser daemon URL on localhost, using the port from ASLM_BROWSER_DAEMON_PORT
+# when it is a valid port number and the default port otherwise.
 def _default_daemon_url() -> str:
     raw = (os.environ.get("ASLM_BROWSER_DAEMON_PORT") or "").strip()
     try:
@@ -31,21 +34,28 @@ def _default_daemon_url() -> str:
     return f"http://127.0.0.1:{port}"
 
 
-# Typed config dataclasses (loaded from search_config.json).
+# Config sections
+
+# Search limits and budgets (the "search" section of search_config.json). The streaming pipeline
+# hardcodes the per-effort budgets in EFFORT_PROFILES; only the fields below are still read (the
+# legacy DDGS/preview/quality-worker knobs such as ddgs_*, preview_fetch_*, quality_ddgs_*,
+# routing_profile and auto_scrape_preview no longer exist).
+# tls_verify: set False only behind corporate MITM proxies. batch_query_limit: cap of a read_page
+# multi-URL batch (mcp-server). preview_max_chars: chars per source in model_context.
+# total_context_budget: max chars of the whole search output (0 = no limit).
 @dataclass
 class SearchSection:
-    # NOTE: the new streaming pipeline hardcodes per-effort budgets in EFFORT_PROFILES;
-    # only the fields below are still read. The legacy DDGS/preview/quality-worker knobs
-    # (ddgs_*, preview_fetch_*, quality_ddgs_*, routing_profile, auto_scrape_preview, …)
-    # were removed 2026-06-20 — they had zero readers after the rewrite.
-    tls_verify: bool = True        # set False only behind corporate MITM proxies
+    tls_verify: bool = True
     max_results: int = 10
-    batch_query_limit: int = 10    # read_page multi-URL batch cap (mcp-server)
+    batch_query_limit: int = 10
     prefetch_fetch_timeout: float = 8.0
-    preview_max_chars: int = 4_000     # per-source chars in model_context
-    total_context_budget: int = 40_000  # max chars in total search output (0 = no limit)
+    preview_max_chars: int = 4_000
+    total_context_budget: int = 40_000
 
 
+# Page extraction limits for read_page: fetch timeout in seconds, the character cap of a page, the
+# minimum text length below which an extraction counts as weak, and the BM25 compression of long
+# pages (it applies above the threshold and shrinks toward the target, both in chars).
 @dataclass
 class ExtractionSection:
     timeout_seconds: float = 25.0
@@ -56,34 +66,47 @@ class ExtractionSection:
     read_page_compress_target_chars: int = 10_000
 
 
+# Cache and de-duplication windows, all in seconds. search_ttl_seconds (6 h) is the flat TTL of the
+# query-results cache and search_negative_ttl_seconds (5 min) that of empty or failed result sets.
+# An identical query within repeat_block_window_seconds is hard-blocked, and sources already served
+# to the model within seen_source_window_seconds are dropped. prefetch_max_urls is how many of the
+# top uncached result URLs are warmed per search (0 = off).
 @dataclass
 class CacheSection:
-    search_ttl_seconds: int = 21_600        # 6 h — flat TTL for the query-results cache
-    search_negative_ttl_seconds: int = 300  # 5 min — empty/failed result sets
+    search_ttl_seconds: int = 21_600
+    search_negative_ttl_seconds: int = 300
     page_ttl_seconds: int = 86_400
-    repeat_block_window_seconds: int = 30   # identical query within this → hard block
-    seen_source_window_seconds: int = 30    # drop sources served to the model within this
-    prefetch_max_urls: int = 4              # top uncached result URLs warmed per search (0 = off)
+    repeat_block_window_seconds: int = 30
+    seen_source_window_seconds: int = 30
+    prefetch_max_urls: int = 4
 
 
-# Year tokens in queries: timelimit (default), strip, or none — see year_hint_* fields.
+# Query schema and year-token handling. year_hint_mode says what to do with year tokens in queries:
+# timelimit (default), strip, or none. The year_hint_* fields map the year to a time limit:
+# the current year gives "m" (last month), the previous year "y" (last year), and an older year
+# None (no restriction).
 @dataclass
 class QuerySection:
-    schema_mode: str = "advanced"  # advanced (default) | legacy
+    # advanced (default) | legacy.
+    schema_mode: str = "advanced"
     year_hint_mode: str = "timelimit"
-    year_hint_current: Optional[str] = "m"  # year == this year  → last month
-    year_hint_prev: Optional[str] = "y"     # year == last year  → last year
-    year_hint_older: Optional[str] = None  # year < last year  → no restriction
+    year_hint_current: Optional[str] = "m"
+    year_hint_prev: Optional[str] = "y"
+    year_hint_older: Optional[str] = None
 
 
-# Warm-browser layer (cloakbrowser daemon). browser_fallback controls where the
-# browser is allowed as a fallback; the backend is always the warm chromium daemon.
+# Warm-browser layer (cloakbrowser daemon); the backend is always the warm chromium daemon.
+# browser_fallback controls where the browser is allowed as a fallback: off | page (read_page only)
+# | full (also for blocked SERP engines).
 @dataclass
 class BrowserSection:
-    browser_fallback: str = "page"      # off | page (read_page only) | full (+ blocked SERP engines)
+    browser_fallback: str = "page"
     daemon_url: str = field(default_factory=_default_daemon_url)
-    engine: str = "chromium"            # warm backend is chromium-only by design
-    autostart_daemon: bool = True       # spawn the daemon lazily on the first tool call
+
+    # The warm backend is chromium-only by design; the daemon is spawned lazily on the first tool call.
+    engine: str = "chromium"
+    autostart_daemon: bool = True
+
     # Daemon self-shuts-down after this many idle seconds (no fetch); 0 = eternal (run
     # until the task is killed). The daemon now OUTLIVES the tool-call process that spawned
     # it (the client no longer kills it on exit), so it stays warm across calls and this
@@ -93,28 +116,37 @@ class BrowserSection:
     headless: bool = True
     humanize: bool = False
     proxy: str = ""
-    nav_timeout: float = 30.0           # per-page navigation timeout (seconds)
-    wait: float = 3.0                   # post-load text-settle wait (seconds)
-    fetch_timeout: float = 45.0         # client-side ceiling for one /fetch round-trip
-    # Recycle thresholds (passed to the daemon; enforced daemon-side).
+
+    # Timeouts in seconds: per-page navigation, the post-load text-settle wait, and the
+    # client-side ceiling for one /fetch round-trip.
+    nav_timeout: float = 30.0
+    wait: float = 3.0
+    fetch_timeout: float = 45.0
+
+    # Recycle thresholds (passed to the daemon; enforced daemon-side). max_rss_mb is the RSS of the
+    # browser process tree that triggers a checkpoint and respawn; checkpoint_interval is the idle
+    # storageState checkpoint cadence in seconds.
     max_requests: int = 40
     max_age_sec: float = 900.0
-    max_rss_mb: int = 2048              # RSS of the browser process tree → checkpoint + respawn
-    checkpoint_interval: float = 30.0   # idle storageState checkpoint cadence (seconds)
+    max_rss_mb: int = 2048
+    checkpoint_interval: float = 30.0
 
 
 # Tor/onion access — the most optional thing in the search. OFF by default and zero-install:
 # the tool never bundles, installs, or spawns tor. When enabled it REUSES a tor that is already
 # running — a system daemon on 9050, an open Tor Browser on 9150, or an explicit socks_url. No
 # running tor → the feature simply goes no-op, never an error.
+# enabled is the master switch (off → onion paths are no-op); socks_url is an explicit override,
+# e.g. socks5h://127.0.0.1:9050; fetch_timeout is the per-request ceiling in seconds (Tor is slow
+# and circuits add latency).
+# The onion allowlist is static and hand-vetted (the seed registry) — there is no runtime
+# discovery or persistence. (The old anchored auto-expansion + onion_registry.db store were
+# removed as more risk than value while the static link-search layer is still unfinished.)
 @dataclass
 class TorSection:
-    enabled: bool = False               # master switch; off → onion paths are no-op
-    socks_url: str = ""                 # explicit override, e.g. socks5h://127.0.0.1:9050
-    fetch_timeout: float = 60.0         # per-request ceiling (Tor is slow; circuits add latency)
-    # The onion allowlist is static and hand-vetted (the seed registry) — there is no runtime
-    # discovery or persistence. (The old anchored auto-expansion + onion_registry.db store were
-    # removed as more risk than value while the static link-search layer is still unfinished.)
+    enabled: bool = False
+    socks_url: str = ""
+    fetch_timeout: float = 60.0
 
 
 # Import the user's REAL browser cookies/metadata into the identity layer so HTTP SERP
@@ -123,22 +155,26 @@ class TorSection:
 # is strictly opt-in. Cross-browser: Chrome/Edge/Brave (chromium family) + Firefox. `browsers`
 # selects which to harvest; empty domains allowlist means every domain (narrow it to search
 # engines to limit exposure). Only cookies whose domain matches the allowlist are imported.
+# enabled is the master switch (off → no profile is ever read). browsers: which installed browsers
+# to harvest. domains: the cookie-domain allowlist (empty = all domains). all_profiles: False →
+# default profile only, True → every profile. refresh_hours: re-harvest only after this long (0 =
+# every start). purge_on_disable: wipe the imported cookies from the store when disabled.
 @dataclass
 class ProfileImportSection:
-    enabled: bool = False                              # master switch — off → no profile is ever read
-    browsers: list[str] = field(                       # which installed browsers to harvest
+    enabled: bool = False
+    browsers: list[str] = field(
         default_factory=lambda: ["chrome", "edge", "brave", "firefox"]
     )
-    domains: list[str] = field(                        # cookie-domain allowlist (empty = all domains)
+    domains: list[str] = field(
         default_factory=lambda: [
             "google.com", "bing.com", "duckduckgo.com", "startpage.com",
             "yandex.com", "yandex.ru", "qwant.com", "brave.com", "search.brave.com",
             "reddit.com",
         ]
     )
-    all_profiles: bool = False                         # False → default profile only; True → every profile
-    refresh_hours: float = 12.0                        # re-harvest only after this long (0 = every start)
-    purge_on_disable: bool = True                      # wipe imported cookies from the store when disabled
+    all_profiles: bool = False
+    refresh_hours: float = 12.0
+    purge_on_disable: bool = True
 
 
 # Hosted (paid API) provider modes. Per provider: "content" | "serp" | "off".
@@ -149,24 +185,24 @@ class ProfileImportSection:
 # fetch (~9s measured) — slower than the medium-effort hosted deadline, so the credits
 # were spent on results the deadline then discarded. SERP-only keeps its consensus value
 # at near-zero latency; flip to "content" deliberately for high-effort/agent workloads.
+# Measured: Tavily is fast even with raw content (~2.4s) while Firecrawl's content mode takes ~9.4s
+# (deadline-hostile). Brave and SerpApi are SERP-native providers, so "content" behaves as "serp".
 @dataclass
 class HostedApiSection:
-    tavily: str = "content"     # fast even with raw content (~2.4s measured)
-    firecrawl: str = "serp"     # content mode measured at ~9.4s — deadline-hostile
-    brave: str = "serp"         # SERP-native providers: "content" behaves as "serp"
+    tavily: str = "content"
+    firecrawl: str = "serp"
+    brave: str = "serp"
     serpapi: str = "serp"
 
 
-# Per-engine kill switches for web_search's tiered selection (TODO §D). An engine set to
-# False never enters a tier — the user opts weak engines in, they are not opted out by
-# health at runtime (that's the breaker's job, this is policy). Both Yandex engines default
-# OFF: the native ya.ru SERP is captcha-gated for scripted clients (it relies on the
-# warm-browser fallback) and the legacy widget is Yandex's retired search product.
+# Model-facing answer cards for top SERP results (core/cards): Wikidata facts, accepted
+# StackExchange answers, Fandom/MediaWiki infoboxes, GitHub repo status, PyPI/npm versions. Each
+# card adds at most `timeout_seconds` (cached afterwards) and fails open. The booleans switch the
+# card sources; max_cards caps the cards per search, scan_results is how many top results are
+# scanned for card candidates, and the ttl fields (seconds) set how long cards and failed lookups
+# are cached.
 @dataclass
 class RichCardsSection:
-    """Model-facing answer cards for top SERP results (core/cards): Wikidata facts,
-    accepted StackExchange answers, Fandom/MediaWiki infoboxes, GitHub repo status, PyPI/npm versions. Each
-    card adds at most `timeout_seconds` (cached afterwards) and fails open."""
     enabled: bool = True
     wikipedia: bool = True
     stackexchange: bool = True
@@ -180,52 +216,60 @@ class RichCardsSection:
     negative_ttl_seconds: float = 900.0
 
 
+# Kill switches for the image vertical (engines/images.py). Defaults follow the 2026-10-28 live
+# check: bing/brave/duckduckgo answer from residential networks (DDG once i.js stopped sending
+# navigation-only headers); openverse times out on every request and would hold each image search
+# until the deadline.
 @dataclass
 class ImageEnginesSection:
-    """Kill switches for the image vertical (engines/images.py). Defaults follow the
-    2026-10-28 live check: bing/brave/duckduckgo answer from residential networks
-    (DDG once i.js stopped sending navigation-only headers); openverse times out
-    on every request and would hold each image search until the deadline."""
     bing: bool = True
     brave: bool = True
     duckduckgo: bool = True
     openverse: bool = False
 
+    # Return the {engine name: enabled} view of the image engines.
     def as_map(self) -> dict[str, bool]:
         return {"bing": self.bing, "brave": self.brave,
                 "duckduckgo": self.duckduckgo, "openverse": self.openverse}
 
 
+# LLM subagent that judges and rewrites search queries.
+# Disabled by default: each evaluated query pays one model call (tens of seconds on a 27B). In
+# "always" mode (default) the model judges every query — an already clean query is approved
+# unchanged, a conversational thought gets rewritten. In "heuristic" mode a local word-stem gate
+# skips the model call for obviously clean queries. Always uses the active chat engine and model
+# from Tools/model_runtime_metadata.json + Settings/settings.json.
 @dataclass
 class QueryRewriterSection:
-    """LLM subagent that judges and rewrites search queries.
-    Disabled by default: each evaluated query pays one model call (tens of seconds
-    on a 27B). In "always" mode (default) the model judges every query — an already
-    clean query is approved unchanged, a conversational thought gets rewritten. In
-    "heuristic" mode a local word-stem gate skips the model call for obviously clean
-    queries. Always uses the active chat engine and model from
-    Tools/model_runtime_metadata.json + Settings/settings.json."""
     enabled: bool = False
     timeout_seconds: float = 75.0
     max_queries: int = 3
-    mode: str = "always"  # always (model judges) | heuristic (cheap gate first)
+
+    # always (model judges) | heuristic (cheap gate first).
+    mode: str = "always"
+
     # Word-stem overrides for the conversational heuristic (rewriter.looks_conversational).
-    # NO built-in lists: empty (the default) disables the local gate entirely, so
-    # heuristic mode behaves like always. A deployment that wants a cheap local gate
-    # writes its own stems here (matched per word: equality, or prefix for stems
-    # of 4+ chars).
+    # NO built-in lists: empty (the default) leaves only the length and question mark rules in the
+    # local gate, so in heuristic mode queries under 6 words without a question mark skip the
+    # model. A deployment that wants a stronger local gate writes its own stems here (matched per
+    # word: equality, or prefix for stems of 4+ chars).
     conversational_markers: tuple[str, ...] = ()
 
 
+# Language-aware region routing and result-language scoring (query_locales).
 @dataclass
 class LocalizationSection:
-    """Language-aware region routing and result-language scoring (query_locales)."""
     enabled: bool = True
+
     # Triage toll for a result written in a language the query did not use. Capped at
     # 0.3 in code; 0.12 keeps one consensus vote (0.2+) above two foreign mismatches.
     language_penalty: float = 0.12
 
 
+# Per-engine kill switches for web_search's tiered selection (TODO §D). An engine set to
+# False never enters a tier — the user opts weak engines in, they are not opted out by
+# health at runtime (that's the breaker's job, this is policy). Yandex defaults OFF: the
+# native ya.ru SERP is captcha-gated for scripted clients (it relies on the warm-browser fallback).
 @dataclass
 class EnginesSection:
     google: bool = True
@@ -247,16 +291,16 @@ class EnginesSection:
         }
 
 
+# Emergency reserve engine (the legacy Yandex site-search widget, Yandex's retired search product).
+# The buffer never participates in normal tier rotation: select_engines fires it only when every
+# regular engine is switched off in config or blocked by its circuit breaker, so a search still
+# returns some results instead of none.
 @dataclass
 class BufferEngineSection:
-    """Emergency reserve engine (the legacy Yandex site-search widget).
-
-    The buffer never participates in normal tier rotation: select_engines fires it
-    only when every regular engine is switched off in config or blocked by its
-    circuit breaker, so a search still returns some results instead of none."""
     enabled: bool = True
 
 
+# Root of the search configuration: one dataclass per section of search_config.json.
 @dataclass
 class SearchConfig:
     search: SearchSection = field(default_factory=SearchSection)
@@ -275,9 +319,14 @@ class SearchConfig:
     buffer_engine: BufferEngineSection = field(default_factory=BufferEngineSection)
 
 
+# Loading
+
+# Cache of the config loaded from the default path, with the (mtime_ns, size) signature of the file
+# it was read from; a changed signature triggers a reload.
 _cached_config: SearchConfig | None = None
 _cached_config_signature: tuple[int, int] | None = None
 
+# Sentinel that tells a missing JSON key apart from an explicit null.
 _MISSING = object()
 
 
@@ -318,7 +367,8 @@ def _string_list(value: object, allowed: Optional[set[str]], default: list[str])
     return out
 
 
-# Coerce JSON values to optional strings (empty string → None).
+# Coerce a JSON value to an optional string: null or an empty string → None, a missing key (the
+# _MISSING sentinel) → default.
 def _optional_string(value: object, default: Optional[str]) -> Optional[str]:
     if value is None:
         return None
@@ -329,15 +379,19 @@ def _optional_string(value: object, default: Optional[str]) -> Optional[str]:
     return str(value)
 
 
-# Load search_config.json and cache a SearchConfig singleton (custom path for tests only).
+# Load search_config.json and cache a SearchConfig singleton (custom path for tests only). Every
+# value is coerced to its field type, invalid choices fall back to the defaults, and a missing or
+# malformed file yields the default config.
 def load_search_config(path: Path | None = None) -> SearchConfig:
     global _cached_config, _cached_config_signature
 
+    # Reuse the cached config while the default file is unchanged.
     target = path or _CONFIG_PATH
     signature = _config_signature(target)
     if path is None and _cached_config is not None and _cached_config_signature == signature:
         return _cached_config
 
+    # Parse the file; a missing or invalid file falls back to the defaults.
     try:
         raw = json.loads(target.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -355,6 +409,7 @@ def load_search_config(path: Path | None = None) -> SearchConfig:
             _cached_config_signature = signature
         return config
 
+    # Pick out the raw JSON section of each config section (short names keep the lines below compact).
     s = raw.get("search", {})
     e = raw.get("extraction", {})
     c = raw.get("cache", {})
@@ -369,8 +424,12 @@ def load_search_config(path: Path | None = None) -> SearchConfig:
     rc = raw.get("rich_cards", {})
     g = raw.get("engines", {})
     buf = raw.get("buffer_engine", {})
+
+    # Allowed values for the hosted API modes and the browsers a profile import may harvest.
     _hosted_modes = {"content", "serp", "off"}
     _known_browsers = {"chrome", "edge", "brave", "firefox"}
+
+    # Warn about unknown engine names; a non-object engines section counts as empty.
     if isinstance(g, dict):
         for key in g:
             if key not in EnginesSection().as_map():
@@ -378,6 +437,7 @@ def load_search_config(path: Path | None = None) -> SearchConfig:
     else:
         g = {}
 
+    # Build every section from its JSON values, with a default for each missing key.
     config = SearchConfig(
         search=SearchSection(
             tls_verify=bool(s.get("tls_verify", True)),
@@ -497,6 +557,7 @@ def load_search_config(path: Path | None = None) -> SearchConfig:
         ),
     )
 
+    # Cache only configs loaded from the default path.
     if path is None:
         _cached_config = config
         _cached_config_signature = signature

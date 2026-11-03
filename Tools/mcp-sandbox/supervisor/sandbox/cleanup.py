@@ -22,29 +22,38 @@ from sandbox.config import (
 )
 from sandbox.workspace import task_root
 
+# Staging layout inside the task root: the tmp directory that holds staged batches, the batch directory
+# name prefix, the per-batch metadata file and the file that records the latest cleanup event.
 TMP_DIR_NAME = "tmp"
 BATCH_PREFIX = "idle-"
 BATCH_METADATA = ".sandbox_cleanup_batch.json"
 STATE_FILENAME = ".sandbox_cleanup_state.json"
+
+# Task-root entries that are never staged (the staging area itself, the state file and Skills).
 _RESERVED_ROOT_NAMES = {TMP_DIR_NAME, STATE_FILENAME, "Skills"}
 
+# Monitor state shared between tool calls and the monitor thread: the lock guarding it, whether the
+# monitor thread was started, the number of tool calls in flight and the time of the last tool activity.
 _LOCK = threading.RLock()
 _MONITOR_STARTED = False
 _ACTIVE_CALLS = 0
 _LAST_ACTIVITY_MONOTONIC = time.monotonic()
 
 
-# Current UTC time.
+# Time helpers
+
+# Return the current time as an aware UTC datetime.
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-# ISO-8601 timestamp for the current instant.
+# Return the current instant as an ISO-8601 string.
 def _iso_now() -> str:
     return _utc_now().isoformat()
 
 
-# Parse an ISO timestamp string, or return None when invalid.
+# Parse an ISO timestamp string into an aware datetime (naive values are taken as UTC), or return None
+# when the value is not a valid timestamp.
 def _parse_iso_timestamp(value: object) -> datetime | None:
     if not isinstance(value, str) or not value:
         return None
@@ -57,12 +66,16 @@ def _parse_iso_timestamp(value: object) -> datetime | None:
     return parsed
 
 
-# Generate a unique batch directory name under tmp/.
+# Build a batch directory name from the batch prefix and the current UTC time, to the second
+# (collisions are resolved by _unique_child).
 def _safe_batch_name() -> str:
     return BATCH_PREFIX + _utc_now().strftime("%Y%m%d-%H%M%S")
 
 
-# Pick a non-colliding child path under parent.
+# Filesystem and metadata helpers
+
+# Pick a non-colliding child path under parent: the name itself, then name-2 up to name-999, then a
+# nanosecond-timestamp suffix.
 def _unique_child(parent: Path, name: str) -> Path:
     candidate = parent / name
     if not candidate.exists():
@@ -102,6 +115,7 @@ def _remember_cleanup_event(root: Path, event: str, **details: object) -> None:
             },
         )
     except OSError:
+        # The event record is informational only; failing to write it must not break cleanup.
         pass
 
 
@@ -144,8 +158,10 @@ def _safe_tmp_root(root: Path) -> Path:
     return tmp_root
 
 
-# Move current root entries into one tmp batch inside the sandbox.
+# Move current root entries into one tmp batch inside the sandbox. Return the batch directory, or None
+# when a background job is running, there is nothing to stage or nothing could be moved.
 def stage_workspace_to_tmp(staged_at: datetime | None = None) -> Path | None:
+    # Never move files out from under a running background job.
     if _has_running_background_jobs():
         return None
 
@@ -155,10 +171,12 @@ def stage_workspace_to_tmp(staged_at: datetime | None = None) -> Path | None:
     if not entries:
         return None
 
+    # Create a fresh batch directory inside the guarded tmp root.
     tmp_root = _safe_tmp_root(root)
     batch_dir = _unique_child(tmp_root, _safe_batch_name())
     batch_dir.mkdir(parents=True, exist_ok=False)
 
+    # Move every entry into the batch; entries that cannot be moved stay where they are.
     moved: list[str] = []
     for entry in entries:
         if not entry.exists():
@@ -168,13 +186,16 @@ def stage_workspace_to_tmp(staged_at: datetime | None = None) -> Path | None:
             shutil.move(str(entry), str(destination))
             moved.append(entry.name)
         except (OSError, shutil.Error):
+            # Locked or vanished entry: leave it in place and continue with the rest.
             continue
 
+    # Drop the empty batch directory when nothing was moved.
     if not moved:
         with contextlib.suppress(OSError):
             batch_dir.rmdir()
         return None
 
+    # Record when and what was staged so the batch can be recycled later.
     staged_at = staged_at or _utc_now()
     metadata = {
         "staged_at": staged_at.isoformat(),
@@ -192,7 +213,8 @@ def stage_workspace_to_tmp(staged_at: datetime | None = None) -> Path | None:
     return batch_dir
 
 
-# Resolve when a tmp batch was staged (metadata or directory mtime).
+# Resolve when a tmp batch was staged: from its metadata file, falling back to the directory mtime.
+# Return None when neither is available.
 def _batch_staged_at(batch_dir: Path) -> datetime | None:
     metadata = _read_json(batch_dir / BATCH_METADATA)
     staged_at = _parse_iso_timestamp(metadata.get("staged_at"))
@@ -206,6 +228,7 @@ def _batch_staged_at(batch_dir: Path) -> datetime | None:
 
 # Send a path to the Windows recycle bin via SHFileOperationW.
 def _send_to_windows_recycle_bin(path: Path) -> None:
+    # ctypes mirror of the Win32 SHFILEOPSTRUCTW structure passed to SHFileOperationW.
     class SHFILEOPSTRUCTW(ctypes.Structure):
         _fields_ = [
             ("hwnd", ctypes.c_void_p),
@@ -218,10 +241,12 @@ def _send_to_windows_recycle_bin(path: Path) -> None:
             ("lpszProgressTitle", ctypes.c_wchar_p),
         ]
 
+    # Request FO_DELETE (3) with the flags undo (move to the recycle bin), no confirmation, silent and
+    # no error UI. pFrom must be double-null terminated.
     operation = SHFILEOPSTRUCTW()
-    operation.wFunc = 3  # FO_DELETE
+    operation.wFunc = 3
     operation.pFrom = str(path) + "\0\0"
-    operation.fFlags = 0x40 | 0x10 | 0x04 | 0x400  # undo, no confirm, silent, no UI
+    operation.fFlags = 0x40 | 0x10 | 0x04 | 0x400
 
     result = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(operation))
     if result != 0 or operation.fAnyOperationsAborted:
@@ -234,9 +259,11 @@ def _send_to_platform_trash(path: Path) -> None:
         _send_to_windows_recycle_bin(path)
         return
 
+    # Prefer the optional send2trash package; without it, fall back to the gio command line tool.
     try:
         from send2trash import send2trash  # type: ignore
     except Exception:
+        # The package is optional; a missing or broken install just selects the gio fallback.
         send2trash = None
 
     if send2trash is not None:
@@ -251,7 +278,8 @@ def _send_to_platform_trash(path: Path) -> None:
     raise OSError("No platform trash backend is available.")
 
 
-# Move expired tmp batches to the OS trash without depending on trash name.
+# Move tmp batches older than the recycle period to the OS trash. Batches are recognized by the idle-
+# name prefix; the paths of the batches that were recycled are returned.
 def recycle_due_tmp_batches(now: datetime | None = None) -> list[Path]:
     root = task_root()
     tmp_root = _safe_tmp_root(root)
@@ -261,6 +289,7 @@ def recycle_due_tmp_batches(now: datetime | None = None) -> list[Path]:
     now = now or _utc_now()
     recycled: list[Path] = []
     for batch_dir in sorted(tmp_root.iterdir(), key=lambda path: path.name):
+        # Skip foreign entries, batches of unknown age and batches that are not old enough yet.
         if not batch_dir.is_dir() or not batch_dir.name.startswith(BATCH_PREFIX):
             continue
         staged_at = _batch_staged_at(batch_dir)
@@ -268,6 +297,8 @@ def recycle_due_tmp_batches(now: datetime | None = None) -> list[Path]:
             continue
         if (now - staged_at).total_seconds() < WORKSPACE_CLEANUP_RECYCLE_SECONDS:
             continue
+
+        # Trash the expired batch; a failure is recorded and the batch is retried on a later pass.
         try:
             _send_to_platform_trash(batch_dir)
         except OSError as exc:
@@ -284,7 +315,10 @@ def recycle_due_tmp_batches(now: datetime | None = None) -> list[Path]:
     return recycled
 
 
-# Perform one cleanup pass if the sandbox is idle.
+# Monitor
+
+# Perform one cleanup pass: recycle expired batches, then stage the workspace when no tool call or
+# background job is active and the sandbox has been idle long enough.
 def run_cleanup_once() -> None:
     if not WORKSPACE_CLEANUP_ENABLED:
         return
@@ -306,6 +340,8 @@ def _monitor_loop() -> None:
     interval = max(1, WORKSPACE_CLEANUP_INTERVAL_SECONDS)
     while True:
         time.sleep(interval)
+
+        # A failed pass must not kill the monitor thread; the next tick tries again.
         with contextlib.suppress(Exception):
             run_cleanup_once()
 

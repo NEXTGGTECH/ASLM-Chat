@@ -1,16 +1,14 @@
 # Copyright NEXTGGTECH. Elastic License 2.0.
 
-"""JSON data-island fallback — ported regression tests from webclaw's data_island.rs.
-
-The cases mirror the reference suite (Contentful rich text, quotes, content-vs-identifier
-heuristic, DOM dedup, chunk dedup) plus the sparse-gate wiring specific to our read path.
-"""
-
 from __future__ import annotations
 
 from core.extract.data_island import _is_content_text, try_extract_data_islands
 
 
+# Verify that headings and nested rich-text values are extracted from a Contentful JSON island.
+# (The tests in this file are ported from the data_island.rs suite of webclaw: Contentful rich
+# text, quotes, content-vs-identifier heuristic, DOM dedup and chunk dedup, plus the sparse-gate
+# cases specific to our read path.)
 def test_extracts_contentful_rich_text():
     html = """<html><body>
     <script type="application/json" data-target="react-app.embeddedData">
@@ -34,14 +32,18 @@ def test_extracts_contentful_rich_text():
     assert "find and fix vulnerabilities" in result
 
 
+# Verify that the JSON islands are not inspected when the DOM already has enough words.
 def test_skips_when_dom_has_enough_content():
     html = """<html><body>
     <script type="application/json">{"heading":"Foo","description":"Some long description here."}</script>
     </body></html>"""
-    # dom_word_count above the sparse threshold → never inspect islands.
+
+    # A dom_word_count above the sparse threshold means the islands are never inspected.
     assert try_extract_data_islands(html, 500, "") is None
 
 
+# Verify that identifiers, URLs, paths and hashes are not treated as content text, while a real
+# sentence is.
 def test_skips_non_content_strings():
     assert not _is_content_text("abc123")
     assert not _is_content_text("https://example.com/foo/bar")
@@ -50,6 +52,8 @@ def test_skips_non_content_strings():
     assert _is_content_text("Automate builds, tests, and deployments with CI/CD.")
 
 
+# Verify that a quote field is extracted as a markdown block quote together with the position of
+# the speaker.
 def test_extracts_quotes():
     html = """<html><body>
     <script type="application/json">
@@ -62,6 +66,7 @@ def test_extracts_quotes():
     assert "CTO at Example Corp" in result
 
 
+# Verify that island content that already appears in the DOM markdown is not extracted again.
 def test_skips_content_already_in_dom():
     html = """<html><body>
     <script type="application/json">
@@ -72,6 +77,7 @@ def test_skips_content_already_in_dom():
     assert try_extract_data_islands(html, 10, existing) is None
 
 
+# Verify that identical chunks in several island entries appear only once in the result.
 def test_deduplicates_chunks():
     html = """<html><body>
     <script type="application/json">
@@ -84,6 +90,7 @@ def test_deduplicates_chunks():
     assert result.count("Same body content across multiple entries") == 1
 
 
+# Verify that the strings of a stats array are extracted.
 def test_stat_string_array():
     html = """<html><body>
     <script type="application/json">
@@ -96,6 +103,8 @@ def test_stat_string_array():
     assert "#1 rated developer platform worldwide" in result
 
 
+# Verify that alt, image and logo fields are not extracted as prose, so an island holding only
+# those yields nothing.
 def test_media_keys_not_extracted_as_prose():
     # alt / image / logo fields must not surface as content, even though they are strings.
     html = """<html><body>
@@ -106,10 +115,12 @@ def test_media_keys_not_extracted_as_prose():
     assert try_extract_data_islands(html, 0, "") is None
 
 
+# Verify that a page without any script element yields None.
 def test_no_script_returns_none():
     assert try_extract_data_islands("<html><body><p>hi</p></body></html>", 0, "") is None
 
 
+# Verify that a script containing invalid JSON is ignored and yields None.
 def test_malformed_json_ignored():
     html = """<html><body>
     <script type="application/json">{not valid json at all,,,}</script>
@@ -117,6 +128,7 @@ def test_malformed_json_ignored():
     assert try_extract_data_islands(html, 0, "") is None
 
 
+# Verify that a JSON script shorter than the minimum size is skipped without parsing.
 def test_tiny_json_skipped():
     # Below the 50-char floor → not worth parsing.
     html = '<html><body><script type="application/json">{"a":"b"}</script></body></html>'

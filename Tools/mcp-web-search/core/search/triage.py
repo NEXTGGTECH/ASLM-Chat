@@ -1,18 +1,5 @@
 # Copyright NEXTGGTECH. Elastic License 2.0.
 
-"""Incremental, model-free SERP triage.
-
-Sources are scored the moment they arrive from search_stream. The session decides
-per source: parse now, hold in queue, or skip. Consensus votes (the same URL
-surfacing from another provider family) re-score an already-seen source and may
-upgrade it from the queue into a parse slot.
-
-No registries, no models, no I/O — pure functions over SERP fields, so a decision
-costs well under a millisecond. Learned domain trust enters as a point-in-time
-ReputationSnapshot the caller loads up front (one DB read per search); per-source
-scoring stays a dict lookup.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -69,7 +56,8 @@ _ENGINE_POSITION_WEIGHT = {
     "hosted:brave": 1.05,
     "hosted:serpapi": 1.05,
     "google": 1.00,
-    "startpage": 1.00,  # same family, same prior
+    # Same family as google, same prior.
+    "startpage": 1.00,
     "duckduckgo": 0.85,
     "brave": 0.70,
     "qwant": 0.60,
@@ -88,6 +76,7 @@ _POSITION_DEPTH = 10
 # view and the REST vote, so the bonus does not depend on arrival order.
 _CONSENSUS_STEP = 0.18
 _CONSENSUS_CAP = 0.36
+
 # NOTE: vote weight is NOT the position weight. Position weight prices how much we
 # trust a family's ORDERING; vote weight prices how much its listing counts as
 # INDEPENDENT EVIDENCE that the page matters. Hence brave votes above ddg despite the
@@ -122,12 +111,15 @@ _SHORT_SNIPPET_CHARS = 30
 _SHORT_SNIPPET_PENALTY = 0.08
 
 
+# What to do with a source: PARSE (score cleared the bar, fetch and parse immediately), QUEUE
+# (usable, waits for a free slot or a consensus upgrade) or SKIP (not worth a fetch).
 class TriageAction(StrEnum):
-    PARSE = "parse"  # score cleared the bar — fetch/parse immediately
-    QUEUE = "queue"  # usable, waits for a free slot or a consensus upgrade
-    SKIP = "skip"  # not worth a fetch
+    PARSE = "parse"
+    QUEUE = "queue"
+    SKIP = "skip"
 
 
+# The decision for one URL with its score; `upgraded` is True when it lifts a previously queued source.
 @dataclass(slots=True)
 class TriageDecision:
     action: TriageAction
@@ -151,22 +143,33 @@ class _SourceState:
     date_value: float = 0.0
 
 
-# Incremental triage over the live source stream.
+# Incremental, model-free triage over the live source stream. Sources are scored the moment they
+# arrive from search_stream, and the session decides per source: parse now, hold in queue, or skip.
+# Consensus votes (the same URL surfacing from another provider family) re-score an already-seen
+# source and may upgrade it from the queue into a parse slot.
+# No registries, no models, no I/O: pure functions over SERP fields, so a decision costs well under
+# a millisecond. Learned domain trust enters as a point-in-time ReputationSnapshot the caller loads
+# up front (one DB read per search); per-source scoring stays a dict lookup.
 class TriageSession:
-
+    # Prepare the per-query context (years, terms, language weight) and the reputation lookups.
     def __init__(self, query: str, reputation: ReputationSnapshot | None = None) -> None:
+        # Query-derived inputs, computed once per session: years and terms (terms feed the
+        # exact-match-domain tell) and the language-mismatch weight, which is 0 when localization
+        # is disabled.
         self.query = query
         self._years = query_years(query)
-        self._terms = tuple(query_terms(query))  # once per session, for the EMD tell
+        self._terms = tuple(query_terms(query))
         self._query_language = analyze_query(query).language
         localization = load_search_config().localization
         self._language_weight = localization.language_penalty if localization.enabled else 0.0
+
+        # Per-URL scoring state, plus earned domain penalties and proven domains from the reputation snapshot.
         self._states: dict[str, _SourceState] = {}
         self._penalties = reputation.penalties if reputation else {}
         self._proven = reputation.proven if reputation else frozenset()
 
     # Score one source from its SERP fields alone (no consensus component).
-    # Returns (score, date_value) — the date component is tracked separately so the
+    # Return (score, date_value) — the date component is tracked separately so the
     # parsed page's own published_time can replace the snippet estimate post-parse.
     def _soft_score(
         self,
@@ -177,14 +180,17 @@ class TriageSession:
         snippet: str,
         url: str,
     ) -> tuple[float, float]:
+        # Raw signals: position decay, the engine's positional prior, hub penalty, snippet length.
         position = max(0.0, 1.0 - (max(1, rank) - 1) / _POSITION_DEPTH)
         position_weight = _ENGINE_POSITION_WEIGHT.get(engine, _DEFAULT_POSITION_WEIGHT)
         hub = hub_penalty(url, title, snippet)
         snip_len = min(1.0, len(snippet) / 300)
+
         # Only the snippet may carry the date: engines prefix real publication dates
         # there, while a title year is a stuffing tell, not evidence.
         date_value = page_date_score(extract_date(snippet), self._years)
 
+        # Weighted base score, then the soft penalties for short snippets and hub pages.
         score = (
             _W_POSITION * position * position_weight
             + _W_SNIPPET_LEN * snip_len
@@ -193,14 +199,17 @@ class TriageSession:
         if len(snippet) < _SHORT_SNIPPET_CHARS:
             score -= _SHORT_SNIPPET_PENALTY
         score -= 0.25 * hub
+
         # Identity-blind SEO trim: gently down-weight year-stuffed farm slugs by URL shape
         # only. No domain favouritism — authority is earned via consensus, not declared.
         score += seo_slug_penalty(url)
         score += insecure_scheme_penalty(url)
+
         # Bad-site tells: structural marks of phishing/farm URLs (IP hosts, embedded
         # gTLD costumes, hyphen/year-stamped names, exact-match-domain squatting).
         score += suspicious_url_penalty(url)
         score += emd_penalty(url, self._terms)
+
         # Language-of-result scoring (query_locales): a page written in a script the
         # query did not use pays a small, capped toll — never a ban, consensus can
         # always outvote it, and English results never pay at all.
@@ -209,6 +218,7 @@ class TriageSession:
             score -= language_mismatch_penalty(
                 self._query_language, result_language, self._language_weight
             )
+
         # Earned negative reputation (TLS failures, systematic empty parses). Magnitude
         # is capped at write-out; consensus votes can still outvote it — two independent
         # families saying "this page answers the query" beat an old grudge.
@@ -224,7 +234,7 @@ class TriageSession:
         bar = _PARSE_THRESHOLD + (_UNPROVEN_PARSE_MARGIN if strict else 0.0)
         return TriageAction.PARSE if score >= bar else TriageAction.QUEUE
 
-    # Whether the stricter parse bar applies to this source right now.
+    # Return whether the stricter parse bar applies to this source right now.
     @staticmethod
     def _strict_bar(state: _SourceState) -> bool:
         return state.unproven and len(state.families) <= 1
@@ -243,7 +253,9 @@ class TriageSession:
         bonus = min(_CONSENSUS_CAP, _CONSENSUS_STEP * sum(weights[1:]))
         return min(1.0, state.base_score + bonus)
 
-    # Ingest a new source event; returns the decision for this URL.
+    # Ingest a new source event; return the decision for this URL. A skip-title source is skipped
+    # outright; otherwise the soft score plus the first family's vote decides, with the stricter
+    # bar for unproven domains.
     def ingest_source(
         self,
         *,
@@ -258,6 +270,7 @@ class TriageSession:
             self._states[url] = _SourceState(base_score=0.0, action=TriageAction.SKIP)
             return TriageDecision(action=TriageAction.SKIP, score=0.0, url=url)
 
+        # Score the source and remember whether its domain still has to prove itself.
         base, date_value = self._soft_score(
             engine=engine, rank=rank, title=title, snippet=snippet, url=url
         )
@@ -267,6 +280,8 @@ class TriageSession:
             unproven=not is_established_tld(domain) and domain not in self._proven,
             date_value=date_value,
         )
+
+        # Count the first family's vote and derive the action from the total score.
         state.families.add(provider_family)
         score = self._total(state)
         state.action = self._action_for(score, strict=self._strict_bar(state))
@@ -298,7 +313,7 @@ class TriageSession:
             state.date_value = date_value
         return self._rescore(state, url, provider_family)
 
-    # Ingest a consensus vote for an already-seen URL. Returns an upgraded decision
+    # Ingest a consensus vote for an already-seen URL. Return an upgraded decision
     # when the extra vote lifts the source over a threshold, else None.
     def ingest_vote(self, *, provider_family: str, url: str) -> TriageDecision | None:
         state = self._states.get(url)
@@ -330,7 +345,7 @@ class TriageSession:
         )
         state.date_value = new_value
 
-    # Current score for a URL (queue ordering for leftover slots).
+    # Return the current score for a URL (queue ordering for leftover slots), or 0.0 when unknown.
     def score_of(self, url: str) -> float:
         state = self._states.get(url)
         return self._total(state) if state else 0.0

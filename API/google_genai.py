@@ -1,4 +1,4 @@
-﻿# Copyright NEXTGGTECH. Elastic License 2.0.
+# Copyright NEXTGGTECH. Elastic License 2.0.
 
 from __future__ import annotations
 
@@ -18,19 +18,33 @@ from Settings import settings
 
 logger = logging.getLogger(__name__)
 
+# Cancellation flag of the adapter, set by abort_generation().
 _abort_event = threading.Event()
+
+# Runtime cache of capability facts learned per (endpoint scope, model); the lock guards it across threads.
 _model_capability_cache_lock = threading.Lock()
 _model_capability_cache: dict[tuple[str, str], dict[str, Any]] = {}
+
+# Runtime cache of model availability per (endpoint scope, API key hash, model); entries expire after
+# MODEL_AVAILABILITY_TTL_SECONDS and the lock guards the cache across threads.
 _model_availability_cache_lock = threading.Lock()
 _model_availability_cache: dict[tuple[str, str, str], dict[str, Any]] = {}
 
+# Default cap on tool-calling rounds per generation; the tool context may override it.
 MAX_TOOL_ROUNDS = 100
+
+# How long, in seconds, a cached availability result stays valid.
 MODEL_AVAILABILITY_TTL_SECONDS = 15 * 60
+
+# Opening and closing tags that models use to wrap inline reasoning inside the answer text.
 REASONING_TAG_PAIRS = (
     ("<think>", "</think>"),
     ("<thinking>", "</thinking>"),
     ("<reasoning>", "</reasoning>"),
 )
+
+# Chat-template control tokens (for example <|start|> or <|im_end|>) that some models leak into their
+# text; _sanitize_generated_text removes them before the text reaches the chat UI.
 CONTROL_TOKEN_PATTERNS = (
     re.compile(
         r"<\|start\|>\s*(?:assistant|user|system)?\s*(?:<\|channel\|>\s*(?:final|analysis|commentary))?\s*(?:<\|message\|>)?",
@@ -44,6 +58,9 @@ CONTROL_TOKEN_PATTERNS = (
     re.compile(r"<\|im_(?:start|end)\|>", flags=re.IGNORECASE),
     re.compile(r"<\|(?:assistant|user|system|endoftext)\|>", flags=re.IGNORECASE),
 )
+
+# Capability names (normalized keys and tokens) that Gemini model metadata uses to advertise tool calling,
+# vision, audio input, video input and reasoning support.
 TOOL_CAPABILITY_NAMES = {
     "tool",
     "tools",
@@ -76,13 +93,19 @@ REASONING_CAPABILITY_NAMES = {
     "supports_reasoning",
     "reasoning_enabled",
 }
+
+# Thinking levels offered to the UI for models that support selectable reasoning effort.
 THINK_LEVEL_OPTIONS = ["minimal", "low", "medium", "high"]
+
+# Generic request option names mapped to the Google GenAI config field they correspond to.
 GOOGLE_OPTION_ALIASES = {
     "max_tokens": "max_output_tokens",
     "max_completion_tokens": "max_output_tokens",
     "n": "candidate_count",
     "stop": "stop_sequences",
 }
+
+# Request options that are passed through to the generate-content config.
 GOOGLE_CONFIG_KEYS = {
     "audio_timestamp",
     "cached_content",
@@ -108,13 +131,16 @@ GOOGLE_CONFIG_KEYS = {
     "top_k",
     "top_p",
 }
+
+# Request options that belong to the nested thinking config instead of the top-level config.
 THINKING_CONFIG_KEYS = {"include_thoughts", "thinking_budget", "thinking_level"}
 
 
-# Return a safe shallow copy for one cached payload.
-def _clone_cache_payload(value: dict[str, Any] | None) -> dict[str, Any]:
-    """Return a safe shallow copy for one cached payload."""
+# Runtime state
 
+# Return a shallow copy of a cached payload in which lists and dicts are copied one level deep, so
+# callers cannot mutate the cache entry; anything that is not a dict yields an empty dict.
+def _clone_cache_payload(value: dict[str, Any] | None) -> dict[str, Any]:
     if not isinstance(value, dict):
         return {}
 
@@ -131,15 +157,14 @@ def _clone_cache_payload(value: dict[str, Any] | None) -> dict[str, Any]:
 
 # Signal the active Google GenAI generation to stop.
 def abort_generation() -> None:
-    """Signal the active Google GenAI generation to stop."""
-
     _abort_event.set()
 
 
-# Import the Google GenAI SDK lazily so the app can boot without it.
-def _get_sdk():
-    """Import the Google GenAI SDK lazily so the app can boot without it."""
+# Endpoint and SDK
 
+# Import the Google GenAI SDK lazily so the app can boot without it; raise ImportError with an
+# actionable message when the google-genai package is missing.
+def _get_sdk():
     try:
         from google import genai
     except ImportError as exc:
@@ -148,10 +173,9 @@ def _get_sdk():
     return genai
 
 
-# Split a configured Gemini endpoint into (base_url, api_version).
+# Split a configured Gemini endpoint into (base_url, api_version): a trailing version segment such as
+# /v1beta is cut off and returned separately, so the SDK does not prefix the version twice.
 def _normalize_google_base_url(base_url: str) -> tuple[str, str | None]:
-    """Split a configured Gemini endpoint into ``(base_url, api_version)``."""
-
     raw_base_url = str(base_url or "").strip()
     if not raw_base_url:
         return "", None
@@ -176,10 +200,8 @@ def _normalize_google_base_url(base_url: str) -> tuple[str, str | None]:
     return normalized_base, api_version
 
 
-# Return the normalized endpoint scope used for Gemini runtime caches.
+# Return the normalized endpoint scope (base URL plus API version) used to key the Gemini runtime caches.
 def _get_runtime_scope() -> str:
-    """Return the normalized endpoint scope used for Gemini runtime caches."""
-
     configured_base_url = settings.get_engine_url("google-genai")
     normalized_base_url, api_version = _normalize_google_base_url(configured_base_url)
     endpoint = str(normalized_base_url or configured_base_url or "").strip().rstrip("/")
@@ -187,40 +209,35 @@ def _get_runtime_scope() -> str:
     return f"{endpoint}|{version}"
 
 
-# Return a stable non-reversible hash for the active Gemini API key.
+# Return a stable non-reversible SHA-256 hash of the active Gemini API key, so cache keys can be
+# scoped to the key without holding the key itself.
 def _get_api_key_hash() -> str:
-    """Return a stable non-reversible hash for the active Gemini API key."""
-
     api_key = str(settings.get_google_genai_api_key() or "")
     return hashlib.sha256(api_key.encode("utf-8")).hexdigest()
 
 
-# Return the stable capability-cache key for one Gemini model.
-def _get_model_capability_cache_key(model_name: str) -> tuple[str, str]:
-    """Return the stable capability-cache key for one Gemini model."""
+# Runtime caches
 
+# Return the capability-cache key for one Gemini model: the endpoint scope plus the normalized model id.
+def _get_model_capability_cache_key(model_name: str) -> tuple[str, str]:
     return (_get_runtime_scope(), _normalize_model_identifier(model_name))
 
 
-# Return the stable key-scoped availability-cache key for one Gemini model.
+# Return the availability-cache key for one Gemini model: endpoint scope, API key hash and normalized
+# model id.
 def _get_model_availability_cache_key(model_name: str) -> tuple[str, str, str]:
-    """Return the stable key-scoped availability-cache key for one Gemini model."""
-
     return (_get_runtime_scope(), _get_api_key_hash(), _normalize_model_identifier(model_name))
 
 
 # Return cached endpoint-scoped capabilities for one Gemini model.
 def _get_cached_model_capabilities(model_name: str) -> dict[str, Any]:
-    """Return cached endpoint-scoped capabilities for one Gemini model."""
-
     with _model_capability_cache_lock:
         return _clone_cache_payload(_model_capability_cache.get(_get_model_capability_cache_key(model_name)))
 
 
-# Merge new endpoint-scoped capability facts into the runtime cache.
+# Merge new endpoint-scoped capability facts into the runtime cache and return a copy of the merged
+# entry. Updates whose value is None are skipped so unknown facts never overwrite known ones.
 def _update_cached_model_capabilities(model_name: str, **updates: Any) -> dict[str, Any]:
-    """Merge new endpoint-scoped capability facts into the runtime cache."""
-
     cleaned_updates = {
         str(key): (list(value) if isinstance(value, list) else value)
         for key, value in updates.items()
@@ -234,10 +251,9 @@ def _update_cached_model_capabilities(model_name: str, **updates: Any) -> dict[s
         return _clone_cache_payload(entry)
 
 
-# Return key-scoped availability info when the cache entry is still fresh.
+# Return key-scoped availability info when the cache entry is still fresh; an expired entry is evicted
+# and None is returned.
 def _get_cached_model_availability(model_name: str) -> dict[str, Any] | None:
-    """Return key-scoped availability info when the cache entry is still fresh."""
-
     cache_key = _get_model_availability_cache_key(model_name)
     now = time.monotonic()
     with _model_availability_cache_lock:
@@ -251,10 +267,9 @@ def _get_cached_model_availability(model_name: str) -> dict[str, Any] | None:
         return _clone_cache_payload(entry)
 
 
-# Cache whether one Gemini model is usable for the current key and endpoint.
+# Cache whether one Gemini model is usable for the current key and endpoint, with the reason, until
+# MODEL_AVAILABILITY_TTL_SECONDS has passed. Return a copy of the stored entry.
 def _set_cached_model_availability(model_name: str, available: bool, reason: str) -> dict[str, Any]:
-    """Cache whether one Gemini model is usable for the current key and endpoint."""
-
     cache_key = _get_model_availability_cache_key(model_name)
     entry = {
         "available": bool(available),
@@ -268,28 +283,26 @@ def _set_cached_model_availability(model_name: str, available: bool, reason: str
 
 # Clear Gemini runtime caches. Intended for tests and debug flows.
 def _reset_runtime_caches() -> None:
-    """Clear Gemini runtime caches. Intended for tests and debug flows."""
-
     with _model_capability_cache_lock:
         _model_capability_cache.clear()
     with _model_availability_cache_lock:
         _model_availability_cache.clear()
 
 
-# Safely close a client instance when the SDK exposes close.
-def _close_client(client: Any) -> None:
-    """Safely close a client instance when the SDK exposes ``close``."""
+# Client lifecycle
 
+# Close a client instance, ignoring clients whose SDK version has no close method or fails to close.
+def _close_client(client: Any) -> None:
     try:
         client.close()
     except Exception:
+        # Closing is best-effort cleanup; an SDK without close() or a failed close is harmless.
         pass
 
 
-# Create a fresh Google GenAI client for the configured Gemini API endpoint.
+# Create a fresh Google GenAI client for the configured Gemini API endpoint. The configured ASLM
+# endpoint stays authoritative, and the API key is passed only when one is set.
 def _get_client():
-    """Create a fresh Google GenAI client for the configured Gemini API endpoint."""
-
     genai = _get_sdk()
     api_key = settings.get_google_genai_api_key()
     configured_base_url = settings.get_engine_url("google-genai")
@@ -309,17 +322,17 @@ def _get_client():
     return genai.Client(**client_kwargs)
 
 
-# Return a normalized lower-case identifier for one key or token.
-def _normalize_key_name(value: Any) -> str:
-    """Return a normalized lower-case identifier for one key or token."""
+# Value conversion
 
+# Return a lower-case identifier for a key or token in which every run of characters other than
+# letters and digits becomes one underscore.
+def _normalize_key_name(value: Any) -> str:
     return re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().lower()).strip("_")
 
 
-# Return a predictable boolean from JSON-like payloads.
+# Return a predictable boolean from a JSON-like value: None gives the default, and strings such as
+# "true", "yes", "enabled" or "off" are recognized; any other value uses plain truthiness.
 def _bool_from_value(value: Any, default: bool = False) -> bool:
-    """Return a predictable boolean from JSON-like payloads."""
-
     if value is None:
         return default
     if isinstance(value, bool):
@@ -333,10 +346,8 @@ def _bool_from_value(value: Any, default: bool = False) -> bool:
     return bool(value)
 
 
-# Convert a scalar into a positive integer when possible.
+# Convert a scalar into a positive integer, or None when it is not numeric, not positive or a bool.
 def _coerce_positive_int(value: Any) -> int | None:
-    """Convert a scalar into a positive integer when possible."""
-
     if isinstance(value, bool):
         return None
     try:
@@ -346,10 +357,9 @@ def _coerce_positive_int(value: Any) -> int | None:
     return numeric_value if numeric_value > 0 else None
 
 
-# Convert a scalar or collection into a normalized list of strings.
+# Convert a string or a collection into a list of stripped, non-empty strings; duplicates are removed
+# case-insensitively and the first spelling is kept.
 def _coerce_string_list(value: Any) -> list[str]:
-    """Convert a scalar or collection into a normalized list of strings."""
-
     if isinstance(value, str):
         stripped = value.strip()
         return [stripped] if stripped else []
@@ -367,10 +377,9 @@ def _coerce_string_list(value: Any) -> list[str]:
     return []
 
 
-# Return one binary payload as a base64 string for JSON-safe storage.
+# Return a binary payload as a base64 string for JSON-safe storage; strings are assumed to be base64
+# already and are returned stripped, and anything else gives None.
 def _encode_binary_payload(value: Any) -> str | None:
-    """Return one binary payload as a base64 string for JSON-safe storage."""
-
     if value is None:
         return None
     if isinstance(value, bytearray):
@@ -383,10 +392,9 @@ def _encode_binary_payload(value: Any) -> str | None:
     return None
 
 
-# Decode one stored base64 payload back into raw bytes.
+# Decode a stored base64 payload back into raw bytes; bytes pass through unchanged. Missing padding is
+# repaired on a second attempt, and undecodable input gives None.
 def _decode_binary_payload(value: Any) -> bytes | None:
-    """Decode one stored base64 payload back into raw bytes."""
-
     if value is None:
         return None
     if isinstance(value, bytearray):
@@ -401,6 +409,7 @@ def _decode_binary_payload(value: Any) -> bytes | None:
     try:
         return base64.b64decode(payload, validate=True)
     except Exception:
+        # Strict decoding failed; retry leniently after restoring the stripped padding.
         try:
             padding = "=" * (-len(payload) % 4)
             return base64.b64decode(f"{payload}{padding}")
@@ -408,31 +417,32 @@ def _decode_binary_payload(value: Any) -> bytes | None:
             return None
 
 
-# Drop service control tokens that should never reach the chat UI.
+# Remove the chat-template control tokens that must never reach the chat UI.
 def _sanitize_generated_text(text: str) -> str:
-    """Drop service control tokens that should never reach the chat UI."""
-
     cleaned = str(text or "")
     for pattern in CONTROL_TOKEN_PATTERNS:
         cleaned = pattern.sub("", cleaned)
     return cleaned
 
 
-# Convert SDK objects into plain Python containers.
+# Convert SDK objects into plain Python containers (dicts, lists and scalars) that can be serialized
+# to JSON. Bytes become base64 strings, and objects are flattened through their first working
+# serializer (to_dict, model_dump or dict), then through their public attributes, then str().
 def _to_plain_data(value: Any) -> Any:
-    """Convert SDK objects into plain Python containers."""
-
+    # Scalars pass through and bytes are base64-encoded.
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     if isinstance(value, (bytes, bytearray)):
         return _encode_binary_payload(value)
 
+    # Containers are converted element by element.
     if isinstance(value, dict):
         return {str(key): _to_plain_data(child) for key, child in value.items()}
 
     if isinstance(value, (list, tuple, set)):
         return [_to_plain_data(child) for child in value]
 
+    # SDK objects: use the first serializer method that works.
     for attr_name in ("to_dict", "model_dump", "dict"):
         serializer = getattr(value, attr_name, None)
         if not callable(serializer):
@@ -446,11 +456,14 @@ def _to_plain_data(value: Any) -> Any:
             try:
                 serialized = serializer()
             except Exception:
+                # The serializer also fails without arguments; try the next one.
                 continue
         except Exception:
+            # This serializer is unusable for the object; try the next one.
             continue
         return _to_plain_data(serialized)
 
+    # Last resorts: public instance attributes, then the string form.
     if hasattr(value, "__dict__"):
         return {
             str(key): _to_plain_data(child)
@@ -461,10 +474,11 @@ def _to_plain_data(value: Any) -> Any:
     return str(value)
 
 
-# Return a normalized model identifier for fuzzy Gemini comparisons.
-def _normalize_model_identifier(value: Any) -> str:
-    """Return a normalized model identifier for fuzzy Gemini comparisons."""
+# Model identifiers
 
+# Return a lower-case model identifier without any "models/" prefix, so ids from different API
+# responses can be compared.
+def _normalize_model_identifier(value: Any) -> str:
     normalized = str(value or "").strip().strip("/").lower()
     if "/models/" in normalized:
         normalized = normalized.rsplit("/models/", 1)[-1]
@@ -473,10 +487,9 @@ def _normalize_model_identifier(value: Any) -> str:
     return normalized
 
 
-# Return whether two Gemini model identifiers likely refer to the same model.
+# Return whether two Gemini model identifiers likely refer to the same model: they are equal after
+# normalization or share the same last path segment.
 def _model_identifiers_match(expected: Any, actual: Any) -> bool:
-    """Return whether two Gemini model identifiers likely refer to the same model."""
-
     normalized_expected = _normalize_model_identifier(expected)
     normalized_actual = _normalize_model_identifier(actual)
     if not normalized_expected or not normalized_actual:
@@ -489,10 +502,9 @@ def _model_identifiers_match(expected: Any, actual: Any) -> bool:
     return bool(expected_tail) and expected_tail == actual_tail
 
 
-# Return the UI-facing model identifier for one Gemini model payload.
+# Return the UI-facing model identifier for one Gemini model payload, taken from the first of the
+# name, id or model fields that is set.
 def _extract_model_name(payload: dict[str, Any]) -> str:
-    """Return the UI-facing model identifier for one Gemini model payload."""
-
     for key in ("name", "id", "model"):
         value = payload.get(key)
         if value:
@@ -503,10 +515,12 @@ def _extract_model_name(payload: dict[str, Any]) -> str:
     return ""
 
 
-# Return base and tuned Gemini model payloads when available.
-def _iter_model_payloads(client: Any) -> list[dict[str, Any]]:
-    """Return base and tuned Gemini model payloads when available."""
+# Model payload lookup
 
+# Return the plain payloads of the available base and tuned Gemini models, without duplicates. The
+# list call is tried with different query configs because SDK versions accept different ones; the
+# last error is raised only when no attempt produced a model.
+def _iter_model_payloads(client: Any) -> list[dict[str, Any]]:
     payloads: list[dict[str, Any]] = []
     seen_names: set[str] = set()
     last_error: Exception | None = None
@@ -516,6 +530,7 @@ def _iter_model_payloads(client: Any) -> list[dict[str, Any]]:
         None,
     )
 
+    # Query base models only, then tuned models only, then fall back to the SDK default listing.
     for query_config in query_attempts:
         try:
             response = client.models.list(config=query_config) if query_config is not None else client.models.list()
@@ -524,6 +539,7 @@ def _iter_model_payloads(client: Any) -> list[dict[str, Any]]:
             last_error = exc
             continue
 
+        # Keep each distinct model once, in the order it was returned.
         for entry in entries:
             payload = _to_plain_data(entry)
             if not isinstance(payload, dict):
@@ -540,14 +556,15 @@ def _iter_model_payloads(client: Any) -> list[dict[str, Any]]:
     return payloads
 
 
-# Return capability metadata for one Gemini model.
+# Return the plain metadata payload of one Gemini model. The direct lookup is tried with several
+# spellings of the name, then the full model list is searched; when everything fails the last error
+# is raised, or a minimal payload with just the name is returned if no call raised.
 def _get_model_payload(client: Any, model_name: str) -> dict[str, Any]:
-    """Return capability metadata for one Gemini model."""
-
     requested_name = _normalize_model_identifier(model_name)
     last_error: Exception | None = None
     attempted_names: list[str] = []
 
+    # Direct lookup by the given, normalized and models/-prefixed name.
     for candidate in (model_name, requested_name, f"models/{requested_name}"):
         candidate_name = str(candidate or "").strip()
         if not candidate_name or candidate_name in attempted_names:
@@ -561,6 +578,7 @@ def _get_model_payload(client: Any, model_name: str) -> dict[str, Any]:
         if isinstance(payload, dict) and payload:
             return payload
 
+    # Fall back to searching the model list for a matching identifier.
     for payload in _iter_model_payloads(client):
         if _model_identifiers_match(requested_name, _extract_model_name(payload)):
             return payload
@@ -571,20 +589,19 @@ def _get_model_payload(client: Any, model_name: str) -> dict[str, Any]:
     return {"name": requested_name or model_name}
 
 
-# Split one free-form value into normalized capability tokens.
-def _tokenize_string(value: Any) -> set[str]:
-    """Split one free-form value into normalized capability tokens."""
+# Capability detection
 
+# Split a free-form value into normalized capability tokens: the whole normalized name plus each
+# underscore-separated part.
+def _tokenize_string(value: Any) -> set[str]:
     normalized = _normalize_key_name(value)
     if not normalized:
         return set()
     return {normalized, *[part for part in normalized.split("_") if part]}
 
 
-# Return normalized tokens extracted from a nested model payload.
+# Return the normalized tokens found in the keys and string values of a nested model payload.
 def _collect_capability_tokens(value: Any) -> set[str]:
-    """Return normalized tokens extracted from a nested model payload."""
-
     if value is None:
         return set()
 
@@ -607,10 +624,9 @@ def _collect_capability_tokens(value: Any) -> set[str]:
     return set()
 
 
-# Return one nested boolean-ish feature flag when it exists.
+# Return the first boolean-like value stored under one of the feature names anywhere in a nested
+# payload, or None when the payload does not mention the feature at all.
 def _extract_feature_flag(value: Any, feature_names: set[str]) -> bool | None:
-    """Return one nested boolean-ish feature flag when it exists."""
-
     if isinstance(value, dict):
         for key, child in value.items():
             normalized_key = _normalize_key_name(key)
@@ -630,28 +646,27 @@ def _extract_feature_flag(value: Any, feature_names: set[str]) -> bool | None:
     return None
 
 
-# Return normalized Gemini supported action names.
+# Return the normalized names of the actions (such as generateContent) that a Gemini model payload
+# lists as supported.
 def _extract_supported_actions(raw_model: dict[str, Any]) -> set[str]:
-    """Return normalized Gemini supported action names."""
-
     raw_actions = raw_model.get("supported_actions", raw_model.get("supportedGenerationMethods", []))
     if not isinstance(raw_actions, list):
         return set()
     return {_normalize_key_name(action) for action in raw_actions if _normalize_key_name(action)}
 
 
-# Return the structured Google SDK error payload when present.
-def _get_google_error_payload(exc: Exception) -> dict[str, Any]:
-    """Return the structured Google SDK error payload when present."""
+# Structured Google errors
 
+# Return the structured Google SDK error payload (the details attribute) when it is a dict, otherwise
+# an empty dict.
+def _get_google_error_payload(exc: Exception) -> dict[str, Any]:
     details = getattr(exc, "details", None)
     return details if isinstance(details, dict) else {}
 
 
-# Return structured per-error detail entries from one Google SDK error.
+# Return the structured per-error detail entries of a Google SDK error; the details list may sit under
+# an "error" key or at the top level of the payload.
 def _get_google_error_entries(exc: Exception) -> list[dict[str, Any]]:
-    """Return structured per-error detail entries from one Google SDK error."""
-
     payload = _get_google_error_payload(exc)
     error_payload = payload.get("error") if isinstance(payload.get("error"), dict) else payload
     detail_entries = error_payload.get("details") if isinstance(error_payload, dict) else None
@@ -660,10 +675,9 @@ def _get_google_error_entries(exc: Exception) -> list[dict[str, Any]]:
     return [entry for entry in detail_entries if isinstance(entry, dict)]
 
 
-# Return the structured Google SDK error code when available.
+# Return the numeric error code of a Google SDK error, read from the exception or else from its
+# structured payload, or None when there is none.
 def _get_google_error_code(exc: Exception) -> int | None:
-    """Return the structured Google SDK error code when available."""
-
     code = getattr(exc, "code", None)
     if code is None:
         payload = _get_google_error_payload(exc)
@@ -676,10 +690,9 @@ def _get_google_error_code(exc: Exception) -> int | None:
         return None
 
 
-# Return the structured Google SDK status marker when available.
+# Return the upper-case status marker (such as RESOURCE_EXHAUSTED) of a Google SDK error, read from the
+# exception or else from its structured payload, or an empty string.
 def _get_google_error_status(exc: Exception) -> str:
-    """Return the structured Google SDK status marker when available."""
-
     status = getattr(exc, "status", None)
     if not status:
         payload = _get_google_error_payload(exc)
@@ -689,10 +702,9 @@ def _get_google_error_status(exc: Exception) -> str:
     return str(status or "").strip().upper()
 
 
-# Return the structured Google SDK message when available.
+# Return the message of a Google SDK error, read from the exception or else from its structured
+# payload, falling back to the exception text.
 def _get_google_error_message(exc: Exception) -> str:
-    """Return the structured Google SDK message when available."""
-
     message = getattr(exc, "message", None)
     if not message:
         payload = _get_google_error_payload(exc)
@@ -702,10 +714,8 @@ def _get_google_error_message(exc: Exception) -> str:
     return str(message or str(exc) or "").strip()
 
 
-# Return flattened quota violations from one structured Google SDK error.
+# Return the quota violations of all detail entries of a structured Google SDK error as one flat list.
 def _iter_quota_violations(exc: Exception) -> list[dict[str, Any]]:
-    """Return flattened quota violations from one structured Google SDK error."""
-
     violations: list[dict[str, Any]] = []
     for entry in _get_google_error_entries(exc):
         raw_violations = entry.get("violations")
@@ -717,10 +727,9 @@ def _iter_quota_violations(exc: Exception) -> list[dict[str, Any]]:
     return violations
 
 
-# Return whether the structured error likely refers to the provided model.
+# Return whether the structured error likely refers to the provided model: an empty model name always
+# matches, otherwise the model must appear in the message or in a quota violation dimension.
 def _error_mentions_model(exc: Exception, model_name: str) -> bool:
-    """Return whether the structured error likely refers to the provided model."""
-
     normalized_model = _normalize_model_identifier(model_name)
     if not normalized_model:
         return True
@@ -739,17 +748,14 @@ def _error_mentions_model(exc: Exception, model_name: str) -> bool:
     return False
 
 
-# Return whether the error represents one Google quota/rate-limit failure.
+# Return whether the error is a Google quota or rate-limit failure (HTTP 429 or RESOURCE_EXHAUSTED).
 def _is_resource_exhausted_error(exc: Exception) -> bool:
-    """Return whether the error represents one Google quota/rate-limit failure."""
-
     return _get_google_error_code(exc) == 429 or _get_google_error_status(exc) == "RESOURCE_EXHAUSTED"
 
 
-# Return whether the error indicates zero entitlement for the current key/model.
+# Return whether the error indicates zero entitlement for the current key and model: a quota failure
+# for this model whose message states a limit of 0.
 def _is_zero_quota_error(exc: Exception, model_name: str) -> bool:
-    """Return whether the error indicates zero entitlement for the current key/model."""
-
     if not _is_resource_exhausted_error(exc) or not _error_mentions_model(exc, model_name):
         return False
 
@@ -760,10 +766,9 @@ def _is_zero_quota_error(exc: Exception, model_name: str) -> bool:
     return False
 
 
-# Return whether the backend says the model cannot serve generateContent.
+# Return whether the backend says the model cannot serve generateContent: a not-found error for this
+# model that mentions the method, or any message that pairs generateContent with an unsupported marker.
 def _is_generate_content_unsupported_error(exc: Exception, model_name: str) -> bool:
-    """Return whether the backend says the model cannot serve ``generateContent``."""
-
     code = _get_google_error_code(exc)
     status = _get_google_error_status(exc)
     message = _normalize_key_name(_get_google_error_message(exc))
@@ -783,10 +788,8 @@ def _is_generate_content_unsupported_error(exc: Exception, model_name: str) -> b
     )
 
 
-# Return whether one backend error explicitly says tools are unsupported.
+# Return whether a backend error message explicitly says that tools or function calling are unsupported.
 def _is_tool_unsupported_error(exc: Exception) -> bool:
-    """Return whether one backend error explicitly says tools are unsupported."""
-
     message = _normalize_key_name(_get_google_error_message(exc))
     if not message:
         return False
@@ -807,10 +810,8 @@ def _is_tool_unsupported_error(exc: Exception) -> bool:
     return has_tool_marker and has_negative_marker
 
 
-# Return whether the backend explicitly rejected Gemini thinking_level.
+# Return whether the backend explicitly rejected Gemini thinking_level with an invalid-argument error.
 def _is_thinking_level_unsupported_error(exc: Exception) -> bool:
-    """Return whether the backend explicitly rejected Gemini ``thinking_level``."""
-
     code = _get_google_error_code(exc)
     status = _get_google_error_status(exc)
     if code != 400 and status != "INVALID_ARGUMENT":
@@ -822,10 +823,9 @@ def _is_thinking_level_unsupported_error(exc: Exception) -> bool:
     ) or "thinking_level_is_not_supported" in message
 
 
-# Update runtime caches from one structured Google SDK error.
+# Update the runtime caches from a structured Google SDK error and return a short code naming what was
+# learned (for example "zero_quota"), or None when the error says nothing about the model.
 def _learn_from_google_error(model_name: str, exc: Exception) -> str | None:
-    """Update runtime caches from one structured Google SDK error."""
-
     if _is_generate_content_unsupported_error(exc, model_name):
         _update_cached_model_capabilities(model_name, supports_generate_content=False)
         _set_cached_model_availability(model_name, False, "unsupported_generate_content")
@@ -857,10 +857,11 @@ def _learn_from_google_error(model_name: str, exc: Exception) -> str | None:
     return None
 
 
-# Return normalized reasoning level options from one nested metadata value.
-def _coerce_reasoning_level_options(value: Any) -> list[str]:
-    """Return normalized reasoning level options from one nested metadata value."""
+# Capability snapshot
 
+# Return the lower-case reasoning level options from a metadata value, looking inside option containers
+# such as enum or options; on/off/true/false entries are toggles, not levels, and are skipped.
+def _coerce_reasoning_level_options(value: Any) -> list[str]:
     if isinstance(value, dict):
         for key in ("enum", "options", "allowed_options", "allowedOptions", "values", "items"):
             options = _coerce_reasoning_level_options(value.get(key))
@@ -877,10 +878,9 @@ def _coerce_reasoning_level_options(value: Any) -> list[str]:
     return normalized_values
 
 
-# Search nested Gemini metadata for explicit reasoning-level options.
+# Search nested Gemini metadata for explicit reasoning-level options published under a thinking_level,
+# think_level or reasoning_effort key.
 def _extract_reasoning_level_options(value: Any) -> list[str]:
-    """Search nested Gemini metadata for explicit reasoning-level options."""
-
     if isinstance(value, dict):
         for key, child in value.items():
             normalized_key = _normalize_key_name(key)
@@ -902,13 +902,14 @@ def _extract_reasoning_level_options(value: Any) -> list[str]:
     return []
 
 
-# Return endpoint-scoped Gemini capabilities for one model.
+# Return the endpoint-scoped Gemini capabilities of one model as a dict of supports_* flags plus the
+# selectable thinking levels. Facts learned at runtime from backend errors (the capability cache) win
+# over what the published model metadata suggests, and the resolved values are cached again.
 def _build_model_capability_snapshot(
     model_name: str,
     raw_model: dict[str, Any],
 ) -> dict[str, Any]:
-    """Return endpoint-scoped Gemini capabilities for one model."""
-
+    # Gather the cached facts, the metadata tokens and whether this is a multimodal Gemini model.
     cached_capabilities = _get_cached_model_capabilities(model_name)
     capability_tokens = _collect_capability_tokens(raw_model)
     supported_actions = _extract_supported_actions(raw_model)
@@ -918,6 +919,7 @@ def _build_model_capability_snapshot(
         and not any(marker in normalized_model_name for marker in ("embedding", "imagen", "veo"))
     )
 
+    # Explicit feature flags published in the model metadata; None means the metadata does not say.
     explicit_tool_support = _extract_feature_flag(raw_model, TOOL_CAPABILITY_NAMES)
     explicit_vision_support = _extract_feature_flag(raw_model, VISION_CAPABILITY_NAMES)
     explicit_audio_input_support = _extract_feature_flag(raw_model, AUDIO_INPUT_CAPABILITY_NAMES)
@@ -925,12 +927,14 @@ def _build_model_capability_snapshot(
     explicit_reasoning_support = _extract_feature_flag(raw_model, REASONING_CAPABILITY_NAMES)
     explicit_reasoning_level_options = _extract_reasoning_level_options(raw_model)
 
+    # Content generation: the cached fact, else the supported action names.
     supports_generate_content = cached_capabilities.get("supports_generate_content")
     if not isinstance(supports_generate_content, bool):
         # The public model listing does not always expose one clean boolean, so
         # fall back to supported action names when the cache is still empty.
         supports_generate_content = any("generatecontent" in action for action in supported_actions)
 
+    # Tool calling: the cached fact, else the explicit flag, else a tool token or generateContent support.
     supports_tool_calling = cached_capabilities.get("supports_tool_calling")
     if not isinstance(supports_tool_calling, bool):
         supports_tool_calling = (
@@ -939,6 +943,8 @@ def _build_model_capability_snapshot(
             else bool(capability_tokens & TOOL_CAPABILITY_NAMES) or supports_generate_content
         )
 
+    # Vision: the cached fact, else the explicit flag, else vision/multimodal tokens or a known
+    # multimodal Gemini model that can generate content.
     supports_vision = cached_capabilities.get("supports_vision")
     if not isinstance(supports_vision, bool):
         supports_vision = (
@@ -954,6 +960,8 @@ def _build_model_capability_snapshot(
             )
         )
 
+    # Audio and video input: the cached fact, else the explicit flag, else matching tokens or a known
+    # multimodal Gemini model that can generate content.
     supports_audio_input = cached_capabilities.get("supports_audio_input")
     if not isinstance(supports_audio_input, bool):
         supports_audio_input = (
@@ -974,6 +982,8 @@ def _build_model_capability_snapshot(
             )
         )
 
+    # Thinking: published metadata decides when it mentions reasoning at all, otherwise the cached
+    # fact is used, and the default is off.
     published_thinking_metadata = (
         "thinking" in raw_model
         or explicit_reasoning_support is not None
@@ -1000,6 +1010,9 @@ def _build_model_capability_snapshot(
     if not think_level_options and isinstance(cached_level_options, list):
         think_level_options = [str(item) for item in cached_level_options if str(item).strip()]
 
+    # Level selection: supported when level options exist, otherwise the cached fact, default off. The
+    # default levels fill in when selection is supported without published options, and the options
+    # are cleared when it is not supported.
     cached_think_level_support = cached_capabilities.get("supports_think_level")
     supports_think_level = (
         True
@@ -1014,6 +1027,7 @@ def _build_model_capability_snapshot(
     if not supports_think_level:
         think_level_options = []
 
+    # A plain on/off thinking toggle is offered when thinking is supported without selectable levels.
     supports_think_toggle = cached_capabilities.get("supports_think_toggle")
     if not isinstance(supports_think_toggle, bool):
         supports_think_toggle = bool(supports_thinking) and not bool(supports_think_level)
@@ -1029,6 +1043,9 @@ def _build_model_capability_snapshot(
         "supports_think_level": bool(supports_think_level),
         "think_level_options": think_level_options,
     }
+
+    # Cache the snapshot, except for thinking facts that were only defaulted because neither the
+    # metadata nor an earlier error said anything, so later metadata can still decide them.
     cached_snapshot = dict(snapshot)
     if not published_thinking_metadata:
         cached_snapshot.pop("supports_thinking", None)
@@ -1044,10 +1061,11 @@ def _build_model_capability_snapshot(
     return snapshot
 
 
-# Return one tool-call arguments payload as a dictionary.
-def _normalize_tool_call_arguments(raw_arguments: Any) -> dict[str, Any]:
-    """Return one tool-call arguments payload as a dictionary."""
+# Tool calls and attachments
 
+# Return a tool-call arguments payload as a dict: JSON object strings are parsed, and any other
+# value is wrapped as {"value": ...}.
+def _normalize_tool_call_arguments(raw_arguments: Any) -> dict[str, Any]:
     if raw_arguments is None:
         return {}
     if isinstance(raw_arguments, dict):
@@ -1064,10 +1082,9 @@ def _normalize_tool_call_arguments(raw_arguments: Any) -> dict[str, Any]:
     return {"value": raw_arguments}
 
 
-# Decode one base64-encoded image attachment.
+# Decode a base64-encoded image attachment, accepting a data: URL; an empty value gives empty bytes.
+# Invalid base64 raises, unlike _decode_binary_payload.
 def _decode_image_bytes(image_base64: str) -> bytes:
-    """Decode one base64-encoded image attachment."""
-
     payload = str(image_base64 or "").strip()
     if not payload:
         return b""
@@ -1076,10 +1093,9 @@ def _decode_image_bytes(image_base64: str) -> bytes:
     return base64.b64decode(payload)
 
 
-# Convert tool result content into Gemini function response JSON.
+# Convert tool result content into a Gemini function response dict: dicts and JSON object strings
+# are used as they are, and any other value is wrapped as {"result": ...}.
 def _normalize_tool_response_payload(content: Any) -> dict[str, Any]:
-    """Convert tool result content into Gemini function response JSON."""
-
     if isinstance(content, dict):
         return content
 
@@ -1101,10 +1117,11 @@ def _normalize_tool_response_payload(content: Any) -> dict[str, Any]:
     return {"result": str(content or "")}
 
 
-# Normalize OpenAI-style or Gemini-style content parts into Gemini request parts.
+# Normalize OpenAI-style or Gemini-style content parts into Gemini request parts. Parts that already
+# carry Gemini fields (text, thought, function call or response, inline or file data) are kept with
+# those fields; otherwise text, image and file parts in the OpenAI shape are converted.
 def _normalize_google_request_parts(raw_parts: Any) -> list[dict[str, Any]]:
-    """Normalize OpenAI-style or Gemini-style content parts into Gemini request parts."""
-
+    # Accept a single part or a list of parts.
     if isinstance(raw_parts, dict):
         raw_parts = [raw_parts]
     if not isinstance(raw_parts, list):
@@ -1115,6 +1132,7 @@ def _normalize_google_request_parts(raw_parts: Any) -> list[dict[str, Any]]:
         if raw_part is None:
             continue
 
+        # A bare value becomes a text part.
         if not isinstance(raw_part, dict):
             text_value = str(raw_part or "")
             if text_value:
@@ -1135,6 +1153,7 @@ def _normalize_google_request_parts(raw_parts: Any) -> list[dict[str, Any]]:
         if thought_signature:
             direct_part["thought_signature"] = thought_signature
 
+        # Function calls and function responses (a response may carry nested parts of its own).
         function_call = raw_part.get("function_call")
         if isinstance(function_call, dict):
             function_name = str(function_call.get("name", "") or "").strip()
@@ -1157,6 +1176,7 @@ def _normalize_google_request_parts(raw_parts: Any) -> list[dict[str, Any]]:
                 if response_parts:
                     direct_part["function_response"]["parts"] = response_parts
 
+        # Inline binary data (base64 text is decoded to bytes) and file references by URI.
         inline_data = raw_part.get("inline_data")
         if isinstance(inline_data, dict):
             raw_data = inline_data.get("data")
@@ -1178,11 +1198,13 @@ def _normalize_google_request_parts(raw_parts: Any) -> list[dict[str, Any]]:
                 if mime_type:
                     direct_part["file_data"]["mime_type"] = mime_type
 
+        # A part that carried any Gemini field is used as is.
         if direct_part:
             normalized_parts.append(direct_part)
             continue
 
         part_type = _normalize_key_name(raw_part.get("type"))
+
         # Fall back to OpenAI-style content-part normalization when the payload
         # came from a provider-agnostic transcript entry.
         if part_type in {"text", "input_text"}:
@@ -1191,6 +1213,7 @@ def _normalize_google_request_parts(raw_parts: Any) -> list[dict[str, Any]]:
                 normalized_parts.append({"text": text_value})
             continue
 
+        # Image parts become inline data; a data: URL supplies its own MIME type, otherwise JPEG is assumed.
         if part_type in {"image_url", "input_image"}:
             image_payload = raw_part.get("image_url", raw_part.get("input_image"))
             if isinstance(image_payload, dict):
@@ -1215,6 +1238,7 @@ def _normalize_google_request_parts(raw_parts: Any) -> list[dict[str, Any]]:
                 )
             continue
 
+        # File parts that reference a URI become file data parts.
         if part_type in {"file", "input_file"}:
             file_payload = raw_part.get("file_data") or raw_part.get("file")
             if isinstance(file_payload, dict):
@@ -1229,14 +1253,15 @@ def _normalize_google_request_parts(raw_parts: Any) -> list[dict[str, Any]]:
     return normalized_parts
 
 
-# Serialize one assistant response part for transcript replay.
+# Serialize one assistant response part for transcript replay, keeping text (unless include_text is
+# false), the thought flag and signature, and function calls. Return None when nothing is left.
 def _build_google_history_part(raw_part: Any, *, include_text: bool = True) -> dict[str, Any] | None:
-    """Serialize one assistant response part for transcript replay."""
-
     part = _to_plain_data(raw_part)
     if not isinstance(part, dict):
         return None
 
+    # Copy the text (when requested) and the thought flag, then the thought signature, which Gemini needs
+    # back to continue a reasoning turn.
     history_part: dict[str, Any] = {}
     if include_text and part.get("text") is not None:
         history_part["text"] = _sanitize_generated_text(str(part.get("text", "") or ""))
@@ -1249,6 +1274,7 @@ def _build_google_history_part(raw_part: Any, *, include_text: bool = True) -> d
     if thought_signature:
         history_part["thought_signature"] = thought_signature
 
+    # Keep function calls with normalized arguments.
     function_call = part.get("function_call")
     if isinstance(function_call, dict):
         function_name = str(function_call.get("name", "") or "").strip()
@@ -1263,15 +1289,12 @@ def _build_google_history_part(raw_part: Any, *, include_text: bool = True) -> d
 
 # Return whether preserved Gemini history already includes function calls.
 def _history_parts_have_function_call(parts: list[dict[str, Any]]) -> bool:
-    """Return whether preserved Gemini history already includes function calls."""
-
     return any(isinstance(part, dict) and isinstance(part.get("function_call"), dict) for part in parts)
 
 
-# Return whether preserved Gemini parts contain a function call without its signature.
+# Return whether preserved Gemini parts contain a function call without its thought signature, which
+# makes the parts unusable for a lossless replay.
 def _google_parts_have_unsigned_function_call(raw_parts: Any) -> bool:
-    """Return whether preserved Gemini parts contain a function call without its signature."""
-
     if isinstance(raw_parts, dict):
         raw_parts = [raw_parts]
     if not isinstance(raw_parts, list):
@@ -1288,16 +1311,19 @@ def _google_parts_have_unsigned_function_call(raw_parts: Any) -> bool:
     return False
 
 
-# Convert ASLM chat messages into Gemini-compatible contents.
+# Convert ASLM chat messages into Gemini-compatible contents. Return the system instruction (all system
+# messages joined) and the list of user/model contents with text, images, media, tool calls and tool
+# responses as Gemini parts.
 def _build_google_contents(messages: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
-    """Convert ASLM chat messages into Gemini-compatible contents."""
-
+    # Collected system messages, the resulting contents, decoded images by digest (so a repeated image
+    # is decoded once) and a flag that drops tool results whose function call could not be replayed.
     system_fragments: list[str] = []
     contents: list[dict[str, Any]] = []
     image_bytes_cache: dict[str, bytes] = {}
     skip_orphan_tool_responses = False
 
     for message_index, message in enumerate(messages, start=1):
+        # Read the message fields; list and dict content is handled through the structured parts below.
         role = str(message.get("role", "user")).lower()
         raw_content = message.get("content", "")
         content = str(raw_content or "") if not isinstance(raw_content, (list, dict)) else ""
@@ -1305,6 +1331,7 @@ def _build_google_contents(messages: list[dict[str, Any]]) -> tuple[str, list[di
         image_mime_types = message.get("image_mime_types") or []
         media = message.get("media") if isinstance(message.get("media"), list) else []
 
+        # System messages are collected into the system instruction instead of the contents.
         if role == "system":
             if content:
                 system_fragments.append(content)
@@ -1312,6 +1339,8 @@ def _build_google_contents(messages: list[dict[str, Any]]) -> tuple[str, list[di
 
         parts: list[dict[str, Any]] = []
 
+        # Tool results become a function response of the user turn, unless the call they answer
+        # was not replayed.
         if role == "tool":
             if skip_orphan_tool_responses:
                 continue
@@ -1352,6 +1381,7 @@ def _build_google_contents(messages: list[dict[str, Any]]) -> tuple[str, list[di
         if role == "assistant" and has_unsigned_google_function_call:
             skip_orphan_tool_responses = True
 
+        # Attach images as inline data (JPEG unless a MIME type was given), decoding each distinct image once.
         for image_index, image_base64 in enumerate(images):
             mime_type = "image/jpeg"
             if image_index < len(image_mime_types):
@@ -1372,6 +1402,7 @@ def _build_google_contents(messages: list[dict[str, Any]]) -> tuple[str, list[di
                     }
                 )
 
+        # Attach other media items (audio, video, files) as inline data with their own MIME type.
         for media_item in media:
             if not isinstance(media_item, dict):
                 continue
@@ -1406,6 +1437,7 @@ def _build_google_contents(messages: list[dict[str, Any]]) -> tuple[str, list[di
                     }
                 )
 
+        # Messages without any usable part are dropped; assistant messages map to the model role.
         if not parts:
             continue
 
@@ -1419,14 +1451,14 @@ def _build_google_contents(messages: list[dict[str, Any]]) -> tuple[str, list[di
     return "\n\n".join(fragment for fragment in system_fragments if fragment).strip(), contents
 
 
-# Return Gemini-compatible tool declarations for one or more servers.
+# Return the Gemini tool declarations for one or more tool servers together with the alias lookup
+# used to dispatch calls; the declarations list is empty when the servers expose no usable tool.
 def _build_google_tools(
     tool_server_ids: list[str],
     model_name: str,
     tool_context: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
-    """Return Gemini-compatible tool declarations for one or more servers."""
-
+    # Build the OpenAI-style definitions through the shared tool registry.
     openai_tools, tool_lookup = tool_registry.build_ollama_tools(
         tool_server_ids,
         engine="google-genai",
@@ -1439,6 +1471,7 @@ def _build_google_tools(
     if not openai_tools:
         return [], tool_lookup
 
+    # Convert each definition into a Gemini function declaration.
     function_declarations: list[dict[str, Any]] = []
     for tool_definition in openai_tools:
         function_payload = tool_definition.get("function", {}) if isinstance(tool_definition, dict) else {}
@@ -1459,10 +1492,10 @@ def _build_google_tools(
     return [{"function_declarations": function_declarations}], tool_lookup
 
 
-# Convert a stop payload into the Gemini list form.
-def _coerce_stop_sequences(value: Any) -> list[str] | None:
-    """Convert a stop payload into the Gemini list form."""
+# Request configuration
 
+# Convert a stop payload (string, list or other value) into the Gemini list form, or None when empty.
+def _coerce_stop_sequences(value: Any) -> list[str] | None:
     if value is None:
         return None
     if isinstance(value, str):
@@ -1474,7 +1507,10 @@ def _coerce_stop_sequences(value: Any) -> list[str] | None:
     return [str(value)]
 
 
-# Split generic generation options into a Gemini GenerateContentConfig payload.
+# Split generic generation options into a Gemini GenerateContentConfig payload: supported options are
+# copied under their Gemini names, thinking options are collected into thinking_config, the ASLM
+# think and think_level values are mapped onto it, and tools are attached with automatic function
+# calling disabled.
 def _build_google_request_config(
     options: dict[str, Any],
     *,
@@ -1485,8 +1521,6 @@ def _build_google_request_config(
     think_level_param_name: str = "thinking_level",
     tools: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Split generic generation options into a Gemini ``GenerateContentConfig`` payload."""
-
     config: dict[str, Any] = {}
     if system_instruction:
         config["system_instruction"] = system_instruction
@@ -1514,6 +1548,7 @@ def _build_google_request_config(
             continue
         config[normalized_key] = raw_value
 
+    # Map the ASLM think and think_level values onto the thinking config.
     normalized_think_param_name = _normalize_key_name(think_param_name)
     normalized_level_param_name = _normalize_key_name(think_level_param_name)
 
@@ -1534,10 +1569,12 @@ def _build_google_request_config(
         elif think_level_param_name:
             thinking_config[str(think_level_param_name)] = think_level
 
+    # Whenever any thinking option is set, thought summaries are requested unless turned off explicitly.
     if thinking_config:
         thinking_config.setdefault("include_thoughts", True)
         config["thinking_config"] = thinking_config
 
+    # Attach the tool declarations; function calling stays in AUTO mode unless the caller set its own.
     if tools:
         # Disable automatic client-side execution because ASLM resolves tools
         # locally and needs the raw function-call payloads back.
@@ -1551,18 +1588,14 @@ def _build_google_request_config(
     return config
 
 
-# Return whether one Gemini request config currently sends thinking_level.
+# Return whether a Gemini request config currently sends thinking_level.
 def _config_uses_thinking_level(config: dict[str, Any]) -> bool:
-    """Return whether one Gemini request config currently sends ``thinking_level``."""
-
     thinking_config = config.get("thinking_config")
     return isinstance(thinking_config, dict) and thinking_config.get("thinking_level") is not None
 
 
 # Return a cloned Gemini request config without thinking_level.
 def _strip_thinking_level_from_config(config: dict[str, Any]) -> dict[str, Any]:
-    """Return a cloned Gemini request config without ``thinking_level``."""
-
     normalized_config = dict(config or {})
     thinking_config = normalized_config.get("thinking_config")
     if not isinstance(thinking_config, dict):
@@ -1578,10 +1611,9 @@ def _strip_thinking_level_from_config(config: dict[str, Any]) -> dict[str, Any]:
     return normalized_config
 
 
-# Apply learned runtime capability overrides to one Gemini request config.
+# Apply learned runtime capability overrides to a Gemini request config: thinking_level is removed
+# for models that were learned not to support it. Return a copy and leave the input untouched.
 def _apply_learned_request_preferences(model_name: str, config: dict[str, Any]) -> dict[str, Any]:
-    """Apply learned runtime capability overrides to one Gemini request config."""
-
     cached_capabilities = _get_cached_model_capabilities(model_name)
     if cached_capabilities.get("supports_think_level") is False:
         return _strip_thinking_level_from_config(config)
@@ -1590,8 +1622,6 @@ def _apply_learned_request_preferences(model_name: str, config: dict[str, Any]) 
 
 # Return a request config clone with function tools disabled.
 def _strip_tools_from_config(config: dict[str, Any]) -> dict[str, Any]:
-    """Return a request config clone with function tools disabled."""
-
     normalized_config = dict(config or {})
     normalized_config.pop("tools", None)
     normalized_config.pop("automatic_function_calling", None)
@@ -1599,21 +1629,22 @@ def _strip_tools_from_config(config: dict[str, Any]) -> dict[str, Any]:
     return normalized_config
 
 
+# Tool events and messages
+
 # Serialize one tool invocation so the UI can render it during streaming.
 def _build_tool_event(tool_lookup: dict[str, dict[str, Any]], tool_call: dict[str, Any]) -> dict[str, Any]:
-    """Serialize one tool invocation so the UI can render it during streaming."""
     return tool_registry.build_tool_event(tool_lookup, tool_call)
 
 
-# Build a tool message payload for the shared ASLM transcript.
+# Build a tool message payload for the shared ASLM transcript: the model-facing content, the extras
+# kept for the UI and, when a tool event is given, the alias, server and display details.
 def _build_tool_message(
     tool_name: str,
     tool_call_id: str,
     content: str | dict[str, Any],
     tool_event: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Build a tool message payload for the shared ASLM transcript."""
-
+    # Split the result into the model-facing content and the extras kept for the UI.
     model_content, tool_extras = tool_registry.split_tool_result_payload(content)
     payload: dict[str, Any] = {
         "role": "tool",
@@ -1623,6 +1654,7 @@ def _build_tool_message(
     }
     payload.update(tool_extras)
 
+    # Attach the alias, server and display details of the invocation, with the tool name as fallback.
     if tool_event:
         payload.update(
             {
@@ -1640,18 +1672,27 @@ def _build_tool_message(
     return payload
 
 
-# Split streamed reasoning text from visible content.
-class _ReasoningTextParser:
+# Reasoning text parsing
 
-    # Initialize the parser state.
+# Streaming parser that splits inline reasoning (text wrapped in tags such as <think>) from visible
+# content. It is stateful across chunks: it remembers whether it is inside a reasoning block and holds
+# back a tail that may be the beginning of a tag cut by a chunk boundary. Opening tags are accepted
+# only at the start of the text or after a clear separator, so tags quoted in prose stay visible.
+class _ReasoningTextParser:
+    # Create a parser for the given (opening, closing) tag pairs and start outside a reasoning block.
     def __init__(self, tag_pairs: tuple[tuple[str, str], ...] = REASONING_TAG_PAIRS) -> None:
+        # Opening and closing tags, in the same order as the pairs.
         self._start_tags = [start for start, _end in tag_pairs]
         self._end_tags = [end for _start, end in tag_pairs]
+
+        # Parsing state: inside a reasoning block, the held-back possible tag prefix and the last
+        # visible character of earlier chunks (None before any text).
         self._in_reasoning = False
         self._pending = ""
         self._visible_boundary_char: str | None = None
 
-    # Find next tag.
+    # Return (index, tag) for the earliest of the given tags found in the source, or None. Outside a
+    # reasoning block an opening tag only counts when it sits at a start boundary.
     def _find_next_tag(self, source: str, tags: list[str]) -> tuple[int, str] | None:
         next_match: tuple[int, str] | None = None
         for tag in tags:
@@ -1670,7 +1711,8 @@ class _ReasoningTextParser:
                 next_match = (index, tag)
         return next_match
 
-    # Accept opening tags only at the start of text or after a clear separator.
+    # Return whether a tag at the given index may open a reasoning block: it must start the text or
+    # follow a newline, a ">" or punctuation, ignoring horizontal whitespace before it.
     def _is_reasoning_start_boundary(self, source: str, tag_index: int) -> bool:
         cursor = tag_index - 1
         while cursor >= 0 and source[cursor] in " \t\f\v":
@@ -1687,7 +1729,8 @@ class _ReasoningTextParser:
                 self._visible_boundary_char = character
                 return
 
-    # Split possible tag prefix.
+    # Split off the tail of the source that could be the beginning of one of the tags, because a tag may
+    # be cut by a chunk boundary. Return the text that is safe to emit and the held-back tail.
     @staticmethod
     def _split_possible_tag_prefix(source: str, tags: list[str]) -> tuple[str, str]:
         reserve = 0
@@ -1701,17 +1744,20 @@ class _ReasoningTextParser:
             return source[:-reserve], source[-reserve:]
         return source, ""
 
-    # Return parsed (thinking, visible_content) fragments.
+    # Parse one chunk and return the (thinking, visible_content) fragments it completes. Content that
+    # the SDK already flags as reasoning is returned entirely as thinking; otherwise reasoning tags
+    # switch between the two, and a possible partial tag at the end is kept for the next call.
     def feed(self, content: str, reasoning_type: str | None = None) -> tuple[str, str]:
-        """Return parsed ``(thinking, visible_content)`` fragments."""
-
         thinking_parts: list[str] = []
         content_parts: list[str] = []
 
+        # SDK-flagged reasoning needs no tag parsing.
         normalized_reasoning_type = _normalize_key_name(reasoning_type)
         if normalized_reasoning_type in {"reasoning", "thought", "thinking"}:
             return str(content or ""), ""
 
+        # Prepend the held-back tail and consume the text tag by tag, toggling the reasoning state
+        # at every tag. Text without a further tag is emitted except for a possible partial tag.
         source = f"{self._pending}{content or ''}"
         self._pending = ""
 
@@ -1741,10 +1787,9 @@ class _ReasoningTextParser:
 
         return "".join(thinking_parts), "".join(content_parts)
 
-    # Flush any pending partial fragment at the end of the stream.
+    # Flush the held-back partial fragment at the end of the stream and return it as (thinking, visible),
+    # depending on whether the parser is still inside a reasoning block.
     def flush(self) -> tuple[str, str]:
-        """Flush any pending partial fragment at the end of the stream."""
-
         pending = self._pending
         self._pending = ""
         if not pending:
@@ -1755,10 +1800,10 @@ class _ReasoningTextParser:
         return "", pending
 
 
-# Return the first-candidate response parts from one SDK response object.
-def _get_response_parts(response: Any) -> list[Any]:
-    """Return the first-candidate response parts from one SDK response object."""
+# Response streaming
 
+# Return the parts of the first candidate of an SDK response object (or streamed chunk).
+def _get_response_parts(response: Any) -> list[Any]:
     parts = getattr(response, "parts", None)
     if isinstance(parts, list):
         return parts
@@ -1777,13 +1822,12 @@ def _get_response_parts(response: Any) -> list[Any]:
     return parts if isinstance(parts, list) else []
 
 
-# Parse visible text, reasoning text, and tool calls from one SDK response.
+# Parse response parts into (reasoning text, visible text, tool calls). Text goes through the
+# reasoning parser, so SDK-flagged thoughts and tagged reasoning both end up as reasoning text.
 def _parse_google_response_parts(
     parser: _ReasoningTextParser,
     parts: list[Any],
 ) -> tuple[str, str, list[dict[str, Any]]]:
-    """Parse visible text, reasoning text, and tool calls from one SDK response."""
-
     thinking_parts: list[str] = []
     content_parts: list[str] = []
     tool_calls: list[dict[str, Any]] = []
@@ -1793,6 +1837,7 @@ def _parse_google_response_parts(
         if not isinstance(part, dict):
             continue
 
+        # Function-call parts become tool calls and carry no text.
         function_call = part.get("function_call")
         if isinstance(function_call, dict):
             function_name = str(function_call.get("name", "") or "").strip()
@@ -1806,6 +1851,8 @@ def _parse_google_response_parts(
                 )
             continue
 
+        # Text parts are cleaned of control tokens and split into reasoning and visible text; parts
+        # flagged as thoughts by the SDK count as reasoning.
         text_fragment = _sanitize_generated_text(str(part.get("text", "") or ""))
         if not text_fragment:
             continue
@@ -1820,7 +1867,10 @@ def _parse_google_response_parts(
     return "".join(thinking_parts), "".join(content_parts), tool_calls
 
 
-# Stream one Gemini round and return the assembled assistant message.
+# Run one Gemini round as a generator: yield {"message": ...} chunks while the model answers (or one
+# chunk for a non-streaming call when stream is false) and return the assembled assistant message,
+# with its OpenAI-style tool calls and the Gemini-native google_parts used for lossless replay. When
+# the endpoint rejects thinking_level before any output, the request is retried once without it.
 def _stream_google_round(
     client: Any,
     model_name: str,
@@ -1829,8 +1879,8 @@ def _stream_google_round(
     *,
     stream: bool = True,
 ):
-    """Stream one Gemini round and return the assembled assistant message."""
-
+    # Accumulated answer: visible text, reasoning text, deduplicated tool calls with their signatures,
+    # the Gemini parts for replay and whether any chunk was already streamed to the caller.
     assistant_content = ""
     assistant_thinking = ""
     tool_calls: list[dict[str, Any]] = []
@@ -1839,6 +1889,7 @@ def _stream_google_round(
     parser = _ReasoningTextParser()
     yielded_chunk = False
 
+    # Apply learned request fixes first.
     effective_config = _apply_learned_request_preferences(model_name, config)
     allow_thinking_level_retry = _config_uses_thinking_level(effective_config)
 
@@ -1858,6 +1909,7 @@ def _stream_google_round(
                 if _abort_event.is_set():
                     break
 
+                # Keep thought signatures and function calls of the chunk for replay; text is recorded below.
                 chunk_parts = _get_response_parts(raw_chunk)
                 for raw_part in chunk_parts:
                     history_part = _build_google_history_part(raw_part, include_text=False)
@@ -1871,6 +1923,8 @@ def _stream_google_round(
                     chunk_parts,
                 )
 
+                # Record new text in the answer and the replay history, then stream it to the caller.
+                # Thinking text fills a preceding thought part that has no text yet.
                 if thinking_part or content_part:
                     yielded_chunk = True
                     assistant_content += content_part
@@ -1916,6 +1970,8 @@ def _stream_google_round(
                     )
             break
         except Exception as exc:
+            # Learn from the error, retry once without thinking_level if the endpoint rejected it before
+            # any output was streamed, and re-raise every other failure.
             _learn_from_google_error(model_name, exc)
             if (
                 allow_thinking_level_retry
@@ -1949,6 +2005,8 @@ def _stream_google_round(
             payload["thinking"] = tail_thinking
         yield {"message": payload}
 
+    # Assemble the final message: tool calls in the OpenAI shape for the shared tool loop, and the
+    # Gemini-native parts for replay, to which function calls are added if the stream reported none.
     assistant_message: dict[str, Any] = {"role": "assistant", "content": assistant_content}
     if assistant_thinking:
         assistant_message["thinking"] = assistant_thinking
@@ -1977,16 +2035,16 @@ def _stream_google_round(
     if assistant_history_parts:
         assistant_message["google_parts"] = assistant_history_parts
 
+    # Emit the final message once when text was assembled without having been streamed.
     if not yielded_chunk and (assistant_content or assistant_thinking):
         yield {"message": assistant_message}
 
     return assistant_message
 
 
-# Yield every chunk from a round stream and return the final assistant message.
+# Re-yield every chunk of a round stream and return its final assistant message, or an empty
+# assistant message when the stream returned nothing.
 def _yield_stream_round(round_stream):
-    """Yield every chunk from a round stream and return the final assistant message."""
-
     while True:
         try:
             yield next(round_stream)
@@ -1994,10 +2052,10 @@ def _yield_stream_round(round_stream):
             return stop.value or {"role": "assistant", "content": ""}
 
 
-# Convert one assembled assistant message back into Gemini conversation content.
+# Convert an assembled assistant message back into Gemini conversation content: preserved google_parts
+# are replayed as they are, otherwise text and tool calls are rebuilt from the generic transcript
+# shape. Return None when the message has nothing to send.
 def _assistant_message_to_content(assistant_message: dict[str, Any]) -> dict[str, Any] | None:
-    """Convert one assembled assistant message back into Gemini conversation content."""
-
     parts = _normalize_google_request_parts(assistant_message.get("google_parts"))
     if parts:
         return {"role": "model", "parts": parts}
@@ -2033,7 +2091,14 @@ def _assistant_message_to_content(assistant_message: dict[str, Any]) -> dict[str
     return {"role": "model", "parts": parts}
 
 
-# Resolve local tools through Gemini function-calling while keeping ASLM transcript markers.
+# Tool loop
+
+# Resolve local tools through Gemini function calling while keeping ASLM transcript markers. The
+# generator yields UI chunks ("message"), "transcript_message", "tool_events" and "tool_result" items.
+# Each round streams one model answer, runs the tool calls it requested (with cooldown, duplicate and
+# quota guards) and sends the results back as function responses, until the model answers without
+# tools, the round limit is reached or the user cancels. Repeated blocked or cancelled results force
+# one final answer without tools.
 def _run_tool_loop(
     client: Any,
     model_name: str,
@@ -2048,8 +2113,8 @@ def _run_tool_loop(
     think_level_param_name: str = "thinking_level",
     stream: bool = True,
 ):
-    """Resolve local tools through Gemini function-calling while keeping ASLM transcript markers."""
-
+    # Build the tool declarations, the Gemini conversation and the request config with the
+    # available-tools prompt added to the system instruction.
     tools, tool_lookup = _build_google_tools(tool_server_ids, model_name, tool_context)
     system_instruction, conversation = _build_google_contents(messages)
     capability_prompt = tool_registry.available_tools_prompt(tool_lookup)
@@ -2080,6 +2145,7 @@ def _run_tool_loop(
     satisfied_tool_server_ids: set[str] = set()
     required_nudges_left = tool_registry.MAX_REQUIRED_TOOL_NUDGES if required_tool_server_ids else 0
 
+    # Run model rounds until the model stops calling tools or the round limit is reached.
     max_tool_rounds = tool_registry.tool_round_limit_from_context(tool_context, MAX_TOOL_ROUNDS)
     for round_index in range(max_tool_rounds):
         # Re-apply learned preferences each round because earlier failures may
@@ -2089,6 +2155,8 @@ def _run_tool_loop(
             _stream_google_round(client, model_name, conversation, request_config, stream=stream)
         )
 
+        # No tool calls: the model answered. Remind it of required tools that were not used yet,
+        # otherwise finish the loop.
         raw_tool_calls = assistant_message.get("tool_calls") or []
         if not raw_tool_calls:
             assistant_content = _assistant_message_to_content(assistant_message)
@@ -2117,6 +2185,7 @@ def _run_tool_loop(
             return
 
         tool_calls: list[dict[str, Any]] = []
+
         # Convert provider payloads into the adapter's shared dispatch format
         # before handing them to the local MCP tool bridge.
         for tool_call_index, raw_tool_call in enumerate(raw_tool_calls, start=1):
@@ -2132,6 +2201,8 @@ def _run_tool_loop(
                 }
             )
 
+        # Resolve aliases, apply the per-round call limit and remember which required tool servers
+        # this round touches.
         tool_calls = tool_registry.prepare_tool_calls(tool_lookup, tool_calls)
         tool_calls = tool_registry.limit_tool_calls_from_context(tool_context, tool_calls, tool_lookup)
 
@@ -2140,6 +2211,7 @@ def _run_tool_loop(
             if satisfied_server_id:
                 satisfied_tool_server_ids.add(satisfied_server_id)
 
+        # Store the assistant message with its canonical tool calls in the conversation and the transcript.
         canonical_assistant_message = tool_registry.canonicalize_transcript_tool_calls(
             assistant_message, tool_calls
         )
@@ -2148,12 +2220,15 @@ def _run_tool_loop(
             conversation.append(assistant_content)
         yield {"transcript_message": canonical_assistant_message}
 
+        # Announce the round's tool events to the UI; each alias gets its call index so that several
+        # calls of the same tool stay distinguishable.
         tool_response_parts: list[dict[str, Any]] = []
         tool_events = [_build_tool_event(tool_lookup, tool_call) for tool_call in tool_calls]
         for _i, _ev in enumerate(tool_events):
             _ev["alias"] = f"{_ev['alias']}__{_i}"
         yield {"tool_events": tool_events}
 
+        # Execute the round's tool calls one by one, starting with the per-call context and request log.
         cancelled_tool_result_seen = False
         for tool_call_index, (tool_call, tool_event) in enumerate(zip(tool_calls, tool_events), start=1):
             call_context = dict(tool_context or {})
@@ -2175,6 +2250,8 @@ def _run_tool_loop(
                 context=call_context,
             )
 
+            # Resolve the result: a preflight error, a cooldown, a duplicate-call or a quota error
+            # short-circuits the call, otherwise the tool runs and its cooldown is recorded.
             preflight_error = tool_call.get("preflight_error_result")
             if preflight_error is not None:
                 tool_result = preflight_error
@@ -2214,6 +2291,8 @@ def _run_tool_loop(
                                 tool_call.get("arguments") or {},
                                 context=call_context,
                             )
+
+            # Track cancelled and blocked results; they decide whether a final answer is forced.
             cancelled_tool_result_seen = (
                 cancelled_tool_result_seen
                 or tool_registry.is_tool_execution_cancelled(tool_result)
@@ -2229,6 +2308,7 @@ def _run_tool_loop(
                 tool_result,
                 tool_event,
             )
+
             # Gemini expects tool results as ``function_response`` parts in the
             # next user turn rather than as OpenAI-style tool-role messages.
             tool_response_parts.append(
@@ -2248,6 +2328,7 @@ def _run_tool_loop(
             )
             yield {"tool_result": dict(tool_message)}
 
+        # Send all results of the round back to the model as one user turn.
         if tool_response_parts:
             conversation.append({"role": "user", "parts": tool_response_parts})
 
@@ -2274,17 +2355,17 @@ def _run_tool_loop(
             yield {"transcript_message": assistant_message}
             return
 
+        # Compact the conversation when it grows too large before the next round.
         conversation = tool_registry.maybe_compact_tool_conversation(
             tool_context, conversation, provider_format="google"
         )
 
+    # The round limit was exhausted without a final answer.
     yield {"message": {"content": "[Error during generation: tool loop exceeded the safety limit.]"}}
 
 
-# Return whether the current conversation already contains tool state.
+# Return whether the conversation already contains tool messages or assistant tool calls.
 def _conversation_uses_tools(messages: list[dict[str, Any]]) -> bool:
-    """Return whether the current conversation already contains tool state."""
-
     for message in messages:
         if str(message.get("role", "")).lower() == "tool":
             return True
@@ -2293,12 +2374,11 @@ def _conversation_uses_tools(messages: list[dict[str, Any]]) -> bool:
     return False
 
 
-# Public adapter API.
+# Public adapter API
 
-# Return models exposed by the configured Gemini API endpoint.
+# Return the models exposed by the configured Gemini API endpoint, keeping only those that can
+# generate content and have not been learned to be unavailable for the current key.
 def get_models() -> list[Any]:
-    """Return models exposed by the configured Gemini API endpoint."""
-
     client = _get_client()
     try:
         models: list[dict[str, Any]] = []
@@ -2306,6 +2386,8 @@ def get_models() -> list[Any]:
             model_name = _extract_model_name(payload)
             if not model_name:
                 continue
+
+            # Skip models that cannot generate content or were learned to be unavailable for this key.
             capability_snapshot = _build_model_capability_snapshot(
                 model_name,
                 payload,
@@ -2329,15 +2411,13 @@ def get_models() -> list[Any]:
 
 # Raise because Gemini API models are remote and cannot be downloaded locally.
 def download_model(model_name: str, **kwargs: Any) -> Any:
-    """Raise because Gemini API models are remote and cannot be downloaded locally."""
-
     raise NotImplementedError("Google GenAI models are remote and cannot be downloaded locally.")
 
 
-# Return capability metadata for one model from Google GenAI.
+# Return the settings payload of one Gemini model for the UI: context length, default parameter values,
+# supported parameters, thinking and input capabilities, and the raw model metadata.
 def get_model_settings(model_name: str) -> dict[str, Any]:
-    """Return capability metadata for one model from Google GenAI."""
-
+    # Fetch the model metadata and resolve its capabilities.
     client = _get_client()
     try:
         raw_model = _get_model_payload(client, model_name)
@@ -2349,11 +2429,14 @@ def get_model_settings(model_name: str) -> dict[str, Any]:
         _close_client(client)
 
     defaults: dict[str, Any] = {}
+
     # Export stable defaults only for values that the public metadata exposes.
     for field_name in ("temperature", "top_p", "top_k"):
         if raw_model.get(field_name) is not None:
             defaults[field_name] = raw_model[field_name]
 
+    # Fill in fallback defaults: one candidate, an output limit capped at 8192 tokens and the
+    # thinking control that the model supports.
     output_token_limit = _coerce_positive_int(raw_model.get("output_token_limit"))
 
     if capability_snapshot["supports_generate_content"]:
@@ -2368,6 +2451,7 @@ def get_model_settings(model_name: str) -> dict[str, Any]:
         defaults.setdefault("include_thoughts", True)
 
     supported_parameters = set()
+
     # Supported parameters are derived from the resolved capability snapshot
     # rather than blindly exposing every known Gemini config field.
     if capability_snapshot["supports_generate_content"]:
@@ -2394,6 +2478,7 @@ def get_model_settings(model_name: str) -> dict[str, Any]:
     if capability_snapshot["supports_think_level"]:
         supported_parameters.add("thinking_level")
 
+    # Capability names shown in the UI; file attachments are always available.
     capabilities: list[str] = []
     if capability_snapshot["supports_vision"]:
         capabilities.append("vision")
@@ -2407,6 +2492,7 @@ def get_model_settings(model_name: str) -> dict[str, Any]:
         capabilities.append("thinking")
     capabilities.append("files")
 
+    # Assemble the settings payload.
     runtime_limits: dict[str, Any] = {}
     if output_token_limit is not None:
         runtime_limits["output_token_limit"] = output_token_limit
@@ -2435,10 +2521,10 @@ def get_model_settings(model_name: str) -> dict[str, Any]:
     }
 
 
-# Generate a streamed or non-streamed response through Google GenAI.
+# Generate a streamed or non-streamed response through Google GenAI as a generator of chunks. Tool
+# servers selected in the kwargs run through the tool loop; otherwise one direct round is streamed,
+# and the final assistant message is added to the transcript. The client is always closed afterwards.
 def generate(model_name: str, messages: list[dict[str, Any]], **kwargs: Any):
-    """Generate a streamed or non-streamed response through Google GenAI."""
-
     # Normalize tool server identifiers from every supported call shape.
     raw_ids = kwargs.pop("tool_server_ids", None) or kwargs.pop("tool_server_id", None) or kwargs.pop("tool_id", None)
     if isinstance(raw_ids, str):

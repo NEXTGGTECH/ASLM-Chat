@@ -7,7 +7,8 @@ import json
 from core.config import api_keys
 
 
-# Load all hosted provider keys from the generated JSON document.
+# Verify that all four hosted provider keys (Tavily, Firecrawl, Brave, SerpAPI) are loaded from the
+# generated JSON document.
 def test_load_api_keys_reads_generated_json(tmp_path) -> None:
     path = tmp_path / "api_keys.json"
     path.write_text(
@@ -34,7 +35,7 @@ def test_load_api_keys_reads_generated_json(tmp_path) -> None:
     assert loaded.search.hosted_api.serpapi_api_key == "serpapi"
 
 
-# Return an empty key set without creating a replacement file when JSON is absent.
+# Verify that a missing JSON file yields an empty key set and that no replacement file is created.
 def test_load_api_keys_does_not_bootstrap_missing_file(tmp_path) -> None:
     path = tmp_path / "api_keys.json"
 
@@ -44,7 +45,7 @@ def test_load_api_keys_does_not_bootstrap_missing_file(tmp_path) -> None:
     assert not path.exists()
 
 
-# Treat blank provider values as disabled hosted integrations.
+# Verify that a blank provider value is normalized to None, which disables that hosted integration.
 def test_load_api_keys_normalizes_blank_values(tmp_path) -> None:
     path = tmp_path / "api_keys.json"
     path.write_text(

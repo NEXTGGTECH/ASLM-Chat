@@ -10,70 +10,80 @@ from typing import Any
 
 from sandbox.config import CONTAINER_WORKSPACE, DEFAULT_TASK_DIR, RG_TYPE_TO_GLOB
 
-# Container task-root prefix (e.g. "/workspace/_sandbox")
+# Container task-root prefix (e.g. "/workspace/_sandbox").
 _CONTAINER_TASK_PREFIX = f"{CONTAINER_WORKSPACE}/{DEFAULT_TASK_DIR}"
 
 
+# What a shell command is meant to do, which decides how it is executed:
+# OPEN reads file content (any form), LOCATE searches text inside files, SURVEY explores directory
+# structure or finds by name, RUN executes code (build, test, install, git, network) and MUTATE changes
+# the filesystem (mkdir, mv, cp, rm, touch).
 class Intent(Enum):
-    OPEN   = "open"    # read file content (any form)
-    LOCATE = "locate"  # search text inside files
-    SURVEY = "survey"  # explore directory structure / find by name
-    RUN    = "run"     # execute code, build, test, install, git, network
-    MUTATE = "mutate"  # filesystem mutations (mkdir, mv, cp, rm, touch)
+    OPEN   = "open"
+    LOCATE = "locate"
+    SURVEY = "survey"
+    RUN    = "run"
+    MUTATE = "mutate"
 
 
+# A shell command reduced to an intent plus parsed targets and options, so a handler can run the
+# equivalent native operation instead of real bash.
 @dataclass
 class NormalizedCommand:
     intent: Intent
     raw_command: str
 
-    # Primary target (file or directory path, unresolved)
+    # Primary target (file or directory path, unresolved).
     target: str = "."
 
-    # Secondary targets (multi-file ops)
+    # Secondary targets (multi-file ops).
     extra_targets: list[str] = field(default_factory=list)
 
-    # LOCATE: search pattern
+    # LOCATE: search pattern.
     pattern: str | None = None
 
-    # OPEN: explicit line range request
+    # OPEN: explicit line range request.
     start_line: int | None = None
     end_line: int | None = None
 
-    # SURVEY: tree depth
+    # SURVEY: tree depth.
     depth: int | None = None
 
-    # Modifiers
+    # Modifiers.
     case_sensitive: bool = False
     recursive: bool = True
     include_hidden: bool = False
     glob_pattern: str | None = None
 
-    # LOCATE: grep context lines
+    # LOCATE: grep context lines.
     context_before: int = 0
     context_after: int = 0
     files_with_matches: bool = False
 
-    # SURVEY/find: name pattern, type filter
+    # SURVEY/find: name pattern, type filter.
     name_pattern: str | None = None
     find_type: str | None = None
 
-    # Set when the original was a compound pipeline that we normalized
+    # Set when the original was a compound pipeline that we normalized.
     was_compound: bool = False
 
 
 # Intent tables
 
+# Command names that read file content. Anything not in the intent tables below is treated as RUN and
+# goes to real bash.
 _OPEN_CMDS = frozenset({
     "cat", "less", "more", "tac",
     "head", "tail",
     "sed",
 })
 
+# Command names that search text inside files.
 _LOCATE_CMDS = frozenset({
     "grep", "egrep", "fgrep", "rg", "ag",
 })
 
+# Command names that explore directory structure or find files by name.
 _SURVEY_CMDS = frozenset({
     "ls", "ll", "la", "tree",
     "find", "fd",
@@ -81,14 +91,13 @@ _SURVEY_CMDS = frozenset({
     # would silently misrepresent disk-usage output. Goes to real bash.
 })
 
+# Command names that change the filesystem.
 _MUTATE_CMDS = frozenset({
     "mkdir", "touch",
     "mv", "cp", "rm",
     "chmod", "chown",
     "ln",
 })
-
-# Anything not in the above tables is treated as RUN and goes to real bash.
 
 # Pipelines whose right-hand side merely transforms read output — the
 # whole expression is still classified as OPEN or LOCATE.
@@ -102,7 +111,9 @@ _READ_ONLY_RHS_CMDS = frozenset({
 })
 
 
-# Shell-safe tokenization; fall back to whitespace split on parse errors.
+# Helpers
+
+# Shell-safe tokenization; fall back to whitespace split on parse errors (e.g. unbalanced quotes).
 def _safe_split(s: str) -> list[str]:
     try:
         return shlex.split(s)
@@ -110,11 +121,12 @@ def _safe_split(s: str) -> list[str]:
         return s.split()
 
 
-# True for absolute paths outside task-space (e.g. /etc); task paths are routed.
+# Return True for absolute paths outside task-space (e.g. /etc); task paths are routed.
 def _is_container_path(path: str) -> bool:
     if not path.startswith("/"):
         return False
-    # Inside task-space container mount → not a container path
+
+    # Inside task-space container mount → not a container path.
     if path == _CONTAINER_TASK_PREFIX or path.startswith(_CONTAINER_TASK_PREFIX + "/"):
         return False
     return True
@@ -122,9 +134,9 @@ def _is_container_path(path: str) -> bool:
 
 # Pipeline parser
 
-# Split on | only; None when &&, ||, ;, subshells, or redirections are present.
+# Split on | only; None when &&, ||, ;, subshells, or redirections are present, or a stage is empty.
 def _split_pipeline(command: str) -> list[str] | None:
-    # Reject anything with complex shell constructs
+    # Reject anything with complex shell constructs.
     if re.search(r"&&|\|\||;|`|\$\(|>|<", command):
         return None
 
@@ -149,12 +161,15 @@ def _classify_single_command(cmd: str) -> Intent | None:
 
 # Per-intent argument parsers
 
-# Extract target path, line range, and unsupported-flag marker from OPEN commands.
+# Extract target path, line range, and unsupported-flag marker from OPEN commands. The result also
+# carries extra_targets for further files and tail_n for a tail request (the handler computes the
+# actual range for it).
 def _parse_open_args(cmd: str, args: list[str]) -> dict[str, Any]:
     result: dict[str, Any] = {"target": ".", "start_line": None, "end_line": None}
     files: list[str] = []
     i = 0
 
+    # head/tail: only the -n forms are understood; the default is 10 lines.
     if cmd in ("head", "tail"):
         n_lines = 10
         while i < len(args):
@@ -163,6 +178,7 @@ def _parse_open_args(cmd: str, args: list[str]) -> dict[str, Any]:
                 try:
                     n_lines = int(args[i + 1])
                 except ValueError:
+                    # Non-numeric count: keep the default.
                     pass
                 i += 2
             elif re.match(r"^-n(\d+)$", p):
@@ -188,6 +204,7 @@ def _parse_open_args(cmd: str, args: list[str]) -> dict[str, Any]:
             result["tail_n"] = n_lines
 
     elif cmd == "sed":
+        # Only the "-n 'N,Mp'" and "-n 'Np'" print forms are understood.
         while i < len(args):
             p = args[i]
             if p == "-n":
@@ -222,13 +239,15 @@ def _parse_open_args(cmd: str, args: list[str]) -> dict[str, Any]:
                 files.append(p)
             i += 1
 
+    # The first file is the target; any others are reported as extra targets.
     if files:
         result["target"] = files[0]
         result["extra_targets"] = files[1:]
     return result
 
 
-# Extract pattern, search path, glob, context, and flags from LOCATE commands.
+# Extract pattern, search path, glob, context, and flags from LOCATE commands. Flags the native
+# search cannot reproduce set "unsupported" so the command falls back to real bash.
 def _parse_locate_args(cmd: str, args: list[str]) -> dict[str, Any]:
     result: dict[str, Any] = {
         "pattern": None,
@@ -245,8 +264,12 @@ def _parse_locate_args(cmd: str, args: list[str]) -> dict[str, Any]:
 
     i = 0
     positional: list[str] = []
+
     # Combined short-flag set we know how to interpret for grep/rg.
     _GREP_COMBINABLE = set("rRniIlLvV")
+
+    # Walk the arguments: known flags update the result, everything else is positional
+    # (the first positional is the pattern, the second the search path).
     while i < len(args):
         p = args[i]
         if p in ("--ignore-case",):
@@ -267,6 +290,7 @@ def _parse_locate_args(cmd: str, args: list[str]) -> dict[str, Any]:
                     result["files_with_matches"] = True
                 elif ch in ("v", "V"):
                     result["unsupported"] = True
+
                 # r/R/n: noop (recursive is default; line numbers always shown)
             i += 1
         elif p in ("-l", "--files-with-matches"):
@@ -293,18 +317,21 @@ def _parse_locate_args(cmd: str, args: list[str]) -> dict[str, Any]:
             try:
                 result["context_before"] = result["context_after"] = int(args[i + 1])
             except ValueError:
+                # Non-numeric context size: keep the default of 0.
                 pass
             i += 2
         elif p in ("-A", "--after-context") and i + 1 < len(args):
             try:
                 result["context_after"] = int(args[i + 1])
             except ValueError:
+                # Non-numeric context size: keep the default of 0.
                 pass
             i += 2
         elif p in ("-B", "--before-context") and i + 1 < len(args):
             try:
                 result["context_before"] = int(args[i + 1])
             except ValueError:
+                # Non-numeric context size: keep the default of 0.
                 pass
             i += 2
         elif p.startswith("-"):
@@ -325,7 +352,8 @@ def _parse_locate_args(cmd: str, args: list[str]) -> dict[str, Any]:
     return result
 
 
-# Extract path, depth, hidden/name/type flags from SURVEY (ls/tree/find) commands.
+# Extract path, depth, hidden/name/type flags from SURVEY (ls/tree/find) commands. Flags the native
+# listing cannot reproduce set "unsupported" so the command falls back to real bash.
 def _parse_survey_args(cmd: str, args: list[str]) -> dict[str, Any]:
     result: dict[str, Any] = {
         "target": ".",
@@ -337,9 +365,11 @@ def _parse_survey_args(cmd: str, args: list[str]) -> dict[str, Any]:
     }
 
     is_find = cmd in ("find", "fd")
+
     # ls combinable short flags we understand: -a (hidden), -A (hidden no .), -l/-h/-F/-1 (display-only).
     _LS_COMBINABLE = set("aAlhF1RrSt")
 
+    # Walk the arguments: known flags update the result, a bare word becomes the target path.
     i = 0
     while i < len(args):
         p = args[i]
@@ -347,6 +377,7 @@ def _parse_survey_args(cmd: str, args: list[str]) -> dict[str, Any]:
             try:
                 result["depth"] = int(args[i + 1])
             except ValueError:
+                # Non-numeric depth: keep the default.
                 pass
             i += 2
         elif p == "-a" or p == "-A" or p == "--all":
@@ -384,6 +415,7 @@ def _parse_survey_args(cmd: str, args: list[str]) -> dict[str, Any]:
             try:
                 result["depth"] = int(args[i + 1])
             except ValueError:
+                # Non-numeric depth: keep the default.
                 pass
             i += 2
         elif is_find and p in ("-mindepth", "-mtime", "-ctime", "-atime", "-size",
@@ -408,7 +440,9 @@ def _parse_survey_args(cmd: str, args: list[str]) -> dict[str, Any]:
 
 # Pipeline normalization
 
-# Collapse read-only pipe chains into one NormalizedCommand; None if unsafe.
+# Collapse read-only pipe chains into one NormalizedCommand; None if unsafe. The first stage must be
+# an OPEN or SURVEY command and every later stage a read-only transform; a grep stage turns the whole
+# pipeline into a LOCATE, head/tail/sed stages narrow the line range.
 def _normalize_pipeline(stages: list[str], cwd: str) -> NormalizedCommand | None:
     if len(stages) < 2:
         return None
@@ -422,7 +456,8 @@ def _normalize_pipeline(stages: list[str], cwd: str) -> NormalizedCommand | None
 
     primary_intent = _classify_single_command(first_cmd)
     if primary_intent not in (Intent.OPEN, Intent.SURVEY):
-        return None  # Only open/survey as the source
+        # Only open/survey commands can be the source of a pipeline.
+        return None
 
     # Every RHS stage must be a read-only transform (head, grep, sed, …).
     for stage in stages[1:]:
@@ -430,9 +465,10 @@ def _normalize_pipeline(stages: list[str], cwd: str) -> NormalizedCommand | None
         if not stage_parts:
             return None
         if stage_parts[0] not in _READ_ONLY_RHS_CMDS:
-            return None  # Side-effecting command → real bash
+            # Side-effecting command → real bash.
+            return None
 
-    # Parse source arguments
+    # Parse source arguments.
     open_args = _parse_open_args(first_cmd, first_args)
     target = open_args.get("target", ".")
     start_line = open_args.get("start_line")
@@ -464,6 +500,7 @@ def _normalize_pipeline(stages: list[str], cwd: str) -> NormalizedCommand | None
                     try:
                         n = int(rhs_args[idx + 1])
                     except ValueError:
+                        # Non-numeric count: keep the default of 10.
                         pass
             rhs_start = start_line or 1
             rhs_end = (start_line or 1) + n - 1
@@ -476,11 +513,13 @@ def _normalize_pipeline(stages: list[str], cwd: str) -> NormalizedCommand | None
                     try:
                         n = int(rhs_args[idx + 1])
                     except ValueError:
+                        # Non-numeric count: keep the default of 10.
                         pass
             tail_n = n
 
         elif rhs_cmd in ("wc",) and "-l" in rhs_args:
-            pass  # stays OPEN, handler will show wc metadata
+            # Stays OPEN, handler will show wc metadata.
+            pass
 
         elif rhs_cmd == "sed":
             loc_args = _parse_open_args("sed", rhs_args)
@@ -499,7 +538,7 @@ def _normalize_pipeline(stages: list[str], cwd: str) -> NormalizedCommand | None
         was_compound=True,
     )
     if tail_n is not None and nc.start_line is None:
-        # Store for handler to compute actual tail range
+        # Store for handler to compute actual tail range.
         nc._tail_n = tail_n  # type: ignore[attr-defined]
 
     return nc
@@ -552,7 +591,8 @@ def classify(command: str, cwd: str = ".") -> NormalizedCommand | None:
         target = parsed.get("target", ".")
         if _is_container_path(target):
             return None
-        # Multi-file: cat a.txt b.txt — let real bash concatenate correctly
+
+        # Multi-file: cat a.txt b.txt — let real bash concatenate correctly.
         if parsed.get("extra_targets"):
             return None
         return NormalizedCommand(
@@ -568,6 +608,7 @@ def classify(command: str, cwd: str = ".") -> NormalizedCommand | None:
         parsed = _parse_locate_args(cmd, args)
         if parsed.get("unsupported"):
             return None
+
         # -l/-L change output format to filenames — not implemented in handler,
         # so let real bash (or rg) return the correct output.
         if parsed.get("files_with_matches"):

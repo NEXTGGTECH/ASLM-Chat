@@ -14,11 +14,14 @@ from unittest import mock
 from Tools.deep_research import orchestrator
 
 
+# Build the chunk stream of a fake model reply that delivers the whole text as one assistant message.
 def _generation(text: str):
     return iter([{"message": {"role": "assistant", "content": text}}])
 
 
+# Build a fake model stream that raises the given exception as soon as it is first iterated.
 def _failed_generation(exc: Exception):
+    # Generator that raises on first iteration; the unreachable yield makes it a generator function.
     def stream():
         raise exc
         yield  # pragma: no cover - keeps this a lazy generator
@@ -26,6 +29,7 @@ def _failed_generation(exc: Exception):
     return stream()
 
 
+# Build the structured result of a fake search or read tool call that returns one primary source.
 def _source_result() -> dict[str, Any]:
     source = {
         "id": "c1000-1",
@@ -42,7 +46,10 @@ def _source_result() -> dict[str, Any]:
     }
 
 
+# Build the six scripted model replies of a successful run: plan, first reflection (gap found), query
+# selection (replaceable through the selection argument), second reflection (complete), final audit and report.
 def _successful_outputs(*, selection: str | None = None) -> list[str]:
+    # JSON replies carry a one-step plan for a single primary-source search; the last item is the final report.
     return [
         (
             '{"summary":"Verify the claim","steps":'
@@ -75,13 +82,18 @@ def _successful_outputs(*, selection: str | None = None) -> list[str]:
     ]
 
 
+# Cover the deep research v2 orchestrator: planning, approval, search, resume, persistence and failure handling.
 class ResearchV2Tests(unittest.TestCase):
+    # Create temporary control and log directories, redirect the control state paths to them and replace the
+    # tool registry build and scope cleanup with mocks (exposed as build_tools and clear_scope).
     def setUp(self) -> None:
+        # Temporary directories removed after each test.
         self._control_directory = tempfile.TemporaryDirectory()
         self._log_directory = tempfile.TemporaryDirectory()
         self.addCleanup(self._log_directory.cleanup)
         self.addCleanup(self._control_directory.cleanup)
 
+        # Keep session state and commands inside the temporary directory.
         control_root = Path(self._control_directory.name)
         self.enterContext(
             mock.patch.object(orchestrator.control, "STATE_ROOT", control_root / "state")
@@ -89,6 +101,8 @@ class ResearchV2Tests(unittest.TestCase):
         self.enterContext(
             mock.patch.object(orchestrator.control, "COMMAND_ROOT", control_root / "commands")
         )
+
+        # Offer only the web search and read page tools, and skip real runtime scope cleanup.
         self.build_tools = self.enterContext(
             mock.patch.object(
                 orchestrator.tool_registry,
@@ -106,6 +120,8 @@ class ResearchV2Tests(unittest.TestCase):
             mock.patch.object(orchestrator.tool_registry, "clear_tool_runtime_scope")
         )
 
+    # Run the v2 orchestrator on a fixed test topic with a stub runtime and return its result; approval is
+    # automatic only when auto_approve is set.
     def _run(
         self,
         session_id: str,
@@ -126,13 +142,17 @@ class ResearchV2Tests(unittest.TestCase):
             logs_dir=Path(self._log_directory.name),
         )
 
+    # Start a run in a background thread and return the thread with an outcome dict that receives either
+    # "result" or "error"; the thread is cancelled on cleanup if it is still alive.
     def _start_run(self, session_id: str) -> tuple[threading.Thread, dict[str, Any]]:
         outcome: dict[str, Any] = {}
 
+        # Thread body: store the run result, or the exception so the owning test thread can re-raise it.
         def target() -> None:
             try:
                 outcome["result"] = self._run(session_id)
-            except BaseException as exc:  # surfaced in the owning test thread
+            except BaseException as exc:
+                # Surfaced in the owning test thread through the outcome dict.
                 outcome["error"] = exc
 
         thread = threading.Thread(target=target, daemon=True)
@@ -140,6 +160,7 @@ class ResearchV2Tests(unittest.TestCase):
         self.addCleanup(self._stop_thread, thread, session_id)
         return thread, outcome
 
+    # Cancel a research thread that is still running and wait up to two seconds for it to exit.
     @staticmethod
     def _stop_thread(thread: threading.Thread, session_id: str) -> None:
         if not thread.is_alive():
@@ -147,9 +168,12 @@ class ResearchV2Tests(unittest.TestCase):
         try:
             orchestrator.control.submit_command(session_id, "cancel")
         except (FileNotFoundError, ValueError):
+            # The session is gone or already finished, so there is nothing left to cancel.
             pass
         thread.join(timeout=2)
 
+    # Poll the session state until the predicate accepts it and return that snapshot; fail the test with the
+    # latest snapshot when the timeout expires.
     def _wait_for_state(
         self,
         session_id: str,
@@ -166,6 +190,7 @@ class ResearchV2Tests(unittest.TestCase):
             time.sleep(0.01)
         self.fail(f"Timed out waiting for research state; latest snapshot: {latest!r}")
 
+    # Wait for a background run to finish, re-raise the error it stored, and return its result.
     def _join_successfully(
         self,
         thread: threading.Thread,
@@ -178,12 +203,17 @@ class ResearchV2Tests(unittest.TestCase):
         self.assertIn("result", outcome)
         return outcome["result"]
 
+    # Check that resuming a session that was interrupted in the given phase (search or reading_completed)
+    # after iteration 1 had spent its full query batch does not replay that batch: only one new search runs,
+    # as iteration 2, within the per-iteration query limit and the doubled total budget, and the model is
+    # not asked to plan again.
     def _assert_counted_phase_resume_advances(
         self,
         *,
         session_id: str,
         phase: str,
     ) -> None:
+        # Arrange: a persisted running session positioned in the given phase of iteration 1.
         orchestrator.control.create_session(session_id, topic="Investigate the test claim")
         orchestrator.control.update_state(
             session_id,
@@ -204,6 +234,9 @@ class ResearchV2Tests(unittest.TestCase):
             ] if phase == "search" else [],
             initial_candidates=[],
         )
+
+        # Scripted model replies for the resumed run: reflection with two new candidates, selection of both,
+        # a completing reflection and the final report.
         outputs = iter(
             [
                 (
@@ -225,6 +258,8 @@ class ResearchV2Tests(unittest.TestCase):
                 "Verified final report [c1000-1]",
             ]
         )
+
+        # Act: resume the session with the model and the search tool mocked.
         with (
             mock.patch.object(
                 orchestrator.llm_api,
@@ -239,6 +274,8 @@ class ResearchV2Tests(unittest.TestCase):
         ):
             result = self._run(session_id, auto_approve=False, max_rounds=2)
 
+        # Assert: a single search of at most MAX_QUERIES_PER_ITERATION queries, charged to iteration 2, and
+        # the first model call is not the planning prompt.
         web_calls = [
             call
             for call in call_tool.call_args_list
@@ -269,19 +306,26 @@ class ResearchV2Tests(unittest.TestCase):
         )
         self.assertNotEqual(generate.call_args_list[0].args[2][0]["content"], orchestrator.PLAN_PROMPT)
 
+    # Verify that resuming a session interrupted during the search phase does not replay the already charged
+    # query batch within the same iteration.
     def test_resume_from_inflight_search_does_not_replay_batch_in_same_iteration(self) -> None:
         self._assert_counted_phase_resume_advances(
             session_id="deep-research:10000000000000000000000000000031",
             phase="search",
         )
 
+    # Verify that resuming a session whose reading phase had completed continues with the next iteration
+    # instead of charging another batch to the same one.
     def test_resume_from_reading_completed_starts_the_next_iteration(self) -> None:
         self._assert_counted_phase_resume_advances(
             session_id="deep-research:10000000000000000000000000000032",
             phase="reading_completed",
         )
 
+    # Verify that a plan JSON object is extracted from a fenced block surrounded by prose, and that a plain
+    # text plan without JSON becomes a checklist of pending items.
     def test_tolerant_json_and_plain_text_plan_fallback(self) -> None:
+        # Fenced JSON between a preface and trailing commentary.
         parsed = orchestrator._extract_json_object(
             "Model preface that should be ignored.\n"
             "```json\n"
@@ -291,6 +335,7 @@ class ResearchV2Tests(unittest.TestCase):
         self.assertEqual(parsed["summary"], "Focused plan")
         self.assertEqual(parsed["steps"][0]["title"], "Verify primary evidence")
 
+        # A numbered and a bulleted line become two pending checklist items.
         fallback = orchestrator._normalize_checklist(
             None,
             "1. Verify the primary record\n- Compare an independent source",
@@ -301,7 +346,10 @@ class ResearchV2Tests(unittest.TestCase):
         )
         self.assertTrue(all(item["status"] == "pending" for item in fallback))
 
+    # Verify that a reflection update cannot move a done checklist item back to pending (its note is kept),
+    # that other items follow their updates, and that the current item is the last active one.
     def test_completed_checklist_item_never_regresses_during_later_reflection(self) -> None:
+        # Arrange: one done, one active and one pending item.
         checklist = [
             {
                 "id": "s1",
@@ -313,6 +361,7 @@ class ResearchV2Tests(unittest.TestCase):
             {"id": "s3", "title": "Resolve contradictions", "status": "pending"},
         ]
 
+        # Act: apply stale updates that try to reset s1 and activate both s2 and s3.
         updated = orchestrator._apply_updates(
             checklist,
             [
@@ -322,12 +371,15 @@ class ResearchV2Tests(unittest.TestCase):
             ],
         )
 
+        # Assert: s1 stays done with its note, s2 falls back to pending, and s3 is the current item.
         self.assertEqual(updated[0]["status"], "done")
         self.assertEqual(updated[0]["note"], "Primary record verified")
         self.assertEqual(updated[1]["status"], "pending")
         self.assertEqual(updated[2]["status"], "active")
         self.assertEqual(orchestrator._current_checklist_item_id(updated), "s3")
 
+    # Verify that merging a reloaded plan keeps the done status and note of an item whose title is unchanged,
+    # and resets an item whose title was changed to pending.
     def test_unchanged_completed_item_survives_plan_reload_but_renamed_item_does_not(self) -> None:
         previous = [
             {
@@ -351,6 +403,8 @@ class ResearchV2Tests(unittest.TestCase):
         self.assertEqual(recovered[0]["note"], "Primary record found")
         self.assertEqual(revised[0]["status"], "pending")
 
+    # Verify that writing a checkpoint with an older checklist after a worker restart cannot move a done
+    # item back to pending, while the other item still takes the new status.
     def test_durable_checkpoint_cannot_reset_completed_item_after_worker_restart(self) -> None:
         session_id = "deep-research:10000000000000000000000000000021"
         orchestrator.control.create_session(session_id, topic="Investigate the test claim")
@@ -373,6 +427,8 @@ class ResearchV2Tests(unittest.TestCase):
         self.assertEqual(recovered["checklist"][0]["status"], "done")
         self.assertEqual(recovered["checklist"][1]["status"], "active")
 
+    # Verify that a model that refuses the connection fails the run during planning, with no sources and no
+    # search tool call.
     def test_unavailable_model_fails_before_search_without_fallback(self) -> None:
         session_id = "deep-research:10000000000000000000000000000008"
         self.enterContext(
@@ -393,6 +449,8 @@ class ResearchV2Tests(unittest.TestCase):
         self.assertEqual(result["sources"], [])
         call_tool.assert_not_called()
 
+    # Verify that a provider error raised only when the reply stream is iterated also fails the run before
+    # any search, and the error text appears in the model context.
     def test_lazy_provider_error_also_fails_before_search(self) -> None:
         session_id = "deep-research:10000000000000000000000000000018"
         self.enterContext(
@@ -413,6 +471,8 @@ class ResearchV2Tests(unittest.TestCase):
         self.assertEqual(result["sources"], [])
         call_tool.assert_not_called()
 
+    # Verify that selected queries become web_search calls with exactly the query, vertical, effort and
+    # description arguments, one call per vertical.
     def test_search_calls_follow_simple_web_search_contract(self) -> None:
         calls = orchestrator._tool_search_calls(
             [
@@ -436,6 +496,8 @@ class ResearchV2Tests(unittest.TestCase):
             [call["vertical"] for call in calls],
             ["web", "academic"],
         )
+
+        # The first call keeps the raw query text (including operators), and its description is the purpose.
         web_call = calls[0]
         self.assertEqual(
             set(web_call),
@@ -445,13 +507,17 @@ class ResearchV2Tests(unittest.TestCase):
         self.assertEqual(web_call["effort"], "medium")
         self.assertEqual(web_call["description"], "Find official documentation")
 
+        # A single query with an empty purpose still produces one call with the same query.
         single = orchestrator._tool_search_calls(
             [{"text": "python asyncio tutorial", "vertical": "web", "purpose": ""}],
             2,
         )
         self.assertEqual(single[0]["query"], "python asyncio tutorial")
 
+    # Verify that a run without auto-approval stops in the awaiting_approval state after planning only, makes
+    # no tool call until an approve command arrives, and then completes with a stored report and sources.
     def test_research_waits_for_explicit_approval_before_any_search(self) -> None:
+        # Arrange: scripted model replies and a mocked search tool.
         session_id = "deep-research:10000000000000000000000000000001"
         outputs = iter(_successful_outputs())
         generate = self.enterContext(
@@ -469,6 +535,7 @@ class ResearchV2Tests(unittest.TestCase):
             )
         )
 
+        # Act and assert before approval: the run waits with one model call (planning) and no tool call.
         thread, outcome = self._start_run(session_id)
         awaiting = self._wait_for_state(
             session_id,
@@ -479,6 +546,7 @@ class ResearchV2Tests(unittest.TestCase):
         self.assertEqual(generate.call_count, 1, "only planning may run before approval")
         call_tool.assert_not_called()
 
+        # Approve plan version 1 and assert the run completes with the report persisted in the final state.
         accepted = orchestrator.control.submit_command(
             session_id,
             "approve",
@@ -493,7 +561,10 @@ class ResearchV2Tests(unittest.TestCase):
         self.assertEqual(terminal_state["report"], result["report"])
         self.assertTrue(terminal_state["sources"])
 
+    # Verify that a revise command while awaiting approval replaces the plan, rebuilds the checklist and
+    # increments the plan version, and that approving the new version completes the run with the revised plan.
     def test_plan_revision_increments_version_before_approval(self) -> None:
+        # Arrange: scripted model replies and a mocked search tool.
         session_id = "deep-research:10000000000000000000000000000002"
         outputs = iter(_successful_outputs())
         self.enterContext(
@@ -511,6 +582,7 @@ class ResearchV2Tests(unittest.TestCase):
             )
         )
 
+        # Act: wait for the first plan, then submit a revision of it.
         thread, outcome = self._start_run(session_id)
         self._wait_for_state(
             session_id,
@@ -527,6 +599,8 @@ class ResearchV2Tests(unittest.TestCase):
             payload={"plan": revised_plan},
             expected_plan_version=1,
         )
+
+        # Assert: the state shows plan version 2 with a two-item checklist taken from the revised plan.
         revised = self._wait_for_state(
             session_id,
             lambda state: state.get("plan_version") == 2,
@@ -538,6 +612,7 @@ class ResearchV2Tests(unittest.TestCase):
             ["Verify the official primary record", "Compare it with independent evidence"],
         )
 
+        # Approve version 2 and check that the finished run carries the revised plan.
         orchestrator.control.submit_command(
             session_id,
             "approve",
@@ -548,6 +623,8 @@ class ResearchV2Tests(unittest.TestCase):
         self.assertEqual(result["ui"]["plan_version"], 2)
         self.assertEqual(result["plan"], revised_plan)
 
+    # Verify that two handles for the same page (different host prefix and trailing slash) merge into one
+    # source that keeps the second handle as a citation alias, so a citation using it still links to the page.
     def test_duplicate_source_handles_remain_linkable(self) -> None:
         sources_by_key: dict[str, dict[str, Any]] = {}
         orchestrator._merge_sources(
@@ -566,7 +643,11 @@ class ResearchV2Tests(unittest.TestCase):
         self.assertEqual(sources[0]["citation_aliases"], ["c0002-7"])
         self.assertIn("[First](https://www.example.com/page)", linked)
 
+    # Verify that a resumed session keeps its stored evidence and stable source ids, and that a new worker's
+    # raw handle "c0000-1" (which collides with the old source's alias) is mapped to a new stable id instead
+    # of being reused; a repeated run after completion replays the stored result without any model or tool call.
     def test_restart_restores_evidence_and_never_reuses_raw_worker_citations(self) -> None:
+        # Arrange: a persisted session at a checkpoint with one source, one evidence entry and a missing gap.
         session_id = "deep-research:deadbeef000000000000000000000001"
         stable_one = "cdeadbeef-1"
         stable_two = "cdeadbeef-2"
@@ -605,6 +686,8 @@ class ResearchV2Tests(unittest.TestCase):
             last_sequence=10,
         )
 
+        # Scripted model replies for the resumed run: reflection, query selection, completing reflection and a
+        # report that cites both the old and the new stable handles.
         outputs = iter(
             [
                 (
@@ -641,6 +724,7 @@ class ResearchV2Tests(unittest.TestCase):
             "url": "https://example.org/new",
         }
 
+        # Fake tool call: search returns the colliding new source, any other tool returns its page text.
         def fake_tool(_lookup, alias, _arguments, context=None):
             del context
             if alias == "web_search__web_search":
@@ -665,6 +749,8 @@ class ResearchV2Tests(unittest.TestCase):
             )
         )
 
+        # Act and assert the result: the run resumes with a reflection (not planning), both sources get
+        # stable ids with the raw handle stored only as an alias, and the report links both sources.
         result = self._run(session_id, auto_approve=False, max_rounds=2)
 
         self.assertEqual(
@@ -681,6 +767,8 @@ class ResearchV2Tests(unittest.TestCase):
         self.assertNotIn(f"[{stable_one}]", result["report"])
         self.assertEqual([item["id"] for item in result["citations"]], [stable_one, stable_two])
 
+        # Assert the persisted terminal state: the citation counter advanced, three evidence entries exist
+        # and they reference the stable handles.
         terminal_state = orchestrator.control.read_state(session_id)
         self.assertEqual(terminal_state["citation_next"], 3)
         self.assertEqual(len(terminal_state["evidence_entries"]), 3)
@@ -698,7 +786,10 @@ class ResearchV2Tests(unittest.TestCase):
         generate.assert_not_called()
         call_tool.assert_not_called()
 
+    # Verify that running a session whose stored completed snapshot uses a legacy raw handle migrates the
+    # stored state to a stable source id and a linked report, and returns it without any model or tool call.
     def test_legacy_terminal_snapshot_is_atomically_migrated_for_ui_polling(self) -> None:
+        # Arrange: a completed legacy session whose report still cites the raw handle c0000-1.
         session_id = "deep-research:facefeed000000000000000000000001"
         legacy_source = {
             "id": "c0000-1",
@@ -726,9 +817,12 @@ class ResearchV2Tests(unittest.TestCase):
             mock.patch.object(orchestrator.tool_registry, "call_ollama_tool")
         )
 
+        # Act: run the session again and read back the migrated state.
         result = self._run(session_id, auto_approve=False, max_rounds=2)
         migrated = orchestrator.control.read_state(session_id)
 
+        # Assert: the returned and stored report are linked, the source has a stable id with the legacy
+        # handle as alias, and nothing was generated or searched.
         expected_report = (
             "Verified legacy claim "
             "[Legacy primary source](https://legacy.example/report)."
@@ -745,7 +839,10 @@ class ResearchV2Tests(unittest.TestCase):
         generate.assert_not_called()
         call_tool.assert_not_called()
 
+    # Verify that a cancel command sent while the run awaits approval ends it as cancelled after the single
+    # planning call, without any tool call.
     def test_cancel_command_stops_a_run_waiting_for_approval(self) -> None:
+        # Arrange: the model returns only a plan and the search tool is mocked.
         session_id = "deep-research:10000000000000000000000000000003"
         generate = self.enterContext(
             mock.patch.object(
@@ -758,6 +855,7 @@ class ResearchV2Tests(unittest.TestCase):
             mock.patch.object(orchestrator.tool_registry, "call_ollama_tool")
         )
 
+        # Act: wait for the approval prompt, then cancel.
         thread, outcome = self._start_run(session_id)
         self._wait_for_state(
             session_id,
@@ -770,6 +868,7 @@ class ResearchV2Tests(unittest.TestCase):
         )
         result = self._join_successfully(thread, outcome)
 
+        # Assert: both the result and the stored state are cancelled, with no further model or tool calls.
         self.assertEqual(result["ui"]["status"], "cancelled")
         self.assertEqual(
             orchestrator.control.read_state(session_id)["status"],
@@ -778,7 +877,10 @@ class ResearchV2Tests(unittest.TestCase):
         self.assertEqual(generate.call_count, 1)
         call_tool.assert_not_called()
 
+    # Verify that when a revise and an approve command both target plan version 1, handling the commands
+    # applies the revision (version 2), does not approve the outdated version and records a rejected command.
     def test_approval_for_previous_revision_is_not_replayed(self) -> None:
+        # Arrange: a session awaiting approval of version 1 with a revise and an approve for version 1 queued.
         session_id = "deep-research:10000000000000000000000000000007"
         checklist = [{"id": "s1", "title": "Original goal", "status": "pending"}]
         orchestrator.control.create_session(
@@ -805,6 +907,7 @@ class ResearchV2Tests(unittest.TestCase):
         )
         self.addCleanup(events.close)
 
+        # Act: process the queued commands.
         _plan, _checklist, version, approved = orchestrator._handle_commands(
             orchestrator.CommandInbox(session_id),
             topic="Investigate the test claim",
@@ -819,7 +922,10 @@ class ResearchV2Tests(unittest.TestCase):
         self.assertFalse(approved)
         self.assertEqual(events.events[-1]["type"], "command_rejected")
 
+    # Verify that when every model reply is malformed or empty, the run ends partial with a report and a
+    # five-item checklist, makes seven model calls, selects no queries and performs no search.
     def test_malformed_model_outputs_do_not_trigger_fallback_search(self) -> None:
+        # Arrange: seven malformed or empty replies and a search tool that must never be called.
         session_id = "deep-research:10000000000000000000000000000004"
         malformed_outputs = iter(
             [
@@ -847,6 +953,7 @@ class ResearchV2Tests(unittest.TestCase):
             )
         )
 
+        # Act and assert: a partial result, and no query was selected in any event.
         result = self._run(session_id, auto_approve=True)
 
         self.assertEqual(result["ui"]["status"], "partial")
@@ -863,7 +970,11 @@ class ResearchV2Tests(unittest.TestCase):
         ]
         self.assertFalse(selected_queries)
 
+    # Verify that a four-query selection over three verticals is capped to its first two queries, searched
+    # with one call per vertical, that the final model call is the report synthesis, and that it receives
+    # no tool arguments.
     def test_query_selection_is_capped_and_synthesis_is_separate_no_tools_call(self) -> None:
+        # Arrange: a selection reply with four queries over three verticals.
         session_id = "deep-research:10000000000000000000000000000005"
         selection = (
             '{"queries":['
@@ -874,8 +985,11 @@ class ResearchV2Tests(unittest.TestCase):
             "]}"
         )
         outputs = iter(_successful_outputs(selection=selection))
+
+        # Ordered log of model phases (by system prompt) and tool calls, used to check the call order.
         timeline: list[str] = []
 
+        # Fake model call: record the phase inferred from the system prompt, then return the next scripted reply.
         def fake_generate(_engine, _model, messages, **_kwargs):
             system_prompt = messages[0]["content"]
             if system_prompt == orchestrator.REPORT_PROMPT:
@@ -894,6 +1008,8 @@ class ResearchV2Tests(unittest.TestCase):
 
         search_calls: list[dict] = []
 
+        # Fake tool call: record the call in the timeline, check the search argument shape and collect
+        # the search arguments.
         def fake_tool(_lookup, alias, arguments, context=None):
             del context
             timeline.append(f"tool:{alias}")
@@ -914,6 +1030,7 @@ class ResearchV2Tests(unittest.TestCase):
             )
         )
 
+        # Act and assert: two queries were used, synthesis is the last model call and comes after the search.
         result = self._run(session_id, auto_approve=True)
 
         self.assertEqual(result["ui"]["queries_used"], 2)
@@ -925,6 +1042,7 @@ class ResearchV2Tests(unittest.TestCase):
         self.assertEqual(timeline[-1], "model:synthesis")
         self.assertIn("tool:web_search__web_search", timeline[:-1])
 
+        # The synthesis call uses the report prompt and none of the tool-related arguments.
         final_call = generate.call_args_list[-1]
         self.assertEqual(final_call.args[2][0]["content"], orchestrator.REPORT_PROMPT)
         for forbidden_tool_argument in (
@@ -938,5 +1056,6 @@ class ResearchV2Tests(unittest.TestCase):
         self.assertEqual(result["report"], "Verified final report [c1000-1]")
 
 
+# Allow running the tests without pytest.
 if __name__ == "__main__":
     unittest.main()

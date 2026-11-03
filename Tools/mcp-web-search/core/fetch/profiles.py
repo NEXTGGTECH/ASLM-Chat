@@ -16,15 +16,16 @@ from dataclasses import dataclass
 # latest fingerprint for that family, so every request gets a coherent, real browser
 # TLS fingerprint.
 #
-# family classifies the engine behind the UA. It drives header coherence: only
-# Chromium families (chrome/edge) emit the Sec-CH-UA client-hint headers — Firefox
-# never sends them, so a Firefox UA paired with Sec-CH-UA is an instant bot tell.
+# family classifies the engine behind the UA (chrome, edge or firefox). It drives header
+# coherence: only Chromium families (chrome/edge) emit the Sec-CH-UA client-hint headers —
+# Firefox never sends them, so a Firefox UA paired with Sec-CH-UA is an instant bot tell.
+# The sec_ch_ua fields are empty strings for non-Chromium families.
 @dataclass(frozen=True)
 class BrowserProfile:
     name: str
-    family: str                       # chrome | edge | firefox
+    family: str
     user_agent: str
-    sec_ch_ua: str                    # "" for non-Chromium families
+    sec_ch_ua: str
     sec_ch_ua_platform: str
     sec_ch_ua_mobile: str
     accept_language: str
@@ -36,6 +37,7 @@ class BrowserProfile:
         "q=0.8,application/signed-exchange;v=b3;q=0.7"
     )
 
+    # Return True for the Chromium families (chrome and edge), which send client-hint headers.
     @property
     def is_chromium(self) -> bool:
         return self.family in ("chrome", "edge")
@@ -126,9 +128,8 @@ _PROFILES: list[BrowserProfile] = [
         primp_target="edge",
         primp_os="windows",
     ),
-    # ── firefox family ────────────────────────────────────────────────────────────
-    # No Sec-CH-UA: Firefox does not implement client hints. build_nav_headers omits
-    # the Sec-CH-UA* trio for these so the header set stays coherent with the UA.
+    # Firefox family. No Sec-CH-UA: Firefox does not implement client hints. build_nav_headers
+    # omits the Sec-CH-UA* trio for these so the header set stays coherent with the UA.
     BrowserProfile(
         name="firefox_133_win",
         family="firefox",
@@ -228,11 +229,14 @@ def build_nav_headers(
         "Upgrade-Insecure-Requests": "1",
         "Cache-Control": "max-age=0",
     }
+
     # Client hints are Chromium-only; emitting them under a Firefox UA is a bot tell.
     if profile.is_chromium:
         headers["Sec-CH-UA"] = profile.sec_ch_ua
         headers["Sec-CH-UA-Mobile"] = profile.sec_ch_ua_mobile
         headers["Sec-CH-UA-Platform"] = profile.sec_ch_ua_platform
+
+    # Optional referer and caller overrides go last, so extra wins over the defaults.
     if referer:
         headers["Referer"] = referer
     if extra:

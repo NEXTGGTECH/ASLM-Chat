@@ -1,18 +1,5 @@
 # Copyright NEXTGGTECH. Elastic License 2.0.
 
-"""Hosted providers as a merged, real-time supplement stream.
-
-Emits the exact event shape of `serp_api.search_stream` ({"type": "source"|"vote"
-|"engine"}), so `web_search` consumes scrape and hosted sources through one triage with
-no special-casing. As content-bearing providers (Tavily, Firecrawl) return, their full
-page text is pre-populated into SourceCache under the read_page cache key BEFORE the
-source event is emitted — so when the orchestrator later parses that URL, read_page gets
-a cache hit and runs the normal extraction/compaction pipeline with no network fetch.
-
-Hosted is strictly a supplement: with no API keys configured it yields nothing and the
-search stays pure scrape.
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -34,6 +21,7 @@ from .hosted_providers import HostedProvider, HostedResult, available_providers,
 logger = logging.getLogger("services.web_search")
 trace_logger = logging.getLogger("trace.web_search")
 
+# Paragraph boundary: a blank line, possibly containing whitespace.
 _PARA_SPLIT_RE = re.compile(r"\n\s*\n")
 
 
@@ -96,6 +84,14 @@ def _engine_payload(provider_name: str, family: str, results: list[HostedResult]
 
 
 # Stream hosted-provider sources/votes/engine events, pre-populating content as it lands.
+# Emits the exact event shape of `serp_api.search_stream` ({"type": "source"|"vote"|"engine"}), so
+# `web_search` consumes scrape and hosted sources through one triage with no special-casing. As
+# content-bearing providers (Tavily, Firecrawl) return, their full page text is pre-populated into
+# SourceCache under the read_page cache key BEFORE the source event is emitted, so when the
+# orchestrator later parses that URL, read_page gets a cache hit and runs the normal
+# extraction/compaction pipeline with no network fetch.
+# Hosted is strictly a supplement: with no providers available it yields nothing and the search
+# stays pure scrape.
 async def hosted_search_stream(
     query: str,
     *,
@@ -111,12 +107,17 @@ async def hosted_search_stream(
     if not providers:
         return
 
+    # Shared state: the event queue drained by the consumer below, plus the URLs already emitted
+    # as sources (guarded by a lock) so a repeat from another provider becomes a vote.
     queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
     seen: set[str] = set()
     seen_lock = asyncio.Lock()
 
+    # Query one provider, feed its content into the cache and push its source, vote and engine events.
     async def run(provider: HostedProvider, client: httpx.AsyncClient) -> None:
         family = provider.provider_family
+
+        # Compile the provider-specific query and sanitize it for the hosted API.
         compiled = compile_provider_query(
             query_text or query,
             operators,
@@ -125,6 +126,8 @@ async def hosted_search_stream(
             timelimit=timelimit,
         )
         sanitized = sanitize_query_for_api(compiled.query)
+
+        # Run the search and time it; a provider failure yields an empty result list.
         started = time.perf_counter()
         try:
             results = await provider.search(client, sanitized, max_results=max_results)
@@ -139,6 +142,7 @@ async def hosted_search_stream(
             if n:
                 trace_logger.info("hosted.cache_feed provider=%s urls=%d", provider.name, n)
 
+        # Emit one event per row: the first sighting of a URL is a source, a repeat is a vote.
         for rank, r in enumerate(results, 1):
             if not r.url:
                 continue
@@ -160,6 +164,8 @@ async def hosted_search_stream(
                     "fetch_ms": fetch_ms, "parse_ms": 0.0,
                 }
             await queue.put(item)
+
+        # Close the provider with its engine status event, carrying the compiled query details.
         payload = _engine_payload(provider.name, family, results, fetch_ms)
         payload["query"] = sanitized
         payload["timelimit"] = compiled.timelimit
@@ -167,6 +173,7 @@ async def hosted_search_stream(
         await queue.put({"type": "engine", "engine": f"hosted:{provider.name}",
                          "payload": payload})
 
+    # Run all providers concurrently and always finish with a None sentinel so the consumer stops.
     async def produce() -> None:
         try:
             async with httpx.AsyncClient(timeout=deadline_seconds, follow_redirects=True) as client:
@@ -176,6 +183,7 @@ async def hosted_search_stream(
         finally:
             await queue.put(None)
 
+    # Consume events as they arrive until the sentinel or the overall deadline.
     producer = asyncio.create_task(produce())
     try:
         async with asyncio.timeout(deadline_seconds):
@@ -185,8 +193,10 @@ async def hosted_search_stream(
                     break
                 yield item
     except TimeoutError:
+        # Deadline reached: keep whatever was already yielded and let the search move on.
         pass
     finally:
+        # Stop any provider still running and swallow its cancellation or failure.
         producer.cancel()
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await producer

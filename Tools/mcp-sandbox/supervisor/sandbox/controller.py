@@ -35,8 +35,9 @@ logger = logging.getLogger(__name__)
 
 # Backend handlers
 
-
-# OPEN intent: read file content with loop-breaking and preview fallbacks.
+# OPEN intent: read file content with loop-breaking and preview fallbacks. Large files, long files and
+# repeated reads of the same file get a structured preview instead of the raw text; a read that mostly
+# overlaps earlier reads is redirected to the next unread window.
 def _handle_open(
     nc: NormalizedCommand,
     state: ExplorationState,
@@ -45,12 +46,12 @@ def _handle_open(
     path = resolve_model_path(nc.target, cwd)
     norm_path = normalize_model_relative_path(path)
 
-    # Check if we should serve an alternative representation due to loops
+    # Check if we should serve an alternative representation due to loops.
     loop_broken = False
     if state.should_break_loop(norm_path, "open"):
         loop_broken = True
 
-    # Get file metadata
+    # Get file metadata.
     try:
         meta = describe(path)
     except Exception as exc:
@@ -60,7 +61,7 @@ def _handle_open(
     size = int(meta_inner.get("size_bytes", 0))
     kind = meta_inner.get("kind", "text")
 
-    # Binary / image — quick exit
+    # Binary / image — quick exit.
     if kind in ("binary", "image"):
         from sandbox.presenters import _human_size
         mime = meta_inner.get("mime", "?")
@@ -83,11 +84,11 @@ def _handle_open(
                representation="map" if loop_broken else "map")
         return _ok(preview, norm_path, warnings=warnings)
 
-    # Normal read — with optional line range
+    # Normal read — with optional line range.
     start = nc.start_line
     end = nc.end_line
 
-    # Tail support from compound pipeline normalization
+    # Tail support from compound pipeline normalization.
     tail_n = getattr(nc, "_tail_n", None)
     if tail_n is not None and start is None:
         full = read(path=path, max_bytes=MAX_READ_BYTES)
@@ -95,6 +96,7 @@ def _handle_open(
         start = max(1, total - tail_n + 1)
         end = total
 
+    # Read the requested slice (the whole file when no range was given) and unpack the result.
     result = read(
         path=path,
         start_line=start,
@@ -123,7 +125,7 @@ def _handle_open(
             ],
         )
 
-    # Overlap with prior reads → serve adjacent unread window when possible.
+    # Overlap with prior reads → serve adjacent unread window when possible (more than 70% overlap).
     if not loop_broken and start is None:
         overlap = state.get_read_overlap(norm_path, s_line, e_line)
         if overlap > 0.7:
@@ -145,6 +147,7 @@ def _handle_open(
     else:
         warnings_list = list(result.get("warnings", []))
 
+    # Render the slice for the model and remember it for loop and overlap detection.
     presented = present_read_slice(
         path=norm_path,
         content=content,
@@ -171,6 +174,7 @@ def _handle_locate(
     path = resolve_model_path(nc.target, cwd)
     norm_path = normalize_model_relative_path(path)
 
+    # Run the search with the parsed flags, capped at MAX_GREP_RESULTS matches.
     result = grep(
         pattern=nc.pattern,
         path=path,
@@ -181,6 +185,7 @@ def _handle_locate(
         max_results=MAX_GREP_RESULTS,
     )
 
+    # Format the matches and record the search for exploration tracking.
     matches = result.get("result", {}).get("matches", [])
     presented = present_grep_results(
         matches=matches,
@@ -193,7 +198,8 @@ def _handle_locate(
     return _ok(presented, norm_path, warnings=result.get("warnings", []))
 
 
-# SURVEY intent (ls/tree): directory listing with optional survey cache.
+# SURVEY intent (ls/tree): directory listing with optional survey cache. The listing of the task root is
+# cached so repeated root surveys are answered from the cache.
 def _handle_survey(
     nc: NormalizedCommand,
     state: ExplorationState,
@@ -202,7 +208,7 @@ def _handle_survey(
     path = resolve_model_path(nc.target, cwd)
     norm_path = normalize_model_relative_path(path)
 
-    # Return cached survey for repeated root surveys
+    # Return cached survey for repeated root surveys.
     if norm_path in (".", "") and state.has_survey_cache():
         cached = state.repo_survey_cache
         return _ok(cached["output"], norm_path,
@@ -215,6 +221,7 @@ def _handle_survey(
         include_hidden=nc.include_hidden,
     )
 
+    # Render one indented line per entry (directories with a trailing slash, files with their size).
     entries = result.get("result", {}).get("entries", [])
     lines = []
     dirs_count = 0
@@ -234,6 +241,7 @@ def _handle_survey(
                 lines.append(f"{indent}{name}")
             files_count += 1
 
+    # Add the header and totals; only the root listing is cached.
     output = "\n".join(lines) or "(empty)"
     output = f"{norm_path}/\n{output}\n\n{dirs_count} directories, {files_count} files"
 
@@ -270,9 +278,10 @@ def _handle_find(
 
 # Helpers
 
-
-# Build structured head/tail preview for large or long files.
+# Build structured head/tail preview for large or long files. The head comes from the start of the
+# file; files over 45 lines also show their last 16 lines as a tail.
 def _build_preview(path: str, meta: dict[str, Any], size: int) -> str:
+    # Read the head of the file (limited by MAX_READ_BYTES).
     head_result = read(path=path, max_bytes=MAX_READ_BYTES)
     head_inner = head_result.get("result", {})
     content = head_inner.get("content", "")
@@ -280,6 +289,7 @@ def _build_preview(path: str, meta: dict[str, Any], size: int) -> str:
     mime = head_inner.get("mime", meta.get("mime", "text/plain"))
     head_lines = content.split("\n") if content else []
 
+    # Long files also get their last lines, read separately.
     tail_lines: list[str] = []
     tail_start_line = 0
     if total_lines > 45:
@@ -294,6 +304,7 @@ def _build_preview(path: str, meta: dict[str, Any], size: int) -> str:
         tail_lines = tail_content.split("\n") if tail_content else []
         tail_start_line = tail_start
 
+    # Format the preview for the model.
     norm = normalize_model_relative_path(path)
     return present_auto_preview(
         path=norm,
@@ -332,17 +343,19 @@ def _err(message: str) -> dict[str, Any]:
     }
 
 
-# Signal path errors so _try_supervise can fall back to real bash.
+# Signal path errors so _try_supervise can fall back to real bash. Always raises FileNotFoundError.
 def _not_found(message: str) -> None:
     raise FileNotFoundError(message)
 
 
 # Main dispatch
 
+# Command names routed to the find handler instead of the directory-listing handler.
 _FIND_COMMANDS = frozenset({"find", "fd"})
 
 
-# Classify command and dispatch; None means fall through to real bash.
+# Classify command and dispatch; None means fall through to real bash. Path-resolution errors
+# propagate to the caller; other failures are logged and also fall through to real bash.
 def dispatch(
     command: str,
     cwd: str,
@@ -354,12 +367,15 @@ def dispatch(
     if nc is None:
         return None
 
+    # Real bash handles execution.
     if nc.intent == Intent.RUN:
-        return None  # real bash handles execution
+        return None
 
+    # Existing _ROUTE_MAP handlers cover mutations.
     if nc.intent == Intent.MUTATE:
-        return None  # existing _ROUTE_MAP handlers cover mutations
+        return None
 
+    # Route to the handler of the intent.
     try:
         if nc.intent == Intent.OPEN:
             result = _handle_open(nc, state, cwd=cwd)
@@ -383,10 +399,11 @@ def dispatch(
         # can apply _is_path_resolution_error and fall back to real bash.
         raise
     except Exception as exc:
+        # Unknown errors fall through to real bash.
         logger.debug("Controller dispatch failed for %r: %s", command, exc)
-        return None  # unknown errors fall through to real bash
+        return None
 
-    # Convert internal result to bash-shaped response
+    # Convert internal result to bash-shaped response.
     error = result.get("error")
     if error:
         return make_bash_error(

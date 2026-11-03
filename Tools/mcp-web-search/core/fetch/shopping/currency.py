@@ -1,7 +1,5 @@
 # Copyright NEXTGGTECH. Elastic License 2.0.
 
-"""Public exchange-rate enrichment for structured shopping prices."""
-
 from __future__ import annotations
 
 import asyncio
@@ -20,6 +18,7 @@ from .models import ShoppingProduct
 
 logger = logging.getLogger("core.fetch.shopping.currency")
 
+# Public ExchangeRate-API endpoint (USD base) and the attribution its terms require us to show.
 EXCHANGE_RATE_API_URL = "https://open.er-api.com/v6/latest/USD"
 EXCHANGE_RATE_API_ATTRIBUTION = "Rates By Exchange Rate API"
 EXCHANGE_RATE_API_ATTRIBUTION_URL = "https://www.exchangerate-api.com"
@@ -49,10 +48,14 @@ DEFAULT_DISPLAY_CURRENCIES = (
     "TWD",
 )
 DISPLAY_CURRENCY_COUNT = len(DEFAULT_DISPLAY_CURRENCIES)
+
+# How long a fetched rate table stays cached, and the timeout of one rate request.
 RATE_CACHE_TTL_SECONDS = 60 * 60
 RATE_REQUEST_TIMEOUT_SECONDS = 6.0
 
 
+# One snapshot of exchange rates. `reference_per_unit` maps a currency code to the value of one
+# unit of it in the reference currency, so any pair converts through the reference.
 @dataclass(frozen=True, slots=True)
 class ExchangeRateTable:
     provider: str
@@ -65,6 +68,8 @@ class ExchangeRateTable:
     documentation_url: str = ""
     terms_url: str = ""
 
+    # Return how many units of `quote` one unit of `base` buys, or None when either currency is
+    # unknown or the quote currency has no usable value.
     def rate(self, base: str, quote: str) -> Decimal | None:
         base_value = self.reference_per_unit.get(str(base or "").upper())
         quote_value = self.reference_per_unit.get(str(quote or "").upper())
@@ -73,10 +78,12 @@ class ExchangeRateTable:
         return base_value / quote_value
 
 
+# Cached rate tables as (monotonic expiry time, table), and the lock that serializes refreshes.
 _rate_cache: dict[str, tuple[float, ExchangeRateTable]] = {}
 _rate_cache_lock = asyncio.Lock()
 
 
+# Parse a positive finite number (a comma is accepted as the decimal separator), or None.
 def _decimal(value: Any) -> Decimal | None:
     try:
         parsed = Decimal(str(value or "").strip().replace(" ", "").replace(",", "."))
@@ -85,22 +92,30 @@ def _decimal(value: Any) -> Decimal | None:
     return parsed if parsed.is_finite() and parsed > 0 else None
 
 
+# Return the last-update date of a rate payload as an ISO date (from the unix stamp, else the
+# raw UTC text).
 def _rate_date(payload: dict[str, Any]) -> str:
     try:
         stamp = int(payload.get("time_last_update_unix") or 0)
     except (TypeError, ValueError):
+        # A missing or non-numeric stamp falls back to the textual date below.
         stamp = 0
     if stamp > 0:
         return datetime.fromtimestamp(stamp, tz=timezone.utc).date().isoformat()
     return str(payload.get("time_last_update_utc") or "").strip()
 
 
+# Parse an ExchangeRate-API reply into a rate table. The API gives units of each currency per
+# reference unit; the table stores the inverse. Raises ValueError for an unsuccessful reply or
+# one without usable rates.
 def parse_exchange_rate_api_table(content: bytes) -> ExchangeRateTable:
+    # Reject an unsuccessful reply.
     payload = json.loads(content)
     if not isinstance(payload, dict) or payload.get("result") != "success":
         error = payload.get("error-type") if isinstance(payload, dict) else "invalid-response"
         raise ValueError(f"ExchangeRate-API returned {error or 'an unsuccessful response'}")
 
+    # Read the reference currency and invert every rate.
     reference_currency = str(payload.get("base_code") or "").strip().upper()
     raw_rates = payload.get("rates")
     if not reference_currency or not isinstance(raw_rates, dict):
@@ -126,6 +141,7 @@ def parse_exchange_rate_api_table(content: bytes) -> ExchangeRateTable:
     )
 
 
+# Return the rate table from the cache, fetching and caching a fresh one when it has expired.
 async def _fetch_table(*, client: httpx.AsyncClient) -> ExchangeRateTable:
     cache_key = "exchange-rate-api-usd"
     cached = _rate_cache.get(cache_key)
@@ -147,6 +163,9 @@ async def _fetch_table(*, client: httpx.AsyncClient) -> ExchangeRateTable:
         return table
 
 
+# Convert a price into the target currencies using the first table that knows each pair. Each
+# entry carries the converted value (rounded to cents), the rate and its provenance. Returns an
+# empty list for a missing currency or a non-positive amount.
 def converted_prices(
     amount: float,
     currency: str,
@@ -171,6 +190,7 @@ def converted_prices(
         if len(normalized_targets) >= conversion_slots:
             break
 
+    # Convert into each target with the first table that has the pair.
     output: list[dict[str, Any]] = []
     for quote in normalized_targets:
         for table in tables:
@@ -195,12 +215,16 @@ def converted_prices(
     return output
 
 
+# Fill `converted_prices` of every product that has a price and currency, and return a summary
+# (providers used, converted product count, display currencies, cache TTL). A rate fetch failure
+# is logged and leaves the original prices untouched. A client passed in is not closed here.
 async def enrich_products_with_exchange_rates(
     products: list[ShoppingProduct],
     *,
     targets: tuple[str, ...] = DEFAULT_DISPLAY_CURRENCIES,
     client: httpx.AsyncClient | None = None,
 ) -> dict[str, Any]:
+    # Only products with a price and a currency can be converted.
     priced = [
         product
         for product in products
@@ -215,6 +239,7 @@ async def enrich_products_with_exchange_rates(
             "cache_ttl_seconds": RATE_CACHE_TTL_SECONDS,
         }
 
+    # Fetch the rate table, closing the HTTP client only when this function created it.
     owns_client = client is None
     http = client or httpx.AsyncClient(
         timeout=RATE_REQUEST_TIMEOUT_SECONDS,
@@ -231,6 +256,7 @@ async def enrich_products_with_exchange_rates(
         if owns_client:
             await http.aclose()
 
+    # Convert each product and report what was done.
     converted_count = 0
     for product in priced:
         product.converted_prices = converted_prices(

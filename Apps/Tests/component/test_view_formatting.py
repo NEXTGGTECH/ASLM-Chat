@@ -13,16 +13,18 @@ from Apps.UI.views import _build_chat_title
 pytestmark = [pytest.mark.component]
 
 
-# Keep user-visible LM output clean and actionable.
+# Cover the view helpers that clean and format user-visible model output, chat titles, tool results and
+# activity segments.
 class ViewFormattingTests(SimpleTestCase):
-    # Test strip LLM control tokens removes service markers.
+    # Verify that stripping control tokens removes the service markers and keeps only the message text.
     def test_strip_llm_control_tokens_removes_service_markers(self):
         self.assertEqual(
             _strip_llm_control_tokens("<|start|>assistant<|channel|>final<|message|>Hello"),
             "Hello",
         )
 
-    # Test format runtime error hides LM Studio model load verbosity.
+    # Verify that the runtime error formatter replaces the verbose LM Studio model load error with a short
+    # Flash Attention hint.
     def test_format_runtime_error_hides_lms_model_load_verbosity(self):
         message = _format_runtime_error(
             "lms",
@@ -34,20 +36,23 @@ class ViewFormattingTests(SimpleTestCase):
         self.assertIn("Flash Attention", message)
         self.assertNotIn("Model get/load error", message)
 
-    # Test chat titles are compact and useful for attachment-only threads.
+    # Verify that a chat title keeps short text, truncates text longer than 30 characters with an ellipsis,
+    # and falls back to a fixed title for attachment-only and empty messages.
     def test_build_chat_title_handles_long_and_attachment_only_messages(self):
         self.assertEqual(_build_chat_title("Short title", False), "Short title")
         self.assertEqual(_build_chat_title("x" * 31, False), f"{'x' * 30}...")
         self.assertEqual(_build_chat_title("", True), "Attachment chat")
         self.assertEqual(_build_chat_title("", False), "New Chat")
 
-    # Test active tool slugs support both current JSON and legacy string shapes.
+    # Verify that active tool slugs are parsed from a JSON list (dropping empty entries) and from a legacy
+    # plain string, and that an empty value gives an empty list.
     def test_parse_active_tool_slugs_supports_json_and_legacy_values(self):
         self.assertEqual(_parse_active_tool_slugs('["time_suite", "", "browser"]'), ["time_suite", "browser"])
         self.assertEqual(_parse_active_tool_slugs("time_suite"), ["time_suite"])
         self.assertEqual(_parse_active_tool_slugs(""), [])
 
-    # Test shared files keep their UI render payload after tool result splitting.
+    # Verify that splitting a shared file tool result gives the model a short download message and keeps
+    # the file render data, the download URL and the tool UI kind for the UI.
     def test_shared_file_tool_result_keeps_ui_metadata(self):
         payload = {
             "kind": "shared_file",
@@ -71,6 +76,8 @@ class ViewFormattingTests(SimpleTestCase):
         self.assertIn("/api/shared-file/download/?", extras["structured_content"]["file"]["download_url"])
         self.assertEqual(extras["tool_ui"]["kind"], "shared_file")
 
+    # Verify that the cancelled tool result is split into a stable model text that tells the model not to
+    # retry, marks the tool UI as cancelled and counts as a blocking tool result.
     def test_cancelled_tool_result_is_stable_and_tells_model_not_to_retry(self):
         model_text, extras = tool_registry.split_tool_result_payload(
             tool_registry.TOOL_EXECUTION_CANCELLED
@@ -82,8 +89,10 @@ class ViewFormattingTests(SimpleTestCase):
         self.assertEqual(extras["tool_ui"]["status"], "cancelled")
         self.assertTrue(tool_registry.is_blocking_tool_result(tool_registry.TOOL_EXECUTION_CANCELLED))
 
-    # Test repeated tool aliases preserve all shared files in activity segments.
+    # Verify that two tool results with the same alias each keep their own shared file in the activity
+    # segments.
     def test_build_activity_segments_keeps_repeated_share_file_aliases(self):
+        # Message stand-in whose transcript holds two share_file tool results with the same alias.
         class _MessageStub:
             llm_transcript = [
                 {
@@ -122,6 +131,7 @@ class ViewFormattingTests(SimpleTestCase):
                 },
             ]
 
+        # Collect the shared file name of every tool segment.
         segments = _build_activity_segments(_MessageStub())
         files = [
             (segment.get("structuredContent") or {}).get("file", {}).get("filename")

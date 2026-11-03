@@ -14,7 +14,10 @@ from Apps.API.views import _extract_model_name
 pytestmark = [pytest.mark.unit]
 
 
+# Cover the sandbox model context that is added to the available-tools prompt.
 class SandboxModelContextTests(SimpleTestCase):
+    # Verify that the context of an enabled sandbox server is requested once per prompt build, shared by all its
+    # tools, and requested again on the next build so values stay current.
     def test_enabled_server_context_is_fetched_once_per_generation(self):
         server = {"id": "sandbox", "has_model_context": True, "external": True,
                   "server_file": Path("Tools/mcp-sandbox/mcp-server.py")}
@@ -29,6 +32,8 @@ class SandboxModelContextTests(SimpleTestCase):
             self.assertEqual(worker.call_count, 2)
         self.assertEqual(worker.call_args.args[1], "model_context")
 
+    # Verify that without a sandbox tool no worker is started, the prompt has no sandbox section and an empty
+    # tool lookup gives an empty prompt.
     def test_disabled_sandbox_is_not_inspected_or_included(self):
         lookup = {"web__search": {"server": {"id": "web"}, "tool": {"description": "Search"}}}
         with patch.object(tool_registry, "_run_worker") as worker:
@@ -36,6 +41,8 @@ class SandboxModelContextTests(SimpleTestCase):
             self.assertEqual(tool_registry.available_tools_prompt({}), "")
         worker.assert_not_called()
 
+    # Verify that a failing context worker only adds an "environment details unavailable" note to the prompt and
+    # never leaks the error text.
     def test_context_failure_does_not_break_generation(self):
         lookup = {"sandbox__bash": {"server": {
             "id": "sandbox", "has_model_context": True, "external": True,
@@ -46,28 +53,31 @@ class SandboxModelContextTests(SimpleTestCase):
         self.assertIn("environment details unavailable", prompt)
         self.assertNotIn("private host details", prompt)
 
+
 # Cover adapter-specific model list formats.
 class ModelNameExtractionTests(SimpleTestCase):
-    # Test extracts name from string.
+    # Verify that a plain string entry is returned as the model name.
     def test_extracts_name_from_string(self):
         self.assertEqual(_extract_model_name("llama3"), "llama3")
 
-    # Test extracts name from mapping.
+    # Verify that the model name is read from the model, name or model_key key of a mapping entry.
     def test_extracts_name_from_mapping(self):
         self.assertEqual(_extract_model_name({"model": "qwen"}), "qwen")
         self.assertEqual(_extract_model_name({"name": "gpt-oss"}), "gpt-oss")
         self.assertEqual(_extract_model_name({"model_key": "mistral-nemo"}), "mistral-nemo")
 
-    # Test prefers id over friendly name.
+    # Verify that the id of a mapping entry wins over its friendly name.
     def test_prefers_id_over_friendly_name(self):
         self.assertEqual(
             _extract_model_name({"id": "openai/gpt-oss-20b", "name": "OpenAI: GPT OSS 20B"}),
             "openai/gpt-oss-20b",
         )
 
+
 # Cover generic engine registry behavior for optional capabilities.
 class EngineRegistryTests(SimpleTestCase):
-    # Test title requests use a bounded source, context, and output.
+    # Verify that a title request truncates the source text to 2048 characters, limits the context and output
+    # tokens, streams, and returns the generated title stripped of whitespace and backticks.
     @patch("API.llm_api.generate")
     def test_generate_chat_title_builds_bounded_ollama_request(self, mock_generate):
         mock_generate.return_value = [{"message": {"content": "  `Useful title`  "}}]
@@ -85,7 +95,8 @@ class EngineRegistryTests(SimpleTestCase):
         self.assertEqual(request["options"], {"num_ctx": 4096, "num_predict": 32})
         self.assertTrue(request["stream"])
 
-    # Test a thought-only instant attempt retries with a bounded reasoning budget.
+    # Verify that a first attempt without thinking that only returns thought text is retried with a low thinking
+    # level and a larger output limit, and the second answer becomes the title.
     @patch("API.llm_api.generate")
     def test_generate_chat_title_retries_thought_only_response(self, mock_generate):
         mock_generate.side_effect = [
@@ -112,15 +123,14 @@ class EngineRegistryTests(SimpleTestCase):
         self.assertEqual(second_request["options"]["thinking_level"], "low")
         self.assertEqual(second_request["options"]["max_output_tokens"], 1024)
 
-    # Test reload model raises for engines without reload support.
+    # Verify that reloading a model on an engine without reload support raises NotImplementedError.
     def test_reload_model_raises_for_engines_without_reload_support(self):
         with self.assertRaises(NotImplementedError):
             llm_api.reload_model("openai", "gpt-oss")
 
-    # Test get models prepares runtime before listing.
+    # Verify that listing models prepares the engine runtime first and returns the engine module's list.
     @patch("API.llm_api.prepare_runtime")
     @patch("API.llm_api._get_engine_module")
-    # Verify get models prepares runtime before listing.
     def test_get_models_prepares_runtime_before_listing(self, mock_get_engine_module, mock_prepare_runtime):
         mock_module = Mock()
         mock_module.get_models.return_value = ["llama3"]
@@ -129,10 +139,10 @@ class EngineRegistryTests(SimpleTestCase):
         self.assertEqual(llm_api.get_models("ollama-service"), ["llama3"])
         mock_prepare_runtime.assert_called_once_with("ollama-service")
 
-    # Test get model settings prepares runtime before loading metadata.
+    # Verify that loading model settings prepares the engine runtime first and returns the engine module's
+    # settings.
     @patch("API.llm_api.prepare_runtime")
     @patch("API.llm_api._get_engine_module")
-    # Verify get model settings prepares runtime before loading metadata.
     def test_get_model_settings_prepares_runtime_before_loading_metadata(
         self,
         mock_get_engine_module,

@@ -9,6 +9,7 @@ import pytest
 from core.fetch.shopping.parse import parse_products
 
 
+# Parse an HTML page as a pricerunner primary-lane page with GBP as the default currency.
 def _parse(html: str):
     return parse_products(
         html,
@@ -20,6 +21,7 @@ def _parse(html: str):
     )
 
 
+# Verify that a JSON-LD Product with a valid offer price is kept, with its price value and currency.
 @pytest.mark.unit
 def test_parse_products_keeps_jsonld_product_with_valid_price() -> None:
     payload = {
@@ -41,6 +43,7 @@ def test_parse_products_keeps_jsonld_product_with_valid_price() -> None:
     assert products[0].currency == "GBP"
 
 
+# Verify that a JSON-LD Product whose offer has no price is dropped.
 @pytest.mark.unit
 def test_parse_products_drops_jsonld_product_without_valid_price() -> None:
     payload = {
@@ -56,6 +59,7 @@ def test_parse_products_drops_jsonld_product_without_valid_price() -> None:
     assert products == []
 
 
+# Verify that when a JSON-LD Product lists several offers, the price of the first offer is used.
 @pytest.mark.unit
 def test_parse_products_uses_first_jsonld_offer_list_item() -> None:
     payload = {
@@ -75,6 +79,7 @@ def test_parse_products_uses_first_jsonld_offer_list_item() -> None:
     assert products[0].price_value == pytest.approx(199.99)
 
 
+# Verify that a link card without a price is dropped for any provider (checked with ek_ua).
 @pytest.mark.unit
 def test_parse_products_drops_cards_without_price_for_all_providers() -> None:
     html = '<a href="https://ek.example/p/1">Product without a price</a>'
@@ -91,6 +96,8 @@ def test_parse_products_drops_cards_without_price_for_all_providers() -> None:
     assert products == []
 
 
+# Verify that a card with a priced link is kept with its price and currency, and that no image URL is
+# extracted.
 @pytest.mark.unit
 def test_parse_products_keeps_card_with_price() -> None:
     html = (
@@ -108,8 +115,11 @@ def test_parse_products_keeps_card_with_price() -> None:
     assert not hasattr(products[0], "image_url")
 
 
+# Verify that a Yandex Market card takes the real price from the offer block ("51673 ₽") and not a number
+# from the specification text (camera count and megapixels).
 @pytest.mark.unit
 def test_yandex_card_uses_real_price_outside_specification_branch() -> None:
+    # Arrange: a product card with a title, a specification line and an offer price.
     html = (
         '<article class="product-card">'
         '<noframes>{"zoneData":{"price":{"currency":"RUR","value":"51673"}}}</noframes>'
@@ -125,6 +135,7 @@ def test_yandex_card_uses_real_price_outside_specification_branch() -> None:
         '</article>'
     )
 
+    # Act.
     products = parse_products(
         html,
         provider="yandex_market",
@@ -134,12 +145,14 @@ def test_yandex_card_uses_real_price_outside_specification_branch() -> None:
         default_currency="RUB",
     )
 
+    # Assert: the single product carries the offer price in rubles.
     assert len(products) == 1
     assert products[0].price_text == "51673 ₽"
     assert products[0].price_value == pytest.approx(51673.0)
     assert products[0].currency == "RUB"
 
 
+# Verify that price filter facet links ("Unter 10 €", "10 € - 20 €") are not parsed as products.
 @pytest.mark.unit
 def test_parse_products_drops_price_filter_facets() -> None:
     html = (
@@ -162,6 +175,8 @@ def test_parse_products_drops_price_filter_facets() -> None:
     assert products == []
 
 
+# Verify that a short category link is dropped when the price appears only in a nearby sibling text
+# and not in the link itself.
 @pytest.mark.unit
 def test_parse_products_drops_short_anchor_when_price_is_only_nearby_context() -> None:
     html = (

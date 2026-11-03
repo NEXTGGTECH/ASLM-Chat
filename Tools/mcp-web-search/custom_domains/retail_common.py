@@ -29,6 +29,7 @@ def normalize_availability(value: str) -> str:
     if not text:
         return ""
 
+    # schema.org enum values (e.g. ".../InStock"), compared with everything but letters removed.
     lower = text.lower()
     mapping = {
         "instock": "In stock",
@@ -40,6 +41,7 @@ def normalize_availability(value: str) -> str:
     if compact in mapping:
         return mapping[compact]
 
+    # Known human-readable labels, returned in their canonical spelling.
     allowed_exact = {
         "в наличии": "В наличии",
         "под заказ": "Под заказ",
@@ -50,6 +52,8 @@ def normalize_availability(value: str) -> str:
     if lower in allowed_exact:
         return allowed_exact[lower]
 
+    # Anything else is accepted only when it looks like a short human label; long text, markup/code
+    # characters and identifier-like words are page noise and are dropped.
     if len(text) > 40:
         return ""
     if any(ch in text for ch in ('"', "{", "}", "=", ";")):
@@ -65,6 +69,7 @@ def prepend_retail_metadata(markdown: str, meta: dict[str, str]) -> str:
     if not markdown or not meta:
         return markdown
 
+    # Read the metadata fields; empty ones produce no line.
     lines: list[str] = []
     price = meta.get("price", "").strip()
     currency = meta.get("currency", "").strip().upper()
@@ -73,6 +78,7 @@ def prepend_retail_metadata(markdown: str, meta: dict[str, str]) -> str:
     summary = meta.get("hero_summary", "").strip()
     specs = meta.get("key_specs", "").strip()
 
+    # Product, price (with currency), availability, summary and key specs, in that order.
     if title:
         lines.append(f"**Product:** {title}")
 

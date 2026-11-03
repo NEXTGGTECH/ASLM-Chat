@@ -22,6 +22,8 @@ from core.fetch.shopping.models import ShoppingProduct
 from core.search.web_search import _shopping_product_dict
 
 
+# Build an ExchangeRate-API style USD-based JSON response with a rate for each display currency, plus
+# fixed USD, GBP (configurable), EUR and ZAR rates.
 def _api_response(*, gbp_rate: float = 0.8) -> bytes:
     rates = {code: float(index + 1) for index, code in enumerate(DEFAULT_DISPLAY_CURRENCIES)}
     rates.update({"USD": 1.0, "GBP": gbp_rate, "EUR": 0.9, "ZAR": 20.0})
@@ -38,6 +40,8 @@ def _api_response(*, gbp_rate: float = 0.8) -> bytes:
     ).encode()
 
 
+# Verify that the number of display currencies equals the number of UI locales and module manifest
+# locales (20), and that the rate cache TTL is one hour.
 def test_display_currency_count_tracks_project_locale_count() -> None:
     project_root = Path(__file__).resolve().parents[3]
     locale_count = len(list((project_root / "Apps" / "UI" / "locales").glob("*.json")))
@@ -52,6 +56,8 @@ def test_display_currency_count_tracks_project_locale_count() -> None:
     assert RATE_CACHE_TTL_SECONDS == 60 * 60
 
 
+# Verify that the parsed public API rate table carries the provider, date and attribution, and converts
+# between non-base currencies (GBP to USD and to EUR).
 def test_public_api_rates_convert_cross_currencies() -> None:
     table = parse_exchange_rate_api_table(_api_response())
 
@@ -62,6 +68,8 @@ def test_public_api_rates_convert_cross_currencies() -> None:
     assert table.attribution == "Rates By Exchange Rate API"
 
 
+# Verify that a price is shown in every display currency including the original one: the converted list
+# holds all but the original, and the USD entry has the converted value and the attribution URL.
 def test_price_has_twenty_currencies_including_original() -> None:
     table = parse_exchange_rate_api_table(_api_response())
     prices = converted_prices(100, "GBP", [table])
@@ -73,6 +81,8 @@ def test_price_has_twenty_currencies_including_original() -> None:
     assert usd["attribution_url"] == "https://www.exchangerate-api.com"
 
 
+# Verify that a primary currency outside the default display set (ZAR) still gets the full number of
+# converted prices.
 def test_unknown_primary_currency_still_uses_twenty_total_slots() -> None:
     table = parse_exchange_rate_api_table(_api_response())
 
@@ -80,7 +90,10 @@ def test_unknown_primary_currency_still_uses_twenty_total_slots() -> None:
     assert len(converted_prices(100, "ZAR", [table])) == DISPLAY_CURRENCY_COUNT - 1
 
 
+# Verify that the shopping source JSON keeps the primary price and all converted prices, and mentions a
+# converted price in the snippet.
 def test_shopping_source_json_keeps_primary_and_all_converted_prices() -> None:
+    # Arrange: a GBP product with converted prices.
     table = parse_exchange_rate_api_table(_api_response())
     product = ShoppingProduct(
         id="p1",
@@ -95,8 +108,10 @@ def test_shopping_source_json_keeps_primary_and_all_converted_prices() -> None:
         converted_prices=converted_prices(100, "GBP", [table]),
     )
 
+    # Act.
     source = _shopping_product_dict(product, citation_id="c1", rank=1)
 
+    # Assert: the primary price is intact and every converted price is present.
     assert source["price"] == {
         "value": 100.0,
         "currency": "GBP",
@@ -108,14 +123,18 @@ def test_shopping_source_json_keeps_primary_and_all_converted_prices() -> None:
     assert "125.00 USD" in source["snippet"]
 
 
+# Verify that enriching four products in parallel fetches the exchange-rate snapshot only once, and
+# every product receives its converted prices.
 def test_parallel_enrichment_fetches_one_hourly_rate_snapshot() -> None:
     requests = 0
 
+    # Count the rate requests and answer with the canned API response.
     async def handler(request):
         nonlocal requests
         requests += 1
         return httpx.Response(200, content=_api_response(), request=request)
 
+    # Enrich four fresh products concurrently against an empty rate cache and return them.
     async def run() -> list[ShoppingProduct]:
         _rate_cache.clear()
         products = [
@@ -143,15 +162,19 @@ def test_parallel_enrichment_fetches_one_hourly_rate_snapshot() -> None:
     assert all(len(product.converted_prices) == DISPLAY_CURRENCY_COUNT - 1 for product in products)
 
 
+# Verify that a rate snapshot is reused while fresh and refetched once it has expired: the refetched
+# snapshot (GBP rate 0.5 instead of 0.8) changes the converted USD price from 125 to 200.
 def test_expired_hourly_snapshot_is_refetched_and_changes_price_math() -> None:
     requests = 0
 
+    # Count the rate requests; the first answer has a GBP rate of 0.8, later ones 0.5.
     async def handler(request):
         nonlocal requests
         requests += 1
         gbp_rate = 0.8 if requests == 1 else 0.5
         return httpx.Response(200, content=_api_response(gbp_rate=gbp_rate), request=request)
 
+    # Build a GBP test product with the given id.
     def product(product_id: str) -> ShoppingProduct:
         return ShoppingProduct(
             id=product_id,
@@ -165,6 +188,8 @@ def test_expired_hourly_snapshot_is_refetched_and_changes_price_math() -> None:
             currency="GBP",
         )
 
+    # Enrich three products one after another: the second reuses the fresh snapshot, the third runs
+    # after the cached snapshot's timestamp was reset to the epoch to simulate expiry.
     async def run() -> tuple[ShoppingProduct, ShoppingProduct, ShoppingProduct]:
         _rate_cache.clear()
         first, cached, refreshed = product("first"), product("cached"), product("refreshed")
@@ -181,6 +206,7 @@ def test_expired_hourly_snapshot_is_refetched_and_changes_price_math() -> None:
     cached_usd = next(item for item in cached.converted_prices if item["currency"] == "USD")
     refreshed_usd = next(item for item in refreshed.converted_prices if item["currency"] == "USD")
 
+    # Two requests in total: the cached product made none, the refreshed one fetched a new snapshot.
     assert requests == 2
     assert first_usd["value"] == 125.0
     assert cached_usd["value"] == 125.0

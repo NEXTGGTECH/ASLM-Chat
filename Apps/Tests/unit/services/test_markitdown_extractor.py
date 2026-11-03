@@ -25,10 +25,9 @@ def _build_docx(paragraphs: list[str]) -> bytes:
     return stream.getvalue()
 
 
-# Conversion.
+# Conversion
 
-
-# A genuine DOCX converts to markdown text.
+# Verify that a genuine DOCX converts to markdown text containing its paragraphs.
 def test_extract_markdown_converts_docx():
     docx_bytes = _build_docx(["MarkItDown heading", "Body paragraph"])
 
@@ -38,27 +37,28 @@ def test_extract_markdown_converts_docx():
     assert "Body paragraph" in text
 
 
-# Empty payloads convert to an empty string.
+# Verify that an empty payload converts to an empty string.
 def test_extract_markdown_rejects_empty_payload():
     assert markitdown_extractor.extract_markdown(b"", name="a.docx", mime="") == ""
 
 
-# Oversized payloads are rejected without starting a conversion.
+# Verify that a payload above the input size limit converts to an empty string.
 def test_extract_markdown_rejects_oversized_payload(monkeypatch):
     monkeypatch.setattr(markitdown_extractor, "MARKITDOWN_MAX_INPUT_BYTES", 10)
 
     assert markitdown_extractor.extract_markdown(b"x" * 11, name="a.docx", mime="") == ""
 
 
-# A missing converter yields an empty string.
+# Verify that an unavailable converter instance yields an empty string.
 def test_extract_markdown_returns_empty_without_converter(monkeypatch):
     monkeypatch.setattr(markitdown_extractor, "_get_markitdown_instance", lambda: None)
 
     assert markitdown_extractor.extract_markdown(b"payload", name="a.docx", mime="") == ""
 
 
-# Converter failures never propagate to the caller.
+# Verify that an exception raised during conversion is swallowed and yields an empty string.
 def test_extract_markdown_swallows_conversion_errors(monkeypatch):
+    # Fail every conversion attempt with a RuntimeError.
     def broken_once(file_bytes, *, name, mime):
         raise RuntimeError("converter exploded")
 
@@ -67,10 +67,9 @@ def test_extract_markdown_swallows_conversion_errors(monkeypatch):
     assert markitdown_extractor.extract_markdown(b"payload", name="a.docx", mime="") == ""
 
 
-# Converter instance caching.
+# Converter instance caching
 
-
-# The shared converter instance is created lazily and reused.
+# Verify that the shared converter instance is created on first use and reused afterwards.
 def test_markitdown_instance_is_cached(monkeypatch):
     monkeypatch.setattr(markitdown_extractor, "_MARKITDOWN_INSTANCE", None)
     monkeypatch.setattr(markitdown_extractor, "_MARKITDOWN_IMPORT_ERROR", False)

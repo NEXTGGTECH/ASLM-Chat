@@ -15,11 +15,14 @@ from Apps.UI.views import _is_active_browser_portal_state
 pytestmark = [pytest.mark.component]
 
 
-# Verify wait-for-user portal timing and finish signaling.
+# Cover the wait-for-user browser portal: activity timing of a waiting session and the finish signal.
 class BrowserPortalApiTests(SimpleTestCase):
-    # Verify active browser portal state uses deadline when available.
+    # Verify that a waiting portal state with a deadline is judged by that deadline and not by
+    # updated_at: an expired deadline is inactive even with a fresh update time, and an unexpired
+    # deadline is active even with a stale update time.
     def test_active_browser_portal_state_uses_deadline_when_available(self):
         with patch("Apps.UI.views.time.time", return_value=1000.0):
+            # The deadline passed 20 seconds ago, beyond the grace period.
             self.assertFalse(
                 _is_active_browser_portal_state(
                     {
@@ -30,6 +33,8 @@ class BrowserPortalApiTests(SimpleTestCase):
                     }
                 )
             )
+
+            # The deadline is still ahead although updated_at is old.
             self.assertTrue(
                 _is_active_browser_portal_state(
                     {
@@ -41,9 +46,11 @@ class BrowserPortalApiTests(SimpleTestCase):
                 )
             )
 
-    # Verify finish event response reports done and queues event.
+    # Verify that posting a finish event for a waiting session answers with queued=True and status
+    # "done" and writes exactly one finish event file for that session into the portal events folder.
     def test_finish_event_response_reports_done_and_queues_event(self):
         with tempfile.TemporaryDirectory() as temp_dir:
+            # Arrange: a portal root holding the state file of a waiting session.
             root = Path(temp_dir) / "browser_portal"
             events_dir = root / "events"
             events_dir.mkdir(parents=True)
@@ -61,6 +68,7 @@ class BrowserPortalApiTests(SimpleTestCase):
                 encoding="utf-8",
             )
 
+            # Act: post the finish event while the session is within its deadline.
             with patch("Apps.UI.views._browser_portal_roots", return_value=[root]):
                 with patch("Apps.UI.views.time.time", return_value=1000.0):
                     response = Client().post(
@@ -69,6 +77,7 @@ class BrowserPortalApiTests(SimpleTestCase):
                         content_type="application/json",
                     )
 
+            # Assert: the response reports the event as queued and one finish event file exists.
             self.assertEqual(response.status_code, 200)
             payload = response.json()
             self.assertTrue(payload["queued"])

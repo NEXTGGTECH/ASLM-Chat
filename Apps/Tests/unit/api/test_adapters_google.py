@@ -15,6 +15,7 @@ pytestmark = [pytest.mark.unit]
 
 # Small structured error helper for Google GenAI adapter tests.
 class FakeGoogleError(Exception):
+    # Store the error code, status, message and a Google-style nested details payload.
     def __init__(
         self,
         code: int,
@@ -36,19 +37,20 @@ class FakeGoogleError(Exception):
         }
         super().__init__(f"{code} {status}. {self.details}")
 
+
 # Cover Google GenAI filtering, capability learning, and thinking fallback.
 class GoogleGenAiAdapterTests(SimpleTestCase):
-    # Set up the test fixture.
+    # Clear the runtime model caches so learned availability does not leak between tests.
     def setUp(self):
         super().setUp()
         google_genai_api._reset_runtime_caches()
 
-    # Tear down the test fixture.
+    # Clear the runtime model caches again after the test.
     def tearDown(self):
         google_genai_api._reset_runtime_caches()
         super().tearDown()
 
-    # Gemini receives supported audio/video as inline_data content parts.
+    # Verify that supported audio/video media is sent to Gemini as inline_data content parts.
     def test_google_contents_include_media_inline_data(self):
         _system_instruction, contents = google_genai_api._build_google_contents(
             [
@@ -70,7 +72,7 @@ class GoogleGenAiAdapterTests(SimpleTestCase):
         self.assertEqual(contents[0]["parts"][1]["inline_data"]["data"], b"fake")
         self.assertEqual(contents[0]["parts"][1]["inline_data"]["mime_type"], "video/mp4")
 
-    # Test Gemini function-call replay preserves thought signatures.
+    # Verify that replaying a Gemini function-call part keeps its thought signature.
     def test_function_call_history_preserves_thought_signature(self):
         raw_part = {
             "thought_signature": b"signature-bytes",
@@ -89,8 +91,10 @@ class GoogleGenAiAdapterTests(SimpleTestCase):
         self.assertEqual(replay_parts[0]["function_call"]["name"], "web_search")
         self.assertEqual(replay_parts[0]["function_call"]["args"], {"query": "latest ai news"})
 
-    # Test fallback function-call reconstruction is skipped for preserved Gemini parts.
+    # Verify that fallback function-call reconstruction is skipped when preserved Gemini parts already carry the
+    # call, so the content has a single signed function call instead of an unsigned duplicate.
     def test_preserved_function_call_parts_avoid_unsigned_duplicate(self):
+        # Arrange: a preserved Gemini part with a signature.
         preserved_parts = [
             {
                 "thought_signature": "c2lnbmF0dXJlLWJ5dGVz",
@@ -101,6 +105,7 @@ class GoogleGenAiAdapterTests(SimpleTestCase):
             }
         ]
 
+        # Act: convert an assistant message that has both the preserved parts and an OpenAI-style tool call.
         self.assertTrue(google_genai_api._history_parts_have_function_call(preserved_parts))
         content = google_genai_api._assistant_message_to_content(
             {
@@ -120,14 +125,17 @@ class GoogleGenAiAdapterTests(SimpleTestCase):
             }
         )
 
+        # Assert: exactly one function call remains and it keeps the decoded signature.
         function_call_parts = [
             part for part in content["parts"] if isinstance(part.get("function_call"), dict)
         ]
         self.assertEqual(len(function_call_parts), 1)
         self.assertEqual(function_call_parts[0]["thought_signature"], b"signature-bytes")
 
-    # Test legacy unsigned Gemini tool-call transcript is not replayed.
+    # Verify that a legacy unsigned Gemini tool-call transcript is not replayed: only the surrounding user
+    # messages remain and no function_call or function_response part is sent.
     def test_unsigned_legacy_function_call_history_is_skipped(self):
+        # Act: build contents from a history whose assistant function call has no thought signature.
         _system_instruction, contents = google_genai_api._build_google_contents(
             [
                 {"role": "user", "content": "Search this"},
@@ -157,6 +165,7 @@ class GoogleGenAiAdapterTests(SimpleTestCase):
             ]
         )
 
+        # Assert: the user turns survive and no function call or response part is left.
         self.assertEqual(contents[0], {"role": "user", "parts": [{"text": "Search this"}]})
         self.assertEqual(contents[-1], {"role": "user", "parts": [{"text": "Continue"}]})
         self.assertFalse(
@@ -174,10 +183,10 @@ class GoogleGenAiAdapterTests(SimpleTestCase):
             )
         )
 
-    # Test get models filters out non generate content models.
+    # Verify that get_models drops models that do not support generateContent and does not probe the remaining
+    # model with a generation request.
     @patch("API.google_genai._close_client")
     @patch("API.google_genai._get_client")
-    # Verify get models filters out non generate content models.
     def test_get_models_filters_out_non_generate_content_models(self, mock_get_client, _mock_close_client):
         client = Mock()
         payloads = [
@@ -192,12 +201,12 @@ class GoogleGenAiAdapterTests(SimpleTestCase):
         self.assertEqual([entry["model"] for entry in models], ["gemini-2.5-flash"])
         client.models.generate_content.assert_not_called()
 
-    # Test get models hides zero quota models for current key after runtime learning.
+    # Verify that a model whose 429 error reports a zero quota limit is learned as unavailable and hidden from
+    # get_models for the current API key.
     @patch("API.google_genai._close_client")
     @patch("API.google_genai._get_client")
     @patch("API.google_genai.settings.get_engine_url", return_value="https://generativelanguage.googleapis.com")
     @patch("API.google_genai.settings.get_google_genai_api_key", return_value="key-a")
-    # Verify get models hides zero quota models for current key after runtime learning.
     def test_get_models_hides_zero_quota_models_for_current_key_after_runtime_learning(
         self,
         _mock_api_key,
@@ -205,6 +214,7 @@ class GoogleGenAiAdapterTests(SimpleTestCase):
         mock_get_client,
         _mock_close_client,
     ):
+        # Arrange: a listed model whose generation fails with a zero-limit quota error.
         client = Mock()
         payloads = [{"name": "models/gemini-3.1-pro", "supported_actions": ["generateContent"]}]
         client.models.list.side_effect = lambda config=None: payloads
@@ -216,6 +226,7 @@ class GoogleGenAiAdapterTests(SimpleTestCase):
         )
         mock_get_client.return_value = client
 
+        # Act: the failed generation teaches the adapter that the model has no quota.
         with self.assertRaises(FakeGoogleError):
             list(
                 generate_google_genai(
@@ -225,15 +236,16 @@ class GoogleGenAiAdapterTests(SimpleTestCase):
                 )
             )
 
+        # Assert: the model disappears from the list and was probed only once.
         self.assertEqual(get_google_genai_models(), [])
         self.assertEqual(client.models.generate_content.call_count, 1)
 
-    # Test get models keeps temporarily rate limited models visible.
+    # Verify that a model hitting a temporary (non-zero) rate limit stays visible in get_models, also on the
+    # cached second call.
     @patch("API.google_genai._close_client")
     @patch("API.google_genai._get_client")
     @patch("API.google_genai.settings.get_engine_url", return_value="https://generativelanguage.googleapis.com")
     @patch("API.google_genai.settings.get_google_genai_api_key", return_value="key-a")
-    # Verify get models keeps temporarily rate limited models visible.
     def test_get_models_keeps_temporarily_rate_limited_models_visible(
         self,
         _mock_api_key,
@@ -241,6 +253,7 @@ class GoogleGenAiAdapterTests(SimpleTestCase):
         mock_get_client,
         _mock_close_client,
     ):
+        # Arrange: a listed model whose generation fails with a retryable quota error (limit above zero).
         client = Mock()
         payloads = [{"name": "models/gemini-2.5-pro", "supported_actions": ["generateContent"]}]
         client.models.list.side_effect = lambda config=None: payloads
@@ -252,6 +265,7 @@ class GoogleGenAiAdapterTests(SimpleTestCase):
         )
         mock_get_client.return_value = client
 
+        # Act: trigger the rate limit, then list models twice.
         with self.assertRaises(FakeGoogleError):
             list(
                 generate_google_genai(
@@ -264,11 +278,13 @@ class GoogleGenAiAdapterTests(SimpleTestCase):
         models = get_google_genai_models()
         cached_models = get_google_genai_models()
 
+        # Assert: the model stays listed and was probed only once.
         self.assertEqual([entry["model"] for entry in models], ["gemini-2.5-pro"])
         self.assertEqual([entry["model"] for entry in cached_models], ["gemini-2.5-pro"])
         self.assertEqual(client.models.generate_content.call_count, 1)
 
-    # Test published thinking metadata is used without an inference request.
+    # Verify that get_model_settings derives thinking support and limits from the published model metadata
+    # without sending an inference request.
     @patch("API.google_genai._close_client")
     @patch("API.google_genai._get_client")
     def test_get_model_settings_uses_published_thinking_metadata_without_generation(
@@ -276,6 +292,7 @@ class GoogleGenAiAdapterTests(SimpleTestCase):
         mock_get_client,
         _mock_close_client,
     ):
+        # Arrange: published metadata for a thinking-capable model.
         client = Mock()
         client.models.get.return_value = {
             "name": "models/gemini-2.5-flash",
@@ -286,8 +303,10 @@ class GoogleGenAiAdapterTests(SimpleTestCase):
         }
         mock_get_client.return_value = client
 
+        # Act: read the model settings.
         payload = get_google_genai_model_settings("gemini-2.5-flash")
 
+        # Assert: thinking toggle, media inputs, defaults and limits come from the metadata.
         self.assertTrue(payload["supports_thinking"])
         self.assertTrue(payload["supports_think_toggle"])
         self.assertFalse(payload["supports_think_level"])
@@ -301,19 +320,20 @@ class GoogleGenAiAdapterTests(SimpleTestCase):
         self.assertNotIn("thinking_level", payload["supported_parameters"])
         client.models.generate_content.assert_not_called()
 
-    # Test generate retries without thinking level when model rejects it.
+    # Verify that generate retries without the thinking level when the model rejects it, and remembers that the
+    # model does not support thinking levels.
     @patch("API.google_genai._close_client")
     @patch("API.google_genai._get_client")
-    # Verify generate retries without thinking level when model rejects it.
     def test_generate_retries_without_thinking_level_when_model_rejects_it(
         self,
         mock_get_client,
         _mock_close_client,
     ):
+        # Arrange: a client that rejects any request carrying a thinking_level.
         client = Mock()
         captured_configs: list[dict[str, object]] = []
 
-        # Simulate a retry flow that rejects thinking_level once.
+        # Record the request config and reject it while it still carries a thinking_level.
         def generate_content(*, model, contents, config):
             captured_configs.append(config)
             thinking_config = dict(config.get("thinking_config", {}) or {})
@@ -328,6 +348,7 @@ class GoogleGenAiAdapterTests(SimpleTestCase):
         client.models.generate_content.side_effect = generate_content
         mock_get_client.return_value = client
 
+        # Act: generate with a requested think level.
         chunks = list(
             generate_google_genai(
                 "gemini-2.5-flash",
@@ -337,6 +358,7 @@ class GoogleGenAiAdapterTests(SimpleTestCase):
             )
         )
 
+        # Assert: the second request drops the level, the answer arrives and the capability is cached as missing.
         self.assertTrue(any(chunk.get("message", {}).get("content") == "Final answer" for chunk in chunks))
         self.assertEqual(len(captured_configs), 2)
         self.assertEqual(
@@ -347,17 +369,18 @@ class GoogleGenAiAdapterTests(SimpleTestCase):
         cached_capabilities = google_genai_api._get_cached_model_capabilities("gemini-2.5-flash")
         self.assertFalse(cached_capabilities["supports_think_level"])
 
-    # Test learned availability is scoped to API key.
+    # Verify that availability learned from a zero-quota error applies only to the API key that triggered it:
+    # after switching keys the model is listed again.
     @patch("API.google_genai._close_client")
     @patch("API.google_genai._get_client")
     @patch("API.google_genai.settings.get_engine_url", return_value="https://generativelanguage.googleapis.com")
-    # Verify learned availability is scoped to api key.
     def test_learned_availability_is_scoped_to_api_key(
         self,
         _mock_engine_url,
         mock_get_client,
         _mock_close_client,
     ):
+        # Arrange: one client per key; key-a hits a zero quota, key-b generates normally.
         client_blocked = Mock()
         client_allowed = Mock()
         payloads = [{"name": "models/gemini-3.1-pro", "supported_actions": ["generateContent"]}]
@@ -374,16 +397,17 @@ class GoogleGenAiAdapterTests(SimpleTestCase):
         }
         key_state = {"value": "key-a"}
 
-        # Get API key.
+        # Return the API key currently selected by the test.
         def get_api_key():
             return key_state["value"]
 
-        # Get client for key.
+        # Return the blocked client for key-a and the allowed client for any other key.
         def get_client_for_key():
             return client_blocked if key_state["value"] == "key-a" else client_allowed
 
         mock_get_client.side_effect = get_client_for_key
 
+        # Act: learn the zero quota under key-a, then switch to key-b and list again.
         with patch("API.google_genai.settings.get_google_genai_api_key", side_effect=get_api_key):
             with self.assertRaises(FakeGoogleError):
                 list(
@@ -397,6 +421,7 @@ class GoogleGenAiAdapterTests(SimpleTestCase):
             key_state["value"] = "key-b"
             models = get_google_genai_models()
 
+        # Assert: key-b sees the model and neither client was probed again.
         self.assertEqual([entry["model"] for entry in models], ["gemini-3.1-pro"])
         self.assertEqual(client_blocked.models.generate_content.call_count, 1)
         client_allowed.models.generate_content.assert_not_called()

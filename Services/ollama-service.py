@@ -19,12 +19,20 @@ from Settings.proxy_policy import apply_loopback_proxy_bypass, urlopen_direct
 
 logger = logging.getLogger(__name__)
 
+# The Ollama child process this service started in the current process, the thread that forwards
+# its output to the console (guarded by the lock), and the file that stores the managed PID so
+# a later run or a separate supervisor can stop the same process.
 _ollama_process: subprocess.Popen | None = None
 _log_stream_thread: threading.Thread | None = None
 _log_stream_lock = threading.Lock()
 PID_FILE = Path(__file__).resolve().parent.parent / "Settings" / "ollama-service.pid"
+
+# Pattern that matches ANSI escape sequences in Ollama output, and the base length (in characters)
+# at which a console line is cut (raised in debug and trace console modes).
 ANSI_ESCAPE_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 MAX_CONSOLE_LINE_LENGTH = 220
+
+# Environment variables of Ollama's "server config" log line that are worth showing in the console.
 SERVER_CONFIG_ENV_KEYS = (
     "OLLAMA_HOST",
     "OLLAMA_MODELS",
@@ -38,7 +46,8 @@ SERVER_CONFIG_ENV_KEYS = (
 
 # Runtime state model
 
-# Flags derived from settings that describe whether Ollama should run.
+# Flags derived from settings that describe whether Ollama should run: the requested and the
+# active LLM engine, whether the ollama-service setting is on, and the resulting run decision.
 @dataclass(frozen=True)
 class OllamaDesiredState:
     requested_engine: str
@@ -76,6 +85,7 @@ def _clear_pid() -> None:
     try:
         PID_FILE.unlink()
     except OSError:
+        # The file is already gone (or locked); a stale PID is harmless because _is_pid_running re-checks it.
         pass
 
 
@@ -265,7 +275,7 @@ def _format_backend_line(message: str) -> str:
 
 # Convert Ollama structured logs into concise console lines.
 def _format_structured_ollama_line(message: str) -> str | None:
-    # Parse key=value pairs from Ollama's structured logger output.
+    # Parse key=value pairs from Ollama's structured logger output; plain text lines are not handled here.
     fields = _parse_structured_log_fields(message)
     if not fields:
         return None
@@ -305,6 +315,7 @@ def _format_structured_ollama_line(message: str) -> str | None:
                 details.append(f"{env_key.removeprefix('OLLAMA_').lower()}={env_value}")
         summary = "Server config"
     elif raw_message == "starting runner":
+        # Show the runner port and model file name taken from its command line.
         command = fields.get("cmd", "")
         port_match = re.search(r"--port\s+(\d+)", command)
         model_match = re.search(r"--model\s+([^\s]+)", command)
@@ -360,6 +371,7 @@ def _format_structured_ollama_line(message: str) -> str | None:
     elif raw_message == "Load request" or (
         source == "runner.go:1284" and fields.get("request")
     ):
+        # Trace lines without a message are recognized by their source file and line.
         details.extend(_summarize_load_request(fields.get("request", "")))
         summary = "Load request"
     elif raw_message == "Model metadata" or source == "ggml.go:136":
@@ -407,6 +419,7 @@ def _format_structured_ollama_line(message: str) -> str | None:
     elif raw_message == "Listening on 127.0.0.1:30002 (version 0.18.3)":
         summary = raw_message
     else:
+        # Unknown message: keep its text and show the common status and memory fields if present.
         for key, label in (
             ("status", "status"),
             ("count", "count"),
@@ -481,11 +494,13 @@ def _stream_process_output(process: subprocess.Popen) -> None:
             if rendered_line:
                 print(rendered_line, flush=True)
     except (OSError, ValueError):
+        # The pipe was closed or the process exited mid-read; end of output is the normal way out.
         pass
     finally:
         try:
             output.close()
         except OSError:
+            # The pipe is already closed; nothing is left to release.
             pass
         _print_status(f"Managed Ollama output closed (PID: {process.pid}).")
 
@@ -494,6 +509,7 @@ def _stream_process_output(process: subprocess.Popen) -> None:
 def _ensure_log_streaming(process: subprocess.Popen) -> None:
     global _log_stream_thread
 
+    # Only one forwarding thread runs at a time; keep the existing one while it is alive.
     with _log_stream_lock:
         if _log_stream_thread is not None and _log_stream_thread.is_alive():
             return
@@ -518,6 +534,7 @@ def _wait_until_ready(
     host = settings.get_engine_url("ollama-service")
     version_url = f"{host.rstrip('/')}/api/version"
 
+    # Poll /api/version until it answers, giving up early when the launched process has exited.
     while time.time() < deadline:
         if process is not None and process.poll() is not None:
             return False
@@ -531,6 +548,7 @@ def _wait_until_ready(
                 if response.status < 500:
                     return True
         except (OSError, URLError):
+            # The endpoint is not accepting connections yet; wait briefly and try again.
             time.sleep(min(0.25, max(deadline - time.time(), 0.0)))
 
     return False
@@ -718,6 +736,7 @@ def run_ollama_runtime(log: bool = False) -> int:
         _print_status(f"Ollama runtime command failed: executable not found at {ollama_path}")
         return 1
 
+    # Print the launch configuration, and skip the launch when another Ollama already answers.
     env, ollama_port = _build_service_environment()
 
     if log:
@@ -732,6 +751,7 @@ def run_ollama_runtime(log: bool = False) -> int:
         _print_status("Ollama runtime is already reachable; dedicated launch is not required.")
         return 0
 
+    # Spawn the runtime and record its PID; on any failure kill a half-started process and report it.
     process: subprocess.Popen | None = None
     try:
         process = _spawn_ollama_process(str(ollama_path), env)
@@ -746,6 +766,8 @@ def run_ollama_runtime(log: bool = False) -> int:
         _print_status(f"Failed to launch dedicated Ollama runtime: {exc}")
         return 1
 
+    # Report readiness, then block until the runtime exits so ASLM supervises its lifetime. Ctrl+C
+    # stops the whole process tree, and the finally block releases the stdin pipe and the PID file.
     try:
         if _wait_until_ready(timeout_seconds=15.0, process=process):
             _print_status(f"Dedicated Ollama runtime is ready (PID: {process.pid}).")
@@ -772,6 +794,7 @@ def run_ollama_runtime(log: bool = False) -> int:
             try:
                 process.stdin.close()
             except OSError:
+                # The pipe is already closed because the process is gone.
                 pass
         _ollama_process = None
         _clear_pid()
@@ -804,7 +827,8 @@ def stop_ollama() -> None:
 
 # Explain where managed Ollama output is available without creating log files.
 def run_ollama_console(log: bool = False) -> None:
-    del log  # Reserved for future verbosity controls.
+    # The log argument is reserved for future verbosity controls.
+    del log
     _print_status(
         "Persistent Ollama logs are disabled. Live output is streamed by the "
         "ASLM process that launches the managed runtime."

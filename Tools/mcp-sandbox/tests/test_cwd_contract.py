@@ -9,11 +9,14 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+# Package root of mcp-sandbox and its sandbox source directory; the latter is put on sys.path at import
+# time so the sandbox package can be imported.
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+# Use the package root as host workspace at import time unless the environment already sets one.
 os.environ.setdefault("SANDBOX_HOST_WORKSPACE", str(ROOT))
 
 from sandbox import workspace  # noqa: E402
@@ -34,7 +37,9 @@ def _mock_exec(stdout: str = "", stderr: str = "", exit_code: int = 0, cwd: str 
     }
 
 
+# Cover how the cwd argument of the bash tool is resolved, reported and isolated between calls.
 class CwdContractTests(unittest.TestCase):
+    # Create the task root if needed and empty it.
     def setUp(self) -> None:
         self.task_root = workspace.task_root()
         self.task_root.mkdir(parents=True, exist_ok=True)
@@ -45,10 +50,13 @@ class CwdContractTests(unittest.TestCase):
                 else:
                     child.unlink()
             except PermissionError:
+                # Skip entries still locked by another process; clearing the task root is best effort.
                 pass
 
-    # pwd reports correct container path.
+    # Working directory reported by pwd
 
+    # Verify that pwd without a cwd is passed to exec_bash and its output, the container path of the task
+    # root, is returned.
     def test_pwd_at_root_reports_task_root(self) -> None:
         with patch("sandbox.api.exec_bash", return_value=_mock_exec(stdout=f"/workspace/{DEFAULT_TASK_DIR}\n")) as mock:
             result = handle_tool("bash", {"command": "pwd"})
@@ -56,6 +64,8 @@ class CwdContractTests(unittest.TestCase):
         self.assertEqual(result["result"]["stdout"], f"/workspace/{DEFAULT_TASK_DIR}\n")
         mock.assert_called_once()
 
+    # Verify that pwd with cwd="repo" is passed to exec_bash and its output, the container path of the
+    # subdirectory, is returned.
     def test_pwd_with_subdir_cwd_reports_subdir(self) -> None:
         handle_tool("write", {"path": "repo/file.txt", "content": "x"})
         with patch("sandbox.api.exec_bash", return_value=_mock_exec(stdout=f"/workspace/{DEFAULT_TASK_DIR}/repo\n", cwd="repo")) as mock:
@@ -64,8 +74,9 @@ class CwdContractTests(unittest.TestCase):
         self.assertEqual(result["result"]["stdout"], f"/workspace/{DEFAULT_TASK_DIR}/repo\n")
         mock.assert_called_once()
 
-    # cwd argument is respected.
+    # Explicit cwd argument
 
+    # Verify that a routed cat resolves its file relative to the explicit cwd and reports that cwd.
     def test_routed_command_respects_explicit_cwd(self) -> None:
         handle_tool("write", {"path": "src/app.py", "content": "print('hi')\n"})
         result = handle_tool("bash", {"command": "cat app.py", "cwd": "src"})
@@ -73,13 +84,14 @@ class CwdContractTests(unittest.TestCase):
         self.assertIn("hi", result["result"]["stdout"])
         self.assertEqual(result["result"]["cwd"], "src")
 
+    # Verify that the cwd in the result equals the cwd passed in the request.
     def test_cwd_returned_matches_input_cwd(self) -> None:
         handle_tool("write", {"path": "lib/util.py", "content": "x = 1\n"})
         result = handle_tool("bash", {"command": "cat util.py", "cwd": "lib"})
         self.assertTrue(result["ok"])
         self.assertEqual(result["result"]["cwd"], "lib")
 
-    # Passing cwd=None should be treated as '.'.
+    # Verify that cwd=None is treated as "." when calling exec_bash.
     def test_none_cwd_defaults_to_root(self) -> None:
         with patch(
             "sandbox.api.exec_bash",
@@ -89,9 +101,10 @@ class CwdContractTests(unittest.TestCase):
         mock.assert_called_once()
         self.assertEqual(mock.call_args.kwargs["cwd"], ".")
 
-    # Container-space paths fall through to real bash.
+    # Container-space paths
 
-    # `cat /etc/os-release` must NOT be handled by the workspace controller.
+    # Verify that `cat /etc/os-release` (a container path outside the task space) falls through to real
+    # bash instead of being handled by the workspace controller.
     def test_cat_container_absolute_path_falls_through(self) -> None:
         with patch(
             "sandbox.api.exec_bash",
@@ -101,13 +114,14 @@ class CwdContractTests(unittest.TestCase):
 
         # Must have fallen through — exec_bash was called
         mock.assert_called_once()
+
         # Must not be routed via workspace controller
         self.assertFalse(
             result.get("result", {}).get("routed", False),
             "cat /etc/os-release should not be workspace-routed",
         )
 
-    # `ls /usr/bin` must fall through to real bash.
+    # Verify that `ls /usr/bin` falls through to real bash and is not workspace-routed.
     def test_ls_container_absolute_path_falls_through(self) -> None:
         with patch(
             "sandbox.api.exec_bash",
@@ -121,9 +135,10 @@ class CwdContractTests(unittest.TestCase):
             "ls /usr/bin should not be workspace-routed",
         )
 
-    # cd inside command does not persist across calls.
+    # Directory changes do not persist
 
-    # `cd / && ls` goes to real bash; next call still uses task_cwd.
+    # Verify that `cd / && ls` goes to real bash and does not affect the next call, which still resolves
+    # files from the task root.
     def test_cd_slash_does_not_affect_next_call_cwd(self) -> None:
         handle_tool("write", {"path": "marker.txt", "content": "here"})
 
@@ -136,7 +151,8 @@ class CwdContractTests(unittest.TestCase):
         self.assertIn("here", result["result"]["stdout"])
         self.assertEqual(result["result"]["cwd"], ".")
 
-    # Each call is independent; cwd comes from the argument, not session.
+    # Verify that consecutive calls are independent: each one takes its cwd from its own argument, not
+    # from the previous call.
     def test_consecutive_routed_calls_use_explicit_cwd(self) -> None:
         handle_tool("write", {"path": "a/b/file.txt", "content": "deep"})
 
@@ -151,9 +167,9 @@ class CwdContractTests(unittest.TestCase):
         self.assertIn("deep", r2["result"]["stdout"])
         self.assertEqual(r2["result"]["cwd"], "a/b")
 
-    # Workspace-relative subdir cd updates cwd correctly.
+    # Nested subdirectories
 
-    # Passing cwd='src/lib' resolves path inside task_root.
+    # Verify that cwd="src/lib" resolves inside the task root and is reported unchanged.
     def test_cwd_subdir_resolves_correctly(self) -> None:
         handle_tool("write", {"path": "src/lib/mod.py", "content": "MOD\n"})
         result = handle_tool("bash", {"command": "cat mod.py", "cwd": "src/lib"})
@@ -161,11 +177,13 @@ class CwdContractTests(unittest.TestCase):
         self.assertIn("MOD", result["result"]["stdout"])
         self.assertEqual(result["result"]["cwd"], "src/lib")
 
-    # Traversal via cwd is blocked.
+    # Traversal via cwd
 
-    # cwd='../../etc' must not allow reading outside task_root.
+    # Verify that cwd="../../etc" cannot be used to read outside the task root: the call either fails or
+    # its output does not contain /etc/passwd content.
     def test_cwd_traversal_is_blocked(self) -> None:
         result = handle_tool("bash", {"command": "ls .", "cwd": "../../etc"})
+
         # Must either fail or fall through to container where it also fails
         if result.get("ok"):
             # If somehow ok, must not have escaped
@@ -173,5 +191,6 @@ class CwdContractTests(unittest.TestCase):
             self.assertNotIn("passwd", stdout, "cwd traversal escaped to /etc!")
 
 
+# Allow running this file directly with the unittest runner.
 if __name__ == "__main__":
     unittest.main()

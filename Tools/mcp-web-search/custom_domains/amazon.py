@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+# Make the web search root importable when this file runs as a standalone script.
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -22,6 +23,7 @@ async def fetch_amazon_snapshot(url: str, timeout: float = 20.0) -> dict[str, An
     started = time.perf_counter()
     import httpx
 
+    # Download the page with browser-like headers; redirects are not followed.
     async with httpx.AsyncClient(
         headers=CHROME_BASIC_HEADERS,
         timeout=timeout,
@@ -30,9 +32,12 @@ async def fetch_amazon_snapshot(url: str, timeout: float = 20.0) -> dict[str, An
     ) as client:
         response = await client.get(url)
 
+    # Extract the title and the markdown/text content from the HTML.
     html = response.text or ""
     title = extract_title(html)
     parsed = extract_with_preferred_pipeline(url, html, prefer_trafilatura=False)
+
+    # Assemble the snapshot with fetch diagnostics next to the extracted content.
     return {
         "source": "amazon",
         "url": url,
@@ -72,6 +77,7 @@ from urllib.parse import urlparse
 
 from custom_domains.base import FetchContext, PageResult
 
+# Amazon storefront hosts (without the www./m. prefix) that this handler serves.
 _AMAZON_HOSTS = frozenset({
     "amazon.com", "amazon.co.uk", "amazon.de",
     "amazon.fr", "amazon.it", "amazon.es", "amazon.co.jp",
@@ -83,7 +89,7 @@ class AmazonHandler:
     name = "amazon"
     fallback_to_generic = True
 
-    # True for known Amazon storefront hosts.
+    # Return True for known Amazon storefront hosts.
     def matches(self, url: str) -> bool:
         host = urlparse(url).netloc.lower().removeprefix("www.").removeprefix("m.")
         return host in _AMAZON_HOSTS
@@ -95,6 +101,8 @@ class AmazonHandler:
             snapshot = await fetch_amazon_snapshot(url, timeout=ctx.timeout)
         except Exception:
             return PageResult(ok=False, method="amazon_custom", error="amazon snapshot failed")
+
+        # The page is usable only with content that is neither blocked nor the banner page.
         markdown = str(snapshot.get("markdown") or "").strip()
         blocked = bool(snapshot.get("blocked_like"))
         useless_banner = "continue shopping" in markdown.lower()
@@ -107,4 +115,5 @@ class AmazonHandler:
         )
 
 
+# Handler instance registered in custom_domains/__init__.py.
 HANDLER = AmazonHandler()

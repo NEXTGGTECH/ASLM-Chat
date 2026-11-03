@@ -13,26 +13,32 @@ from custom_domains.base import FetchContext, PageResult
 
 logger = logging.getLogger("custom_domains.youtube")
 
+# Hosts (without the www./m. prefix) of YouTube watch and short links.
 _YT_HOSTS = ("youtube.com", "youtu.be")
 
 
-# Normalized host from URL (no www/m prefix).
+# URL helpers
+
+# Return the lowercase host of the URL without the www./m. prefix.
 def _host(url: str) -> str:
     return urlparse(url).netloc.lower().removeprefix("www.").removeprefix("m.")
 
 
-# True for YouTube watch/short URLs.
+# Return True for YouTube watch/short URLs.
 def is_youtube(url: str) -> bool:
     return _host(url) in _YT_HOSTS
 
 
-# Parse the 11-char YouTube video id from a URL.
+# Parse the 11-char YouTube video id from a URL (watch, youtu.be, /v/, /embed/ and /shorts/ forms).
 def youtube_video_id(url: str) -> str | None:
     m = re.search(r"(?:v=|/v/|youtu\.be/|/embed/|/shorts/)([A-Za-z0-9_-]{11})", url)
     return m.group(1) if m else None
 
 
-# Fetch a YouTube transcript: youtube-transcript-api first, then yt-dlp fallback.
+# Transcript fetching
+
+# Fetch a YouTube transcript: youtube-transcript-api first, then yt-dlp fallback. Return the
+# transcript text, or an "Error: ..." string when the id cannot be parsed or no transcript exists.
 async def fetch_youtube_transcript(url: str) -> str:
     video_id = youtube_video_id(url)
     if not video_id:
@@ -46,14 +52,21 @@ async def fetch_youtube_transcript(url: str) -> str:
         try:
             from youtube_transcript_api import YouTubeTranscriptApi
         except ImportError:
+            # The library is optional; continue with the yt-dlp fallback.
             return None
 
+        # Transcript languages in order of preference.
         PREFERRED = ["ru", "en", "uk", "de", "fr"]
 
+        # List the available transcripts, with a 15 second timeout on every HTTP request where the
+        # library accepts a custom http_client. Newer library versions expose list() on the
+        # instance, older ones a static list_transcripts().
         try:
             import requests as _req
 
+            # requests session that applies a default timeout to every request.
             class _TimedSession(_req.Session):
+                # Send the request with a default 15 second timeout unless the caller set one.
                 def request(self, method, url, **kwargs):  # type: ignore[override]
                     kwargs.setdefault("timeout", 15)
                     return super().request(method, url, **kwargs)
@@ -73,6 +86,9 @@ async def fetch_youtube_transcript(url: str) -> str:
             logger.debug("youtube_transcript_api list() failed for %s: %s", url, e)
             return None
 
+        # Choose a transcript: a manually created one in the first available preferred language,
+        # else an auto-generated one, else any transcript (translated to English when its language
+        # is not a preferred one).
         fetched = None
         for lang in PREFERRED:
             try:
@@ -104,6 +120,7 @@ async def fetch_youtube_transcript(url: str) -> str:
                 logger.debug("No transcripts available via youtube_transcript_api for %s", url)
                 return None
 
+        # Download the chosen transcript and join its snippets into one text.
         try:
             data = fetched.fetch()
             parts = [
@@ -118,6 +135,7 @@ async def fetch_youtube_transcript(url: str) -> str:
             logger.debug("youtube_transcript_api fetch() failed for %s", url, exc_info=True)
         return None
 
+    # Run attempt 1 on the I/O pool; "ERR:" marks a known terminal error (e.g. unavailable video).
     result = await loop.run_in_executor(_io_pool, _yta_try)
     if result and result.startswith("ERR:"):
         return f"Error: {result[4:]}"
@@ -125,6 +143,7 @@ async def fetch_youtube_transcript(url: str) -> str:
         return result
 
     # Attempt 2: yt-dlp (heavier — downloads subtitle files).
+    # Returns the transcript text, or None when no subtitles could be obtained.
     def _yt_dlp_try() -> str | None:
         try:
             import glob as _glob
@@ -133,12 +152,21 @@ async def fetch_youtube_transcript(url: str) -> str:
 
             import yt_dlp
 
+            # yt-dlp logger that discards every message.
             class _Silent:
+                # Discard a debug message.
                 def debug(self, msg: str) -> None: pass
+
+                # Discard an info message.
                 def info(self, msg: str) -> None: pass
+
+                # Discard a warning message.
                 def warning(self, msg: str) -> None: pass
+
+                # Discard an error message.
                 def error(self, msg: str) -> None: pass
 
+            # Download only the subtitle files (manual and automatic, VTT) into a temp directory.
             with tempfile.TemporaryDirectory() as tmpdir:
                 opts = {
                     "skip_download": True,
@@ -162,6 +190,8 @@ async def fetch_youtube_transcript(url: str) -> str:
                 vtt_files = _glob.glob(os.path.join(tmpdir, "*.vtt"))
                 if not vtt_files:
                     return None
+
+                # Pick the subtitle file of the first preferred language, else the first file found.
                 PREFERRED_LANGS = ["ru", "en", "uk", "de", "fr"]
                 chosen = vtt_files[0]
                 for lang in PREFERRED_LANGS:
@@ -169,6 +199,8 @@ async def fetch_youtube_transcript(url: str) -> str:
                     if candidates:
                         chosen = candidates[0]
                         break
+
+                # Strip the VTT headers, cue timings, cue numbers and markup, dropping repeated lines.
                 raw = open(chosen, encoding="utf-8", errors="replace").read()
                 lines, seen = [], set()
                 for line in raw.splitlines():
@@ -185,17 +217,22 @@ async def fetch_youtube_transcript(url: str) -> str:
             logger.debug("yt-dlp transcript fallback crashed for %s", url, exc_info=True)
             return None
 
+    # Run attempt 2 on the I/O pool and report an error when it found nothing either.
     result = await loop.run_in_executor(_io_pool, _yt_dlp_try)
     return result or f"Error: No transcript available for: {url}"
 
+
+# Handler
 
 # Unified handler: return a YouTube video transcript as markdown text.
 class YouTubeHandler:
     name = "youtube"
     fallback_to_generic = False
-    scope = "read_page"  # requires a browser; not for web_search inline parsing
 
-    # True for YouTube watch/short URLs.
+    # read_page only; web_search keeps YouTube links as snippets instead of fetching transcripts inline.
+    scope = "read_page"
+
+    # Return True for YouTube watch/short URLs.
     def matches(self, url: str) -> bool:
         return is_youtube(url)
 
@@ -211,4 +248,5 @@ class YouTubeHandler:
         )
 
 
+# Handler instance registered in custom_domains/__init__.py.
 HANDLER = YouTubeHandler()

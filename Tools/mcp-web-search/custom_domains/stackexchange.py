@@ -17,7 +17,7 @@ class StackExchangeHandler:
     name = "stackexchange"
     fallback_to_generic = False
 
-    # True for Stack Exchange question URLs.
+    # Return True for Stack Exchange question URLs.
     def matches(self, url: str) -> bool:
         return is_stackexchange_question_url(url)
 
@@ -33,4 +33,5 @@ class StackExchangeHandler:
         )
 
 
+# Handler instance registered in custom_domains/__init__.py.
 HANDLER = StackExchangeHandler()

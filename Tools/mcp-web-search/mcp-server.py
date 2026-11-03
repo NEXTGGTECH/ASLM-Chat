@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+# Make the server root importable (core, custom_domains) when the worker loads this file by path.
 SERVER_ROOT = Path(__file__).resolve().parent
 if str(SERVER_ROOT) not in sys.path:
     sys.path.insert(0, str(SERVER_ROOT))
@@ -50,6 +51,7 @@ from urllib.parse import urlparse
 setup_logging()
 logger = logging.getLogger("mcp.server")
 
+# Set after the first cache eviction so it runs only once per process.
 _evicted = False
 
 
@@ -68,12 +70,17 @@ def _evict_caches_once() -> None:
     except Exception as exc:  # noqa: BLE001 — housekeeping must never block a search
         logger.debug("cache eviction skipped: %s", exc)
 
+
+# Tool definitions
+
+# Server descriptor advertised to the ASLM tool worker.
 MCP_SERVER = {
     "id": "web_search",
     "name": "Web Search",
     "description": MCP_SERVER_DESCRIPTION,
 }
 
+# Tool descriptors (id, name, description and JSON schema) for web_search, image_search and read_page.
 TOOLS = [
     {
         "id": "web_search",
@@ -144,7 +151,10 @@ def supports(engine: str | None = None, model_name: str | None = None) -> bool:
     return engine in (None, "ollama-service", "lms", "openai", "google-genai")
 
 
-# Attach rich cards (wikipedia/discussions) to a finished web_search result.
+# Web search
+
+# Attach rich cards (wikipedia/discussions) to a finished web_search result. Return the result
+# unchanged when the feature is disabled or building the cards fails.
 async def _attach_rich_cards(result: dict[str, Any], queries: list[str]) -> dict[str, Any]:
     try:
         from core.config import load_search_config
@@ -153,6 +163,7 @@ async def _attach_rich_cards(result: dict[str, Any], queries: list[str]) -> dict
             return result
         from core.cards import RichCardService, insert_cards_context
 
+        # Detect the language from the first non-empty query so the cards match it.
         sources = result.get("sources") or []
         language = ""
         for query in queries:
@@ -160,6 +171,8 @@ async def _attach_rich_cards(result: dict[str, Any], queries: list[str]) -> dict
                 from core.search.query_locales import analyze_query
                 language = analyze_query(query).language
                 break
+
+        # Build the cards from the result sources and render them as text.
         service = RichCardService()
         started = time.perf_counter()
         cards = await service.build(sources, config, language=language or "en")
@@ -171,6 +184,8 @@ async def _attach_rich_cards(result: dict[str, Any], queries: list[str]) -> dict
                 str(result.get("model_context") or ""), cards_text
             )
             result["answer_cards"] = cards
+
+        # Log how many cards were produced, of which kinds, and how long it took.
         logger.info(
             "mcp.web_search.answer_cards cards=%d kinds=%s took=%.0fms",
             len(cards), ",".join(str(card.get("kind")) for card in cards) or "-",
@@ -181,17 +196,15 @@ async def _attach_rich_cards(result: dict[str, Any], queries: list[str]) -> dict
     return result
 
 
-# Rewrite raw model-supplied query text before the plan compiler runs.
+# Rewrite raw model-supplied query text before the plan compiler runs: return args with the query
+# text replaced by the rewriter output when it fires. The model composes its own query strings,
+# so the subagent must see them BEFORE prepare_search_arguments compiles the advanced schema;
+# rewritten text then flows through the same operator extraction, tool_ui build, and execution
+# pipeline in every schema mode. Fail-open: any non-string shape or disabled config returns the
+# args untouched.
 async def _rewrite_search_args(args: dict[str, Any]) -> dict[str, Any]:
-    """Return args with query text replaced by rewriter output when it fires.
-
-    The model composes its own query strings, so the subagent must see them
-    BEFORE prepare_search_arguments compiles the advanced schema — rewritten
-    text then flows through the same operator extraction, tool_ui build, and
-    execution pipeline in every schema mode. Fail-open: any non-string shape
-    or disabled config returns the args untouched.
-    """
     try:
+        # Accept a string or a non-empty list of strings; anything else is passed through.
         if not isinstance(args, dict) or "query" not in args:
             return args
         raw = args["query"]
@@ -203,6 +216,9 @@ async def _rewrite_search_args(args: dict[str, Any]) -> dict[str, Any]:
             return args
         if not any(str(item).strip() for item in queries):
             return args
+
+        # A single query may be expanded into several (capped per vertical, one at high effort);
+        # several queries are rewritten in place. Without a change the original args are kept.
         if len(queries) == 1:
             fan_out = await expanded_queries(queries[0])
             if fan_out:
@@ -216,6 +232,8 @@ async def _rewrite_search_args(args: dict[str, Any]) -> dict[str, Any]:
             queries, changed = await rewrite_queries(queries)
             if not changed:
                 return args
+
+        # Accept the rewrite only when the result still compiles to a valid search plan.
         rewritten_args = dict(args)
         rewritten_args["query"] = queries[0] if len(queries) == 1 else queries
         if not prepare_search_arguments(rewritten_args).get("ok"):
@@ -238,10 +256,14 @@ async def _call_web_search(
     # Instant mode is the latency-critical path and keeps its own contract.
     if not instant_mode:
         args = await _rewrite_search_args(args)
+
+    # Validate and canonicalize the arguments; invalid input returns the prepared error result.
     prepared = prepare_search_arguments(args, instant_mode=instant_mode)
     if not prepared.get("ok"):
         return dict(prepared.get("error_result") or {})
 
+    # Read the queries and flags: from the compiled plan in the advanced/instant schema modes,
+    # coerced from the raw arguments otherwise.
     canonical_args = dict(prepared.get("arguments") or {})
     search_request = dict(prepared.get("search_request") or {})
     if search_request.get("schema_mode") in {"advanced", "instant"}:
@@ -265,6 +287,7 @@ async def _call_web_search(
         academic = coerce_search_academic(canonical_args)
         onion = coerce_search_onion(canonical_args)
 
+    # Record the request in the model IO log and the server log.
     write_search_io_event(
         {
             "layer": "mcp_adapter",
@@ -285,6 +308,7 @@ async def _call_web_search(
         effort, shopping, academic, onion, len(queries), query_preview,
     )
 
+    # Run the pipeline matching the request: the compiled plan, a batch of queries or a single query.
     started = time.perf_counter()
     try:
         if search_request.get("schema_mode") in {"advanced", "instant"}:
@@ -307,6 +331,9 @@ async def _call_web_search(
     except Exception:
         logger.exception("mcp.web_search.failed query_preview=%r", query_preview)
         raise
+
+    # Merge the warnings from argument preparation with the caller's preflight warnings (without
+    # duplicates) and put them before the model context.
     warnings = [
         dict(warning)
         for warning in prepared.get("warnings", [])
@@ -329,14 +356,19 @@ async def _call_web_search(
         )
         result["warnings"] = warnings
         result.setdefault("ui", {})["warnings"] = warnings
+
+    # Log completion with the elapsed time.
     elapsed = time.perf_counter() - started
     logger.info(
         "mcp.web_search.done effort=%s queries=%d sources=%d elapsed=%.3fs",
         effort, len(queries), len(result.get("sources", [])), elapsed,
     )
+
     # Rich cards (config-gated, default OFF): wikipedia summary card + forum
     # discussion block for the top results. Fail-open on any error.
     result = await _attach_rich_cards(result, queries)
+
+    # Record the final result in the model IO log.
     write_search_io_event(
         {
             "layer": "mcp_adapter",
@@ -352,6 +384,8 @@ async def _call_web_search(
     return result
 
 
+# Read page helpers
+
 # Parse a JSON-encoded list passed as a string tool argument (some callers stringify).
 def _maybe_parse_list(val: Any) -> Any:
     if isinstance(val, str) and val.strip().startswith("["):
@@ -365,7 +399,7 @@ def _maybe_parse_list(val: Any) -> Any:
     return val
 
 
-# Bare registrable host for a URL (no scheme/userinfo/port/www.).
+# Return the bare host of a URL (no scheme/userinfo/port/www.).
 def _source_domain(url: str) -> str:
     host = urlparse(url or "").netloc.lower()
     if "@" in host:
@@ -375,7 +409,7 @@ def _source_domain(url: str) -> str:
     return host.removeprefix("www.")
 
 
-# Short human label from a domain (example.com -> "Example").
+# Return a short human label for a domain (example.com -> "Example").
 def _display_domain(domain: str) -> str:
     parts = [p for p in (domain or "").split(".") if p]
     if len(parts) >= 2:
@@ -387,12 +421,12 @@ def _display_domain(domain: str) -> str:
     return label.replace("-", " ").title()
 
 
-# DuckDuckGo favicon URL for a source chip.
+# Return the DuckDuckGo favicon URL for a source chip, or an empty string without a domain.
 def _favicon_url(domain: str) -> str:
     return f"https://icons.duckduckgo.com/ip3/{domain}.ico" if domain else ""
 
 
-# One read_page source record (UI chip metadata + ok flag from the result text).
+# Build one read_page source record (UI chip metadata + ok flag from the result text).
 def _read_page_source(url: str, rank: int, result_text: str = "") -> dict[str, Any]:
     domain = _source_domain(url)
     ok = not str(result_text or "").lstrip().lower().startswith("error:")
@@ -408,6 +442,7 @@ def _read_page_source(url: str, rank: int, result_text: str = "") -> dict[str, A
 
 # Assemble the structured read_page payload for one or many URLs (legacy bridge shape).
 def _read_page_payload(urls: list[str], results: list[str]) -> dict[str, Any]:
+    # One source record per URL, with the overall status: done (all ok), partial (some) or error (none).
     sources = [
         _read_page_source(url, i, results[i - 1] if i - 1 < len(results) else "")
         for i, url in enumerate(urls, 1)
@@ -427,19 +462,22 @@ def _read_page_payload(urls: list[str], results: list[str]) -> dict[str, Any]:
     }
 
 
-# Fetch one or many URLs as markdown and wrap them in the structured payload.
-# Run the image-search vertical and shape a gallery-friendly payload.
+# Image search
+
 # In-memory TTL cache for image results: reopening a chat re-resolves every
 # [[images:]] token, and re-running engines for the same query is pure latency.
+# Maps a query/limit key to (expiry on the monotonic clock, payload).
 _IMAGE_CACHE_TTL_SECONDS = 1800.0
 _IMAGE_CACHE_MAX_ENTRIES = 100
 _image_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 
 
+# Return the cache key for a query and result limit (the query is case-insensitive).
 def _image_cache_key(query: str, limit: int) -> str:
     return f"{query.casefold()}|{limit}"
 
 
+# Return a copy of the cached payload for the query, or None when it is missing or expired.
 def _cached_image_result(query: str, limit: int) -> dict[str, Any] | None:
     entry = _image_cache.get(_image_cache_key(query, limit))
     if entry is None or entry[0] <= time.monotonic():
@@ -447,6 +485,7 @@ def _cached_image_result(query: str, limit: int) -> dict[str, Any] | None:
     return copy.deepcopy(entry[1])
 
 
+# Cache a copy of the payload. When the cache is full, drop expired entries first and then the oldest ones.
 def _store_image_result(query: str, limit: int, payload: dict[str, Any]) -> None:
     if len(_image_cache) >= _IMAGE_CACHE_MAX_ENTRIES:
         now = time.monotonic()
@@ -460,9 +499,9 @@ def _store_image_result(query: str, limit: int, payload: dict[str, Any]) -> None
     )
 
 
+# Build compact per-engine diagnostics (status, HTTP status, timing, transport, result count) for the
+# image-search logs.
 def _image_engine_summary(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    """Compact per-engine diagnostics for the image-search logs."""
-
     summary: list[dict[str, Any]] = []
     for name, engine in (payload.get("engines") or {}).items():
         if not isinstance(engine, dict):
@@ -478,9 +517,12 @@ def _image_engine_summary(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return summary
 
 
+# Run the image-search vertical and shape a gallery-friendly payload: UI gallery metadata plus a
+# compact model-facing listing. Failures are returned as an error payload instead of raised.
 async def _call_image_search(args: dict[str, Any]) -> dict[str, Any]:
     from core.search.image_search import ImageSearchService
 
+    # Normalize the query; an empty one is rejected without running any engine.
     query = " ".join(str(args.get("query") or "").split())
     if not query:
         logger.warning("mcp.image_search.rejected reason=empty_query args=%r", args)
@@ -493,11 +535,14 @@ async def _call_image_search(args: dict[str, Any]) -> dict[str, Any]:
             "tool_ui": {"kind": "image_search", "status": "error", "images": []},
             "result": "Image search failed: query must be a non-empty string.",
         }
+
+    # Clamp the limit to 1-24 (default 12), falling back to 12 for a non-numeric value.
     try:
         limit = max(1, min(24, int(args.get("limit") or 12)))
     except (TypeError, ValueError):
         limit = 12
 
+    # Serve a repeated query from the TTL cache.
     cached = _cached_image_result(query, limit)
     if cached is not None:
         cached_count = int((cached.get("ui") or {}).get("result_count") or 0)
@@ -508,6 +553,7 @@ async def _call_image_search(args: dict[str, Any]) -> dict[str, Any]:
         )
         return cached
 
+    # Run the engines with an 8 second budget; any failure becomes an error payload.
     logger.info("mcp.image_search.start query=%r limit=%d", query[:120], limit)
     write_search_io_event(
         {"layer": "mcp_adapter", "phase": "image_search.request", "tool_id": "image_search",
@@ -536,6 +582,7 @@ async def _call_image_search(args: dict[str, Any]) -> dict[str, Any]:
             "result": f"Image search failed: {exc}",
         }
 
+    # Gallery entries for the UI: only sources that have an image URL.
     images = [
         {
             "id": f"img{index}",
@@ -559,6 +606,8 @@ async def _call_image_search(args: dict[str, Any]) -> dict[str, Any]:
         "result_count": len(images),
         "images": images,
     }
+
+    # Log the result and per-engine diagnostics; engines that failed or found nothing get a warning.
     elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
     engines_summary = _image_engine_summary(payload)
     write_search_io_event(
@@ -588,6 +637,7 @@ async def _call_image_search(args: dict[str, Any]) -> dict[str, Any]:
                 query[:120], item["engine"], item["status"], item["http_status"],
                 item["fetch_ms"], item["results"],
             )
+
     # The model-facing result stays compact: it sees URLs + metadata and can fetch
     # any image itself when it is multimodal; the rich gallery is UI-only.
     result_lines = [
@@ -606,6 +656,7 @@ async def _call_image_search(args: dict[str, Any]) -> dict[str, Any]:
             "answer on its own line, outside code blocks, inline code, quotes, links, and lists:\n"
             f"[[images: {query[:140]}]]"
         )
+
     # model_context is the MCP contract's compact model-facing text: with it (plus
     # the ui dict) _extract_structured_tool_result keeps the gallery metadata and
     # the model sees the clean listing instead of a full JSON dump.
@@ -624,17 +675,23 @@ async def _call_image_search(args: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# Read page
+
+# Fetch one or many URLs as markdown and wrap them in the structured payload. A list of URLs is read
+# concurrently (truncated to the configured batch limit); a failing URL becomes an "Error:" text.
 async def _call_read_page(args: dict[str, Any]) -> dict[str, Any]:
     import asyncio
 
     from core.config import load_search_config
 
+    # Parse the url argument (string, list or stringified list) and log the request.
     batch_limit = max(1, int(load_search_config().search.batch_query_limit))
     url = _maybe_parse_list(args.get("url", ""))
     write_search_io_event(
         {"layer": "mcp_adapter", "phase": "read_page.request", "tool_id": "read_page", "url": url}
     )
 
+    # Read the page(s): a batch runs concurrently, a single URL runs directly.
     if isinstance(url, list):
         urls = [u.strip() for u in url if isinstance(u, str) and u.strip()][:batch_limit]
         logger.info("mcp.read_page.start batch=True urls=%d", len(urls))
@@ -647,6 +704,7 @@ async def _call_read_page(args: dict[str, Any]) -> dict[str, Any]:
         text = await run_read_page(url_text)
         payload = _read_page_payload([url_text], [text])
 
+    # Record the result in the model IO log and the server log.
     write_search_io_event(
         {"layer": "mcp_adapter", "phase": "read_page.result", "tool_id": "read_page",
          "result": payload}
@@ -655,6 +713,8 @@ async def _call_read_page(args: dict[str, Any]) -> dict[str, Any]:
                 payload["ui"]["status"], payload["ui"]["result_count"])
     return payload
 
+
+# Tool lifecycle and dispatch
 
 # Cancel outstanding background work (prefetch) and release this process's HTTP resources
 # at server shutdown. The warm browser daemon is intentionally left running so it stays warm
@@ -679,6 +739,7 @@ async def call_tool(
     args = dict(arguments or {})
     _evict_caches_once()
     if tool_id == "web_search":
+        # Collect the warnings of the original (raw) arguments so the compiled call inherits them.
         instant_mode = bool((context or {}).get("instant_mode"))
         inherited_warnings: list[dict[str, Any]] = []
         raw_arguments = (context or {}).get("raw_tool_arguments")

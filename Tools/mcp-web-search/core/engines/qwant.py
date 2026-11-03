@@ -35,6 +35,9 @@ class QwantParser:
     ) -> EngineRequest:
         country, language = split_region(region)
         profile = for_engine("qwant")
+
+        # Query parameters of the web vertical: ten results per page with the offset following the page. The
+        # time limit is not supported and ignored.
         params = {
             "q": query,
             "count": "10",
@@ -46,6 +49,8 @@ class QwantParser:
             "display": "true",
             "llm": "false",
         }
+
+        # XHR-style headers: the API is called by the Qwant web app with a same-site Origin and CORS fetch mode.
         extra = {
             "Accept": "application/json",
             "Origin": "https://www.qwant.com",
@@ -73,6 +78,7 @@ class QwantParser:
 
     # Parse Qwant's JSON response, excluding ads and non-web modules.
     def parse(self, document: str) -> EngineParseResult:
+        # Decode the JSON body; anything else means the API changed.
         try:
             payload = json.loads(document)
         except json.JSONDecodeError as exc:
@@ -91,9 +97,11 @@ class QwantParser:
                 diagnostics=["Anti-bot captcha interstitial"],
             )
 
+        # A non-success status is reported as BLOCKED for rate limits and challenges, as ERROR otherwise.
         data = payload.get("data") or {}
         if payload.get("status") != "success":
             error_data = data.get("error_data") or {}
+
             # error_code 24 is Qwant's rate-limit signal; a captchaUrl means a challenge.
             blocked = data.get("error_code") == 24 or bool(error_data.get("captchaUrl"))
             message = data.get("message") or "Qwant API error"
@@ -105,6 +113,8 @@ class QwantParser:
                 diagnostics=[str(message)],
             )
 
+        # Collect results from the "web" blocks of the mainline only; items without a title or a valid http(s)
+        # URL are counted as malformed.
         mainline = (((data.get("result") or {}).get("items") or {}).get("mainline") or [])
         results: list[SearchResult] = []
         cards_seen = 0
@@ -123,6 +133,7 @@ class QwantParser:
                     continue
                 results.append(SearchResult(title=title, url=href, snippet=snippet))
 
+        # No results is an empty result, and any malformed item downgrades a success to PARTIAL.
         status = ParseStatus.SUCCESS if results else ParseStatus.EMPTY
         if results and malformed:
             status = ParseStatus.PARTIAL

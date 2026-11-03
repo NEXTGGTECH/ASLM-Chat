@@ -1,12 +1,5 @@
 # Copyright NEXTGGTECH. Elastic License 2.0.
 
-"""Model-facing MCP contract for the search tools (ported from the legacy adapter).
-
-The model sees a compact query interface; advanced calls compile into the existing
-mixed-vertical execution plan. Older vertical-field arguments remain readable for stored
-conversations. Region routing, safe-search, and engine selection remain internal.
-"""
-
 from __future__ import annotations
 
 import json
@@ -19,6 +12,9 @@ from core.query.search_plan import (
     prepare_advanced_search,
 )
 
+# Whitespace runs, the accepted effort levels with the aliases that map to "medium", and the
+# maximum number of queries per call: advanced and instant batches, and the largest legacy
+# per-vertical limit.
 _SPACE_RE = re.compile(r"\s+")
 _EFFORT_VALUES = ("low", "medium", "high")
 _EFFORT_ALIASES = {"": "medium", "normal": "medium", "default": "medium", "standard": "medium"}
@@ -28,9 +24,12 @@ LEGACY_BATCH_LIMIT = max(
     VERTICAL_QUERY_LIMITS[vertical] for vertical in ("web", "shopping", "academic")
 )
 
+# Description of the MCP server shown to the model.
 MCP_SERVER_DESCRIPTION = "Search and page-reading tools."
 
 
+# Model-facing description of the web_search tool in the legacy schema mode (vertical flags such as
+# shopping and academic are separate arguments).
 LEGACY_WEB_SEARCH_TOOL_DESCRIPTION = """Search the web for facts, sources, and documentation.
 Pass query as one focused string or up to three independent queries. Use shopping=true for
 prices/offers or academic=true for papers. Effort defaults to medium. Optional search
@@ -38,6 +37,8 @@ operators (site:, quoted phrases, after:) belong in query. Cite returned source 
 and use read_page for full text when needed."""
 
 
+# Model-facing description of the web_search tool in the advanced schema mode (a vertical argument
+# selects web, academic, shopping or onion).
 ADVANCED_WEB_SEARCH_TOOL_DESCRIPTION = """Search the web for facts, sources, documentation, and research.
 Pass query as a focused string or up to three independent query strings. Optional vertical
 selects web (default), academic (papers), shopping (prices/offers), or onion when available.
@@ -51,6 +52,8 @@ Example: {"query":"M2 high speed steel thermal conductivity","vertical":"academi
 WEB_SEARCH_TOOL_DESCRIPTION = ADVANCED_WEB_SEARCH_TOOL_DESCRIPTION
 
 
+# Model-facing description of the image search tool, including the display token the model must put
+# in its answer so the chat UI renders an image gallery.
 IMAGE_SEARCH_TOOL_DESCRIPTION = (
     "Search the web for images matching a query. Returns normalized image results: "
     "full image URL, thumbnail, source page, dimensions. The query's own language "
@@ -70,6 +73,7 @@ IMAGE_SEARCH_TOOL_DESCRIPTION = (
 )
 
 
+# Model-facing description of the read_page tool.
 READ_PAGE_TOOL_DESCRIPTION = """\
 Open one or more exact URLs and extract their readable text as markdown.
 
@@ -86,6 +90,8 @@ read the sources. PDFs, YouTube transcripts, Reddit threads, GitHub pages, Stack
 questions, and X/Twitter posts are handled automatically from their URL."""
 
 
+# Input schema of the web_search tool in the legacy schema mode: query plus effort and the shopping
+# and academic routing flags.
 SEARCH_QUERY_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
@@ -152,8 +158,10 @@ _ONION_PROPERTY: dict[str, Any] = {
 }
 
 
-# Build the search tool's input schema for the current config. The onion opt-in is exposed
-# only while tor.enabled, so the advertised arguments track the actual capability.
+# Tool schemas
+
+# Return the configured schema mode, "legacy" or "advanced" (the default, also used when the
+# config cannot be loaded).
 def search_schema_mode() -> str:
     try:
         from core.config import load_search_config
@@ -164,6 +172,7 @@ def search_schema_mode() -> str:
     return mode if mode in {"legacy", "advanced"} else "advanced"
 
 
+# Return the web_search tool description that matches the configured schema mode.
 def build_search_description() -> str:
     return (
         LEGACY_WEB_SEARCH_TOOL_DESCRIPTION
@@ -172,6 +181,8 @@ def build_search_description() -> str:
     )
 
 
+# Build the search tool's input schema for the current config. The onion opt-in is exposed
+# only while tor.enabled, so the advertised arguments track the actual capability.
 def build_search_schema() -> dict[str, Any]:
     import copy
 
@@ -182,6 +193,7 @@ def build_search_schema() -> dict[str, Any]:
     except Exception:  # noqa: BLE001
         tor_enabled = False
 
+    # Advanced mode: a compact query/vertical/effort/description object.
     if search_schema_mode() == "advanced":
         verticals = ["web", "academic", "shopping", *(["onion"] if tor_enabled else [])]
         query_string = {"type": "string", "minLength": 1, "maxLength": 512}
@@ -205,11 +217,14 @@ def build_search_schema() -> dict[str, Any]:
             "required": ["query"],
         }
 
+    # Legacy mode: the fixed schema, plus the onion flag when Tor is enabled.
     schema = copy.deepcopy(SEARCH_QUERY_SCHEMA)
     if tor_enabled:
         schema["properties"]["onion"] = dict(_ONION_PROPERTY)
     return schema
 
+
+# Argument coercion
 
 # Best-effort JSON parse for string tool arguments that look like objects.
 def _try_parse_json(value: str) -> Any:
@@ -231,6 +246,8 @@ def sanitize_query(query: str) -> str:
 # Convert the public query argument into provider-ready search strings up to the supplied limit.
 def coerce_search_queries(value: Any, *, limit: int = SEARCH_BATCH_LIMIT) -> list[str]:
     limit = max(1, int(limit or SEARCH_BATCH_LIMIT))
+
+    # An object wraps the queries under "query" (or a legacy raw_query / q / text key): unwrap it.
     if isinstance(value, dict):
         plan = value.get("query", value)
         if isinstance(plan, dict):
@@ -239,6 +256,8 @@ def coerce_search_queries(value: Any, *, limit: int = SEARCH_BATCH_LIMIT) -> lis
                     return coerce_search_queries(plan[key], limit=limit)
             return []
         return coerce_search_queries(plan, limit=limit)
+
+    # A list: sanitize each item, drop empty ones and stop at the limit.
     if isinstance(value, (list, tuple)):
         queries: list[str] = []
         for item in value:
@@ -248,6 +267,8 @@ def coerce_search_queries(value: Any, *, limit: int = SEARCH_BATCH_LIMIT) -> lis
             if len(queries) >= limit:
                 break
         return queries
+
+    # A string: JSON-encoded objects and arrays are decoded first, otherwise it is one query.
     if isinstance(value, str):
         parsed = _try_parse_json(value)
         if isinstance(parsed, (dict, list)):
@@ -256,10 +277,14 @@ def coerce_search_queries(value: Any, *, limit: int = SEARCH_BATCH_LIMIT) -> lis
                 return nested
         query = sanitize_query(value)
         return [query] if query else []
+
+    # Any other value is converted to text.
     query = sanitize_query(str(value or ""))
     return [query] if query else []
 
 
+# Count the queries a raw query argument holds, without sanitizing or truncating them. It mirrors
+# the unwrapping rules of coerce_search_queries, so the legacy per-vertical limit can be checked.
 def _search_query_item_count(value: Any) -> int:
     if isinstance(value, dict):
         plan = value.get("query", value)
@@ -336,6 +361,9 @@ def coerce_search_onion(value: Any = None) -> bool:
         return False
 
 
+# Search plan preparation
+
+# Return the search request as shown to the UI, without the internal per-query time limit.
 def _public_search_request(request: dict[str, Any]) -> dict[str, Any]:
     public = {key: value for key, value in request.items() if key != "queries"}
     public["queries"] = [
@@ -346,9 +374,9 @@ def _public_search_request(request: dict[str, Any]) -> dict[str, Any]:
     return public
 
 
+# Recover the common model hallucination {"item": ...} (or "items") in a vertical field by
+# unwrapping it to the string or list inside, without losing a batch.
 def _recover_public_query_wrappers(arguments: Any) -> Any:
-    """Recover the common model hallucination ``{"item": ...}`` without losing a batch."""
-
     if not isinstance(arguments, dict):
         return arguments
     normalized = dict(arguments)
@@ -363,12 +391,16 @@ def _recover_public_query_wrappers(arguments: Any) -> Any:
     return normalized
 
 
+# Build the tool result for a rejected search call: an INVALID_SEARCH_PLAN error, an empty source
+# list, a model_context message that lists the failures and the required shape, and a "rejected"
+# UI entry.
 def invalid_search_plan_result(
     issues: list[dict[str, str]],
     *,
     description: str = "",
     received_arguments: Any = None,
 ) -> dict[str, Any]:
+    # Summarize the failures and echo (a capped copy of) the received arguments.
     details = "; ".join(
         f"{issue.get('path', '$')}: {issue.get('message', 'invalid value')}"
         for issue in issues
@@ -383,6 +415,8 @@ def invalid_search_plan_result(
         )[:1600]
     except Exception:  # noqa: BLE001
         received = str(received_arguments)[:1600]
+
+    # The message the model sees: the failures, the required shape and valid examples.
     message = (
         "INVALID_SEARCH_PLAN: web_search rejected this call before running any search.\n"
         f"Failures: {details}\n"
@@ -408,11 +442,14 @@ def invalid_search_plan_result(
     }
 
 
+# Validate the compact instant shape (query, description and optional operators) and compile it
+# into a low-effort web plan. Return {ok: False, error_result, ...} for an invalid call, otherwise
+# {ok: True, arguments, search_request, warnings, tool_ui} before any network work.
 def prepare_instant_search_arguments(arguments: Any) -> dict[str, Any]:
-    """Validate the compact instant shape and compile it into a low-effort web plan."""
-
     args = dict(arguments) if isinstance(arguments, dict) else {}
     args.pop("_instant_mode", None)
+
+    # Reject unknown keys and a missing description.
     issues: list[dict[str, str]] = []
     for key in sorted(set(args) - {"query", "description", "operators"}):
         issues.append({"path": f"$.{key}", "message": "is not allowed in instant mode"})
@@ -422,6 +459,7 @@ def prepare_instant_search_arguments(arguments: Any) -> dict[str, Any]:
     if not description:
         issues.append({"path": "$.description", "message": "must be a non-empty string"})
 
+    # Check that there is at least one query and no more than the instant batch limit.
     raw_query = args.get("query")
     raw_queries = list(raw_query) if isinstance(raw_query, list) else [raw_query]
     if not raw_queries or raw_queries == [None]:
@@ -432,6 +470,7 @@ def prepare_instant_search_arguments(arguments: Any) -> dict[str, Any]:
             "message": f"instant mode permits at most {INSTANT_SEARCH_BATCH_LIMIT} queries",
         })
 
+    # The shared operators object must be an object (empty when omitted).
     operators = args.get("operators", {})
     if operators in (None, ""):
         operators = {}
@@ -439,6 +478,7 @@ def prepare_instant_search_arguments(arguments: Any) -> dict[str, Any]:
         issues.append({"path": "$.operators", "message": "must be an object"})
         operators = {}
 
+    # Reject the call with an instant-mode specific message when the shape is invalid.
     if issues:
         error_result = invalid_search_plan_result(
             issues,
@@ -470,6 +510,9 @@ def prepare_instant_search_arguments(arguments: Any) -> dict[str, Any]:
         {"text": query, "operators": dict(operators)} if operators else query
         for query in raw_queries
     ]
+
+    # Compile through the advanced preparer as a low-effort web plan; its own rejections get the
+    # same instant-mode message.
     advanced_arguments = {
         "call_description": description,
         "web": structured_queries[0] if len(structured_queries) == 1 else structured_queries,
@@ -510,6 +553,7 @@ def prepare_instant_search_arguments(arguments: Any) -> dict[str, Any]:
             "error_result": error_result,
         }
 
+    # Mark the request as instant and return the canonical arguments with the UI data.
     search_request = prepared["search_request"]
     search_request["schema_mode"] = "instant"
     public_request = _public_search_request(search_request)
@@ -538,15 +582,22 @@ def prepare_instant_search_arguments(arguments: Any) -> dict[str, Any]:
     }
 
 
+# Validate the web_search arguments and return the canonical arguments, the search request and the
+# normalized UI data before any network work ({ok: False, error_result, ...} when rejected).
+# Instant mode, the advanced schema (compact query/vertical shape or the full plan shape) and the
+# legacy schema are each handled by their own branch below.
 def prepare_search_arguments(arguments: Any, *, instant_mode: bool = False) -> dict[str, Any]:
-    """Return canonical arguments and normalized UI data before network work."""
-
+    # Instant calls are validated by their own preparer.
     if instant_mode or (isinstance(arguments, dict) and arguments.get("_instant_mode") is True):
         return prepare_instant_search_arguments(arguments)
 
+    # Advanced schema.
     if search_schema_mode() == "advanced":
         normalized_arguments = _recover_public_query_wrappers(arguments)
         simple_shape = isinstance(normalized_arguments, dict) and "query" in normalized_arguments
+
+        # The compact shape (query, vertical, effort, description) is validated here and rewritten
+        # into the plan shape below.
         if simple_shape:
             # Keep the existing plan/execution pipeline behind a compact public interface.
             args = normalized_arguments
@@ -565,6 +616,8 @@ def prepare_search_arguments(arguments: Any, *, instant_mode: bool = False) -> d
                 vertical: args.get("query"),
                 "effort": args.get("effort", "medium"),
             }
+
+        # Validate and normalize the plan.
         try:
             from core.config import load_search_config
 
@@ -578,6 +631,7 @@ def prepare_search_arguments(arguments: Any, *, instant_mode: bool = False) -> d
                 allow_multiple_queries=True,
             )
         except PlanValidationError as exc:
+            # Report the issues; for the compact shape, translate plan paths back to its names.
             issues = exc.issues
             if simple_shape:
                 issues = [dict(issue) for issue in issues]
@@ -602,6 +656,8 @@ def prepare_search_arguments(arguments: Any, *, instant_mode: bool = False) -> d
                 "tool_ui": error_result["ui"],
                 "error_result": error_result,
             }
+
+        # Return the canonical arguments in the shape the caller used, with the UI data.
         request = _public_search_request(prepared["search_request"])
         warnings = list(prepared.get("warnings") or [])
         return {
@@ -623,6 +679,8 @@ def prepare_search_arguments(arguments: Any, *, instant_mode: bool = False) -> d
             },
         }
 
+    # Legacy schema: the vertical comes from the shopping, academic and onion flags (in that
+    # priority), and the number of queries is capped per vertical.
     args = arguments if isinstance(arguments, dict) else {}
     raw_query = args.get("query", "")
     shopping = coerce_search_shopping(args)
@@ -646,6 +704,8 @@ def prepare_search_arguments(arguments: Any, *, instant_mode: bool = False) -> d
             "tool_ui": error_result["ui"],
             "error_result": error_result,
         }
+
+    # Build the canonical arguments and the search request.
     queries = coerce_search_queries(raw_query, limit=query_limit)
     canonical_query: str | list[str] = queries[0] if len(queries) == 1 else queries
     effort = coerce_search_effort(args)

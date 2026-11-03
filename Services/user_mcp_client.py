@@ -22,6 +22,8 @@ from Settings.proxy_policy import build_proxy_environment_overlay
 
 logger = logging.getLogger(__name__)
 
+# Timeouts in seconds: listing tools (also the session handshake), one tool call, and the extra
+# slack the manager adds when it waits for the connection task so the inner timeout fires first.
 LIST_TOOLS_TIMEOUT = 15.0
 CALL_TOOL_TIMEOUT = 120.0
 MANAGER_TIMEOUT_BUFFER = 5.0
@@ -74,6 +76,7 @@ def _tool_definitions_from_mcp_tools(
     seen_slugs: set[str] = set()
     error: str | None = None
 
+    # Build one definition per tool, naming unnamed tools "tool_N".
     for index, tool in enumerate(mcp_tools, start=1):
         raw_name = str(getattr(tool, "name", "") or "").strip()
         if not raw_name:
@@ -109,6 +112,7 @@ def _tool_definitions_from_mcp_tools(
 
 # Format one MCP call_tool result as plain text for the chat layer.
 def _format_call_tool_result(result: Any) -> str:
+    # An error result is reduced to the text of its content blocks.
     if getattr(result, "isError", False):
         parts: list[str] = []
         for block in getattr(result, "content", []) or []:
@@ -118,6 +122,7 @@ def _format_call_tool_result(result: Any) -> str:
         message = "\n".join(parts).strip() or "Tool reported an error."
         return f"MCP tool error: {message}"
 
+    # A successful result is the structured content (as JSON) followed by the text blocks.
     chunks: list[str] = []
     structured = getattr(result, "structuredContent", None)
     if isinstance(structured, dict) and structured:
@@ -136,6 +141,7 @@ def _format_call_tool_result(result: Any) -> str:
 # Open one short-lived MCP session for stdio or streamable HTTP transport.
 @asynccontextmanager
 async def _connect_session(entry: UserMcpServerEntry):
+    # Streamable HTTP transport: connect to the server URL with the configured headers.
     if entry.transport == "http":
         assert entry.url
         headers = dict(entry.headers) if entry.headers else None
@@ -151,6 +157,8 @@ async def _connect_session(entry: UserMcpServerEntry):
                 yield session
         return
 
+    # Stdio transport: launch the configured command with the proxy environment overlay, sending
+    # the child's stderr to the null device so it cannot pollute this process's output.
     assert entry.command
     devnull = open(os.devnull, "w", encoding="utf-8")  # noqa: SIM115
     try:
@@ -170,7 +178,11 @@ async def _connect_session(entry: UserMcpServerEntry):
 
 
 # Own one MCP transport and serialize all requests through its lifetime task.
+# Requests are queued as (operation, payload, timeout, future) tuples and answered one at a time
+# by _serve, which holds the session open. After the first failed request, or when the task ends,
+# the connection stops accepting requests and fails everything still queued.
 class _PersistentMcpConnection:
+    # Remember the server entry and start the task that serves the request queue.
     def __init__(self, entry: UserMcpServerEntry) -> None:
         self.entry = entry
         self._accepting_requests = True
@@ -180,10 +192,12 @@ class _PersistentMcpConnection:
             name=f"user-mcp-{entry.server_id}",
         )
 
+    # Return whether the connection still accepts requests and its task is running.
     @property
     def is_alive(self) -> bool:
         return self._accepting_requests and not self._task.done()
 
+    # Queue one request ("list_tools" or "call_tool") and wait for the result of the serving task.
     async def request(self, operation: str, payload: dict[str, Any], timeout: float) -> Any:
         if not self.is_alive:
             raise RuntimeError(f"MCP connection for {self.entry.server_id} is not running")
@@ -192,6 +206,7 @@ class _PersistentMcpConnection:
         await self._queue.put((operation, payload, timeout, result_future))
         return await result_future
 
+    # Stop accepting requests and cancel the serving task, which closes the transport.
     async def close(self) -> None:
         self._accepting_requests = False
         if not self._task.done():
@@ -199,12 +214,15 @@ class _PersistentMcpConnection:
         with suppress(asyncio.CancelledError):
             await self._task
 
+    # Keep one session open and answer queued requests one by one until the first failure or a
+    # cancellation, then fail the in-flight and still queued requests.
     async def _serve(self) -> None:
         active_future: asyncio.Future[Any] | None = None
         failure: Exception | None = None
         try:
             async with _connect_session(self.entry) as session:
                 while True:
+                    # Take the next request and run it with its own timeout.
                     operation, payload, timeout, active_future = await self._queue.get()
                     try:
                         if operation == "list_tools":
@@ -220,6 +238,8 @@ class _PersistentMcpConnection:
                         else:
                             raise ValueError(f"Unsupported MCP operation: {operation}")
                     except Exception as exc:
+                        # A failed request poisons the connection: report it to the caller and
+                        # leave the loop so the transport is closed and recreated on next use.
                         self._accepting_requests = False
                         failure = exc
                         if not active_future.done():
@@ -227,6 +247,7 @@ class _PersistentMcpConnection:
                         active_future = None
                         break
 
+                    # Hand the result to the waiting caller (unless it gave up in the meantime).
                     if not active_future.done():
                         active_future.set_result(result)
                     active_future = None
@@ -237,6 +258,8 @@ class _PersistentMcpConnection:
             failure = exc
             logger.warning("Persistent user MCP connection failed for %s: %s", self.entry.server_id, exc)
         finally:
+            # Whatever ended the task, fail the in-flight request and every queued one with the
+            # original failure (or a generic "closed" error) so no caller waits forever.
             self._accepting_requests = False
             closed_error = failure or RuntimeError(
                 f"MCP connection for {self.entry.server_id} was closed"
@@ -250,14 +273,22 @@ class _PersistentMcpConnection:
 
 
 # Host persistent MCP connections on one process-wide asyncio event loop.
+# The loop runs on a daemon thread started on first use; synchronous callers submit coroutines
+# to it and wait for the result. Connections are cached by a hash of the server configuration.
 class _PersistentMcpSessionManager:
+    # Create the manager without starting the loop thread.
     def __init__(self) -> None:
+        # The background loop, its thread, an event set once the loop exists, and the lock that
+        # guards starting and stopping the thread.
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._ready = threading.Event()
         self._state_lock = threading.Lock()
+
+        # Live connections by configuration hash (see _entry_cache_key).
         self._connections: dict[str, _PersistentMcpConnection] = {}
 
+    # Run the event loop of the manager thread; on exit cancel the remaining tasks and close the loop.
     def _thread_main(self) -> None:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
@@ -273,7 +304,9 @@ class _PersistentMcpSessionManager:
                 loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
             loop.close()
 
+    # Start the loop thread when it is not running and wait until its loop exists.
     def _ensure_started(self) -> None:
+        # Fast path without the lock, then a second check under the lock so only one thread starts it.
         if self._thread is not None and self._thread.is_alive() and self._loop is not None:
             return
 
@@ -289,6 +322,8 @@ class _PersistentMcpSessionManager:
             self._thread.start()
             self._ready.wait()
 
+    # Send one request over the cached connection of the entry, replacing a dead connection
+    # (or creating the first one) on the manager loop.
     async def _request_async(
         self,
         entry: UserMcpServerEntry,
@@ -305,6 +340,9 @@ class _PersistentMcpSessionManager:
             self._connections[cache_key] = connection
         return await connection.request(operation, payload, timeout)
 
+    # Run one request on the manager loop and block the calling thread for the result.
+    # Raise TimeoutError when the loop does not answer within the request timeout plus the
+    # list-tools handshake time and a small buffer.
     def request(
         self,
         entry: UserMcpServerEntry,
@@ -324,6 +362,7 @@ class _PersistentMcpSessionManager:
             future.cancel()
             raise TimeoutError(f"MCP {operation} timed out for {entry.server_id}") from exc
 
+    # Close every cached connection and forget them all.
     async def _shutdown_all_async(self) -> None:
         connections = list(self._connections.values())
         self._connections.clear()
@@ -333,14 +372,15 @@ class _PersistentMcpSessionManager:
                 return_exceptions=True,
             )
 
+    # Close and forget the cached connection of one server entry, if any.
     async def _cancel_entry_async(self, entry: UserMcpServerEntry) -> None:
         connection = self._connections.pop(_entry_cache_key(entry), None)
         if connection is not None:
             await connection.close()
 
+    # Close the active transport for one configured MCP server.
+    # Do nothing when the loop thread is not running; log a warning when closing takes too long.
     def cancel_entry(self, entry: UserMcpServerEntry) -> None:
-        """Close the active transport for one configured MCP server."""
-
         loop = self._loop
         thread = self._thread
         if loop is None or thread is None or not thread.is_alive():
@@ -352,6 +392,7 @@ class _PersistentMcpSessionManager:
             future.cancel()
             logger.warning("Timed out while cancelling user MCP server %s", entry.server_id)
 
+    # Close every cached connection but keep the loop thread alive for reuse.
     def shutdown_all(self) -> None:
         loop = self._loop
         thread = self._thread
@@ -365,6 +406,7 @@ class _PersistentMcpSessionManager:
             future.cancel()
             logger.warning("Timed out while shutting down persistent user MCP sessions")
 
+    # Close every connection, then stop the loop and join its thread. A later request starts a new thread.
     def close(self) -> None:
         self.shutdown_all()
         with self._state_lock:
@@ -378,6 +420,7 @@ class _PersistentMcpSessionManager:
             thread.join(timeout=3.0)
 
 
+# Process-wide manager that all module-level functions below share.
 _session_manager = _PersistentMcpSessionManager()
 
 
@@ -391,6 +434,8 @@ def cancel_entry(entry: UserMcpServerEntry) -> None:
     _session_manager.cancel_entry(entry)
 
 
+# Close all MCP transports and stop the loop thread when the interpreter exits, so no MCP server
+# child process is left behind.
 atexit.register(_session_manager.close)
 
 
@@ -408,6 +453,7 @@ def fetch_tool_definitions(entry: UserMcpServerEntry) -> tuple[list[dict[str, An
 # Invoke one MCP tool through the cached per-server connection.
 def call_user_mcp_tool(entry: UserMcpServerEntry, mcp_tool_name: str, arguments: dict[str, Any]) -> str:
     try:
+        # Call the tool and format its result as text.
         result = _session_manager.request(
             entry,
             "call_tool",
@@ -415,6 +461,8 @@ def call_user_mcp_tool(entry: UserMcpServerEntry, mcp_tool_name: str, arguments:
             CALL_TOOL_TIMEOUT,
         )
         formatted = _format_call_tool_result(result)
+
+        # GitHub search tools that hit the API rate limit are answered from the public HTML search instead.
         if str(entry.server_id or "").strip().lower() == "github":
             from Services.github_html_fallback import (
                 GITHUB_SEARCH_TYPE_BY_TOOL,

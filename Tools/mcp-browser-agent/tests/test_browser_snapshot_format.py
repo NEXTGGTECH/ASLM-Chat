@@ -15,6 +15,7 @@ from browser import (
 )
 
 
+# Verify that the Camoufox launch options exclude the optional UBO default addon.
 @pytest.mark.unit
 def test_camoufox_launch_excludes_optional_default_addon() -> None:
     options = _camoufox_launch_options()
@@ -23,8 +24,7 @@ def test_camoufox_launch_excludes_optional_default_addon() -> None:
     assert options["exclude_addons"][0].name == "UBO"
 
 
-# _is_noise_element — hide empty footer links outside main content.
-
+# Verify that an unnamed link in the footer landmark counts as noise while a named button in main does not.
 @pytest.mark.unit
 def test_is_noise_element_filters_empty_links_outside_main() -> None:
     assert _is_noise_element({"role": "link", "name": "", "landmark": "contentinfo"})
@@ -33,8 +33,7 @@ def test_is_noise_element_filters_empty_links_outside_main() -> None:
     )
 
 
-# _format_control_line — ref, role, editable flag, and region in snapshot lines.
-
+# Verify that a text box line shows its ref, role, editable flag and region.
 @pytest.mark.unit
 def test_format_control_line_includes_editable_and_region() -> None:
     line = _format_control_line(
@@ -53,8 +52,7 @@ def test_format_control_line_includes_editable_and_region() -> None:
     assert 'region=main' in line
 
 
-# _filter_snapshot_controls — compact mode drops noise; full mode keeps all.
-
+# Verify that the compact filter drops the unnamed footer link and the full filter keeps both controls.
 @pytest.mark.unit
 def test_filter_snapshot_controls_hides_noise_in_compact_mode() -> None:
     elements = [
@@ -68,8 +66,8 @@ def test_filter_snapshot_controls_hides_noise_in_compact_mode() -> None:
     assert len(full) == 2
 
 
-# _format_parsed_controls — group headings and max_items cap.
-
+# Verify that controls are listed under group headings and that a max_items cap of 2 leaves a "more
+# controls hidden" note for the third control.
 @pytest.mark.unit
 def test_format_parsed_controls_groups_and_caps_items() -> None:
     elements = [
@@ -83,8 +81,8 @@ def test_format_parsed_controls_groups_and_caps_items() -> None:
     assert "more controls hidden" in joined
 
 
-# _build_parsed_state — mode and per-role counts for compact snapshot.
-
+# Verify that the parsed state of a compact snapshot reports the "controls" mode and the control and
+# text-input counts.
 @pytest.mark.unit
 def test_build_parsed_state_reports_counts() -> None:
     elements = [
@@ -97,8 +95,8 @@ def test_build_parsed_state_reports_counts() -> None:
     assert state["counts"]["text_inputs"] == 1
 
 
-# is_browser_closed_error — recognize driver/page-closed error messages.
-
+# Verify that exceptions with browser-closed or driver-connection-closed messages are recognized as a dead
+# browser.
 @pytest.mark.unit
 @pytest.mark.parametrize(
     "message",

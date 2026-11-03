@@ -11,8 +11,8 @@ from browser_screenshot import _load_model_runtime_metadata, _model_supports_vis
 
 
 # Build a minimal valid PNG with the given IHDR dimensions (test helper).
-
 def _minimal_png(width: int, height: int) -> bytes:
+    # PNG signature, then the IHDR chunk (length, type, dimensions and fixed format bytes, CRC) and IEND.
     signature = b"\x89PNG\r\n\x1a\n"
     ihdr_data = (
         width.to_bytes(4, "big")
@@ -29,8 +29,7 @@ def _minimal_png(width: int, height: int) -> bytes:
     return signature + ihdr_chunk + iend_chunk
 
 
-# _png_dimensions — parse IHDR from bytes or return None for invalid input.
-
+# Verify that PNG dimensions are read from the IHDR chunk and that non-PNG bytes give None.
 @pytest.mark.unit
 def test_png_dimensions_reads_width_and_height() -> None:
     data = _minimal_png(640, 480)
@@ -39,10 +38,11 @@ def test_png_dimensions_reads_width_and_height() -> None:
     assert _png_dimensions(b"not-a-png") is None
 
 
-# _model_supports_vision and _load_model_runtime_metadata — vision flag from runtime JSON.
-
+# Verify that the vision flag is read from a runtime metadata file found under the module directory, and
+# that the metadata loader returns the models mapping from the same file.
 @pytest.mark.unit
 def test_model_supports_vision_from_runtime_metadata(tmp_path: Path) -> None:
+    # Write metadata for one active vision-capable model into <module_dir>/Tools.
     meta = {
         "active": {"engine": "ollama-service", "model": "vision-model"},
         "models": {
@@ -55,6 +55,7 @@ def test_model_supports_vision_from_runtime_metadata(tmp_path: Path) -> None:
     path.parent.mkdir(parents=True)
     path.write_text(json.dumps(meta), encoding="utf-8")
 
+    # The vision lookup finds the record by engine and model name.
     supported, record, reason = _model_supports_vision(
         {"module_dir": str(tmp_path), "engine": "ollama-service", "model_name": "vision-model"}
     )
@@ -62,5 +63,6 @@ def test_model_supports_vision_from_runtime_metadata(tmp_path: Path) -> None:
     assert reason == "matched"
     assert isinstance(record, dict)
 
+    # The loader reads the same file.
     payload = _load_model_runtime_metadata(str(tmp_path))
     assert isinstance(payload.get("models"), dict)

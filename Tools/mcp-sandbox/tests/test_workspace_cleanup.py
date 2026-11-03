@@ -11,6 +11,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
+# Package root of mcp-sandbox with its supervisor and sandbox source directories, put on sys.path at import
+# time so the sandbox package can be imported.
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 SUPERVISOR = ROOT / "supervisor"
@@ -18,12 +20,15 @@ for path in (SUPERVISOR, SRC):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
+# Point the sandbox at a throwaway workspace at import time unless the environment already sets one.
 os.environ.setdefault("SANDBOX_HOST_WORKSPACE", str(ROOT / ".test_workspace_cleanup"))
 
 import sandbox.cleanup as cleanup_mod  # noqa: E402
 
 
+# Cover the workspace cleanup: staging root entries into a tmp batch and recycling expired batches.
 class WorkspaceCleanupTests(unittest.TestCase):
+    # Create a temporary _sandbox task root and make the cleanup module use it.
     def setUp(self) -> None:
         self.tmpdir = tempfile.TemporaryDirectory()
         self.task_root = Path(self.tmpdir.name) / "_sandbox"
@@ -31,10 +36,13 @@ class WorkspaceCleanupTests(unittest.TestCase):
         self.task_root_patch = patch.object(cleanup_mod, "task_root", return_value=self.task_root)
         self.task_root_patch.start()
 
+    # Stop the task root patch and delete the temporary directory.
     def tearDown(self) -> None:
         self.task_root_patch.stop()
         self.tmpdir.cleanup()
 
+    # Verify that staging moves all root entries (files and directories) into one batch under tmp, writes
+    # the state file and the batch metadata, and leaves nothing behind in the root.
     def test_stage_workspace_to_tmp_moves_root_entries_into_one_batch(self) -> None:
         (self.task_root / "notes.txt").write_text("hello\n", encoding="utf-8")
         (self.task_root / "repo").mkdir()
@@ -52,6 +60,7 @@ class WorkspaceCleanupTests(unittest.TestCase):
         self.assertTrue((self.task_root / cleanup_mod.STATE_FILENAME).is_file())
         self.assertTrue((batch / cleanup_mod.BATCH_METADATA).is_file())
 
+    # Verify that staging leaves the Skills directory in the root and moves only the other entries.
     def test_stage_workspace_to_tmp_keeps_skills_root(self) -> None:
         (self.task_root / "Skills").mkdir()
         (self.task_root / "Skills" / "SKILL.md").write_text("skill\n", encoding="utf-8")
@@ -65,6 +74,8 @@ class WorkspaceCleanupTests(unittest.TestCase):
         self.assertFalse((batch / "Skills").exists())
         self.assertTrue((batch / "notes.txt").is_file())
 
+    # Verify that staging is skipped (no batch, files untouched, no tmp directory) while a background job
+    # is running.
     def test_stage_workspace_to_tmp_skips_when_background_job_running(self) -> None:
         (self.task_root / "notes.txt").write_text("hello\n", encoding="utf-8")
 
@@ -75,6 +86,8 @@ class WorkspaceCleanupTests(unittest.TestCase):
         self.assertTrue((self.task_root / "notes.txt").is_file())
         self.assertFalse((self.task_root / "tmp").exists())
 
+    # Verify that a tmp symlink pointing outside the task root is replaced by a real directory before
+    # staging, so nothing is written to the symlink target.
     @unittest.skipIf(
         sys.platform == "win32",
         "Symlink creation requires elevated privileges on Windows",
@@ -94,7 +107,10 @@ class WorkspaceCleanupTests(unittest.TestCase):
         self.assertTrue((batch / "notes.txt").is_file())
         self.assertEqual(list(outside.iterdir()), [])
 
+    # Verify that a batch staged longer ago than the recycle time is sent to the platform trash backend
+    # and reported as recycled.
     def test_recycle_due_tmp_batches_uses_trash_backend_for_expired_batches(self) -> None:
+        # Arrange: a batch staged 120 seconds ago, against a recycle time of 10 seconds.
         batch = self.task_root / "tmp" / "idle-old"
         batch.mkdir(parents=True)
         (batch / "old.txt").write_text("old\n", encoding="utf-8")
@@ -105,6 +121,7 @@ class WorkspaceCleanupTests(unittest.TestCase):
         )
         recycled: list[Path] = []
 
+        # Record the batch and delete it instead of using the real platform trash.
         def fake_trash(path: Path) -> None:
             recycled.append(path)
             shutil.rmtree(path)
@@ -120,6 +137,8 @@ class WorkspaceCleanupTests(unittest.TestCase):
         self.assertEqual(recycled, [batch])
         self.assertFalse(batch.exists())
 
+    # Verify that a batch staged just now is kept when the recycle time is an hour: nothing is recycled
+    # and the trash backend is not called.
     def test_recycle_due_tmp_batches_keeps_recent_batches(self) -> None:
         batch = self.task_root / "tmp" / "idle-recent"
         batch.mkdir(parents=True)
@@ -138,6 +157,8 @@ class WorkspaceCleanupTests(unittest.TestCase):
         trash_mock.assert_not_called()
         self.assertTrue(batch.exists())
 
+    # Verify that recycling replaces a tmp symlink with a real directory without recycling anything or
+    # touching the symlink target.
     @unittest.skipIf(
         sys.platform == "win32",
         "Symlink creation requires elevated privileges on Windows",
@@ -157,5 +178,6 @@ class WorkspaceCleanupTests(unittest.TestCase):
         self.assertEqual(list(outside.iterdir()), [])
 
 
+# Allow running this file directly with the unittest runner.
 if __name__ == "__main__":
     unittest.main()

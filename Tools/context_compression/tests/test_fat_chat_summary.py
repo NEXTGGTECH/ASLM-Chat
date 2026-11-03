@@ -14,6 +14,7 @@ from context_compression.tests.cache_chat_utils import (
     resolve_cache_db_path,
 )
 
+# Lowercased substrings that mark a summary field value as raw tool or search output.
 RAW_NOISE_MARKERS = (
     "citation rules",
     "cite search evidence",
@@ -25,8 +26,8 @@ RAW_NOISE_MARKERS = (
 )
 
 
-# Count summary field values that look like raw tool or search noise.
-
+# Count summary field values that look like raw tool or search noise: a noise marker, a "tool:" prefix
+# or more than one URL in a single value.
 def _count_noise(values: list[str]) -> int:
     return sum(
         1
@@ -37,9 +38,10 @@ def _count_noise(values: list[str]) -> int:
     )
 
 
-# Exercise the bundled fat-chat fixture: model path, fallback path, and noise metrics.
-
+# Run the three summary paths (unparseable model output, empty model output, valid Markdown output) on the
+# largest cached chat, raise AssertionError when a path loses its raw context, and print noise metrics.
 def main() -> None:
+    # Load the largest chat from the cache database as the compression input.
     db_path = resolve_cache_db_path()
     if not db_path.exists():
         raise RuntimeError(f"Database not found: {db_path}")
@@ -50,7 +52,9 @@ def main() -> None:
         raise RuntimeError(f"No chats found in cache database: {db_path}")
     entries, recent = collect_chat_entries(conn, fat["id"])
 
+    # Fake model callback that returns a well-formed Markdown summary with all twelve contract sections.
     def valid_model_response(prompt_messages: list[dict[str, str]]) -> str:
+        # Headings follow the contract order; list sections use "- " bullets and "- None" marks an empty section.
         return "\n".join([
             "## Session Goal",
             "Real fat chat compression fixture.",
@@ -114,6 +118,7 @@ def main() -> None:
     if not payload.get("work_summary") or not payload.get("key_facts"):
         raise AssertionError("Model-backed compression produced an empty semantic summary.")
 
+    # Collect the sanitized fields to measure and the URLs that point at localhost or Bing.
     key_facts = payload.get("key_facts") or []
     open_tasks = payload.get("open_tasks") or []
     risk_flags = payload.get("risk_flags") or []
@@ -126,6 +131,7 @@ def main() -> None:
         if re.search(r"https?://(127\.0\.0\.1|localhost|([^/]+\.)?bing\.com)(:|/|$)", str(url), re.IGNORECASE)
     ]
 
+    # Print chat statistics, noise counts per field and a few sample values.
     print("fat_chat_id:", fat["id"])
     print("fat_chat_title:", fat["title"])
     print("fat_chat_chars:", fat["chars"])
@@ -142,8 +148,8 @@ def main() -> None:
     print("sample:source_memory:", (source_memory[:2] if isinstance(source_memory, list) else []))
 
 
-# Pytest entry: skip when the bundled database is absent or has no chats.
-
+# Verify that the summary paths of main() hold on the largest chat of the cache database; the test is
+# skipped when the database is absent or contains no chats.
 @pytest.mark.integration
 def test_fat_chat_summary_fixture() -> None:
     db_path = resolve_cache_db_path()
@@ -154,5 +160,6 @@ def test_fat_chat_summary_fixture() -> None:
     main()
 
 
+# Allow running the fixture check without pytest.
 if __name__ == "__main__":
     main()

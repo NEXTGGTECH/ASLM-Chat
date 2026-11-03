@@ -8,14 +8,16 @@ from urllib.parse import urlparse
 
 # One vetted onion service from the registry seed. `onion` is the last-known address
 # (seed/fallback); the resolver refreshes it from `clearnet_anchor`'s Onion-Location.
+# The category is one of media, infosec, rights, privacy_mail, whistleblow or archive, and
+# clearnet_anchor is the TLS https URL that authoritatively publishes the onion address.
 @dataclass(frozen=True, slots=True)
 class OnionService:
     name: str
-    category: str          # media / infosec / rights / privacy_mail / whistleblow / archive
-    clearnet_anchor: str   # TLS https URL that authoritatively publishes the onion
-    onion: str             # seeded onion URL (fallback when refresh fails)
+    category: str
+    clearnet_anchor: str
+    onion: str
 
-    # The .onion host of the seeded address (for logging / source_domain).
+    # Return the lowercase .onion host of the seeded address (for logging and source_domain).
     @property
     def onion_host(self) -> str:
         return (urlparse(self.onion).netloc or "").lower()

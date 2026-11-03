@@ -18,7 +18,7 @@ class HackerNewsHandler:
     name = "hackernews"
     fallback_to_generic = False
 
-    # True for news.ycombinator.com/item?id=NNN URLs.
+    # Return True for news.ycombinator.com/item?id=NNN URLs.
     def matches(self, url: str) -> bool:
         return is_hackernews_item_url(url)
 
@@ -34,4 +34,5 @@ class HackerNewsHandler:
         )
 
 
+# Handler instance registered in custom_domains/__init__.py.
 HANDLER = HackerNewsHandler()

@@ -15,11 +15,15 @@ from .parse import parse_products, source_domain
 from .providers import ShoppingProvider, providers_for_lane
 
 
+# Share of the result limit taken from the (primary, secondary) lane per effort tier.
 EFFORT_RATIOS = {
     "low": (0.75, 0.25),
     "medium": (0.60, 0.40),
     "high": (0.50, 0.50),
 }
+
+# Hard wall-clock ceiling of a search per effort tier; the regional table applies to
+# non-English searches, which need more time.
 EFFORT_HARD_TIMEOUT_MS = {
     "low": 2500,
     "medium": 5000,
@@ -30,12 +34,16 @@ REGIONAL_EFFORT_HARD_TIMEOUT_MS = {
     "medium": 7500,
     "high": 10000,
 }
+
+# Extra time per effort tier to wait for the slower lane once the buffered results can already
+# fill the limit.
 EFFORT_BUFFER_GRACE_MS = {
     "low": 0,
     "medium": 350,
     "high": 900,
 }
 
+# Browser-like request headers sent to shopping sites.
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -47,15 +55,21 @@ HEADERS = {
 }
 
 
+# Per-provider failure streaks and cooldown deadlines, so a provider that keeps failing or
+# getting blocked is skipped for a while.
 class ProviderState:
+    # Create empty state: failure counts, cooldown deadlines and last status, keyed by provider name.
     def __init__(self) -> None:
         self.failures: dict[str, int] = {}
         self.cooldown_until: dict[str, float] = {}
         self.last_status: dict[str, str] = {}
 
+    # Return True when the provider is not cooling down.
     def available(self, provider: ShoppingProvider) -> bool:
         return self.cooldown_until.get(provider.name, 0.0) <= time.time()
 
+    # Record an attempt outcome. A failure (fetch error, blocked status, or no products) extends the
+    # streak and starts the provider's cooldown once its threshold is reached; a success resets both.
     def record(self, provider: ShoppingProvider, attempt: ShoppingProviderAttempt, product_count: int) -> None:
         bad_status = attempt.status_code in {202, 403, 429, 503}
         failed = (not attempt.ok) or bad_status or product_count <= 0
@@ -70,6 +84,8 @@ class ProviderState:
         self.failures[provider.name] = 0
         self.cooldown_until.pop(provider.name, None)
 
+    # Return failure counts, remaining cooldown seconds of providers still cooling down, and the
+    # last status of every provider.
     def snapshot(self) -> dict[str, Any]:
         now = time.time()
         return {
@@ -88,7 +104,10 @@ class ProviderState:
 _GLOBAL_PROVIDER_STATE = ProviderState()
 
 
+# Shopping vertical engine. A search runs two lanes concurrently (primary and secondary) under
+# one hard deadline per effort tier, merges their products in the effort's ratio and dedupes them.
 class ShoppingSearchEngine:
+    # Store the favicon helper and the provider state shared across searches.
     def __init__(
         self,
         *,
@@ -96,10 +115,13 @@ class ShoppingSearchEngine:
         state: ProviderState | None = None,
     ) -> None:
         self.assets = asset_cache or ShoppingAssetCache()
+
         # Default to the process-wide state so cooldowns persist across calls; tests inject
         # a fresh ProviderState for isolation.
         self.state = state if state is not None else _GLOBAL_PROVIDER_STATE
 
+    # Run one shopping search: start both lanes, collect their products until the lanes finish, the
+    # buffer can fill the limit, or the hard deadline passes, then merge and describe the outcome.
     async def search(
         self,
         query: str,
@@ -109,12 +131,14 @@ class ShoppingSearchEngine:
         language: str = "en",
         hard_timeout_ms: int | None = None,
     ) -> ShoppingSearchResult:
+        # Split the limit between the lanes by the effort's ratio.
         started = time.perf_counter()
         effort = effort if effort in EFFORT_RATIOS else "medium"
         primary_ratio, secondary_ratio = EFFORT_RATIOS[effort]
         primary_limit = max(1, round(limit * primary_ratio))
         secondary_limit = max(0, limit - primary_limit)
 
+        # Start both lanes concurrently; finished lanes are stored in the buffer.
         timeout_ms = hard_timeout_ms if hard_timeout_ms is not None else self._hard_timeout_for_effort(effort, language)
         grace_ms = EFFORT_BUFFER_GRACE_MS[effort]
         buffer = _SearchBuffer()
@@ -124,6 +148,8 @@ class ShoppingSearchEngine:
         }
         partial = False
         partial_reason = ""
+
+        # Collect lane results as they finish, until both are done or the deadline passes.
         try:
             pending = set(tasks.keys())
             deadline = started + (timeout_ms / 1000)
@@ -139,10 +165,15 @@ class ShoppingSearchEngine:
                     try:
                         products, attempts, elapsed_ms = task.result()
                     except Exception as exc:
+                        # A crashed lane contributes nothing and marks the result partial.
                         products, attempts, elapsed_ms = [], [], int((time.perf_counter() - started) * 1000)
                         partial = True
                         partial_reason = f"{lane}_error:{type(exc).__name__}"
                     buffer.update(lane, products, attempts, elapsed_ms)
+
+                # Early stop: when the buffer can already fill the limit, give the slower lane only
+                # a short grace period. Non-English searches keep waiting while the primary lane
+                # has produced nothing.
                 if pending and self._buffer_can_fill_limit(buffer, primary_limit, secondary_limit, limit):
                     if self._should_wait_for_regional_primary(language, pending, tasks, buffer):
                         continue
@@ -158,14 +189,19 @@ class ShoppingSearchEngine:
                             try:
                                 products, attempts, elapsed_ms = task.result()
                             except Exception as exc:
+                                # A crashed lane contributes nothing and marks the result partial.
                                 products, attempts, elapsed_ms = [], [], int((time.perf_counter() - started) * 1000)
                                 partial = True
                                 partial_reason = f"{lane}_error:{type(exc).__name__}"
                             buffer.update(lane, products, attempts, elapsed_ms)
+
+                    # The lane that is still running after the grace period is dropped.
                     if pending:
                         partial = True
                         partial_reason = partial_reason or "buffer_full"
                         break
+
+            # Deadline reached or early stop: cancel the unfinished lane and mark the result partial.
             if pending:
                 partial = True
                 partial_reason = partial_reason or "hard_timeout"
@@ -173,11 +209,13 @@ class ShoppingSearchEngine:
                     task.cancel()
                 await asyncio.gather(*pending, return_exceptions=True)
         except asyncio.CancelledError:
+            # The caller cancelled the whole search: stop both lanes, then propagate.
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks.keys(), return_exceptions=True)
             raise
 
+        # Merge the lanes: the secondary lane also covers a shortfall of the primary lane.
         primary_products = buffer.products.get("primary", [])
         secondary_products = buffer.products.get("secondary", [])
         primary_shortfall = max(0, primary_limit - len(primary_products))
@@ -189,6 +227,8 @@ class ShoppingSearchEngine:
             secondary_fetch_limit,
             limit,
         )
+
+        # Attach favicons, then flag the products of a partial result with the reason.
         favicon_elapsed_ms = self._timed_attach_favicons(products)
         total_elapsed_ms = int((time.perf_counter() - started) * 1000)
         attempts = [*buffer.attempts.get("primary", []), *buffer.attempts.get("secondary", [])]
@@ -196,6 +236,8 @@ class ShoppingSearchEngine:
             for product in products:
                 product.meta["partial"] = True
                 product.meta["partial_reason"] = partial_reason
+
+        # Report the products with per-stage timings and the provider cooldown state.
         return ShoppingSearchResult(
             query=query,
             effort=effort,
@@ -221,12 +263,17 @@ class ShoppingSearchEngine:
             partial_reason=partial_reason,
         )
 
+    # Return the hard deadline in ms for an effort tier; non-English searches use the longer
+    # regional table.
     def _hard_timeout_for_effort(self, effort: str, language: str) -> int:
         lang = (language or "en").split("-", 1)[0].lower()
         if lang != "en":
             return REGIONAL_EFFORT_HARD_TIMEOUT_MS.get(effort, REGIONAL_EFFORT_HARD_TIMEOUT_MS["medium"])
         return EFFORT_HARD_TIMEOUT_MS.get(effort, EFFORT_HARD_TIMEOUT_MS["medium"])
 
+    # Lanes
+
+    # Run a lane and return its products and attempts together with its elapsed milliseconds.
     async def _timed_lane(
         self,
         query: str,
@@ -239,6 +286,8 @@ class ShoppingSearchEngine:
         products, attempts = await self._lane(query, lane, limit, language=language)
         return products, attempts, int((time.perf_counter() - started) * 1000)
 
+    # Run the secondary lane and return its products and attempts together with its elapsed
+    # milliseconds.
     async def _timed_secondary_lane(
         self,
         query: str,
@@ -250,6 +299,7 @@ class ShoppingSearchEngine:
         products, attempts = await self._secondary_lane(query, limit, language=language)
         return products, attempts, int((time.perf_counter() - started) * 1000)
 
+    # Return True when the products buffered so far already merge into the full result limit.
     def _buffer_can_fill_limit(
         self,
         buffer: "_SearchBuffer",
@@ -264,6 +314,8 @@ class ShoppingSearchEngine:
         merged = self._merge_products(primary_products, secondary_products, primary_limit, secondary_fetch_limit, total_limit)
         return len(merged) >= total_limit
 
+    # Return True for a non-English search whose primary lane is still running and has produced
+    # nothing yet, so the early stop must not drop it.
     def _should_wait_for_regional_primary(
         self,
         language: str,
@@ -277,6 +329,7 @@ class ShoppingSearchEngine:
             return False
         return any(tasks.get(task) == "primary" for task in pending)
 
+    # Query the lane's providers one after another, in ranked order, until the limit is reached.
     async def _lane(
         self,
         query: str,
@@ -299,6 +352,8 @@ class ShoppingSearchEngine:
                     break
         return products[:limit], attempts
 
+    # Query the secondary lane: the best provider and the first backup run concurrently as a first
+    # wave, and the remaining backups run one by one only while the limit is still not reached.
     async def _secondary_lane(
         self,
         query: str,
@@ -316,17 +371,20 @@ class ShoppingSearchEngine:
         attempts: list[ShoppingProviderAttempt] = []
         products: list[ShoppingProduct] = []
 
+        # First wave: the best provider and the first backup run concurrently.
         first_wave = [asyncio.create_task(self._provider(query, main))]
         if backups:
             first_wave.append(asyncio.create_task(self._provider(query, backups[0])))
         results = await asyncio.gather(*first_wave, return_exceptions=True)
         for result in results:
             if isinstance(result, Exception):
+                # A crashed provider task is ignored; the other providers still count.
                 continue
             provider_products, provider_attempts = result
             attempts.extend(provider_attempts)
             products.extend(provider_products)
 
+        # Second wave: sequential backups that were not already tried.
         if len(products) < limit and backups:
             attempted = {attempt.provider for attempt in attempts}
             for provider in backups[1:]:
@@ -339,15 +397,22 @@ class ShoppingSearchEngine:
                     break
         return self._dedupe_products(products)[:limit], attempts
 
+    # Return the lane's providers with those in cooldown moved to the end (they are tried last,
+    # not dropped).
     def _ranked_available(self, lane: str, *, language: str = "en") -> list[ShoppingProvider]:
         providers = providers_for_lane(lane, language=language)
         available = [provider for provider in providers if self.state.available(provider)]
         unavailable = [provider for provider in providers if provider not in available]
         return available + unavailable
 
+    # Query one provider through its fetch methods in order and return the first non-empty product
+    # list with all attempts made. A provider in cooldown is not contacted; a blocked status
+    # (403/429/503) stops trying the remaining methods.
     async def _provider(self, query: str, provider: ShoppingProvider) -> tuple[list[ShoppingProduct], list[ShoppingProviderAttempt]]:
         url = provider.url_builder(query)
         attempts: list[ShoppingProviderAttempt] = []
+
+        # Skip a provider that is cooling down, recording a "cooldown" attempt.
         if not self.state.available(provider):
             attempt = ShoppingProviderAttempt(
                 provider=provider.name,
@@ -361,6 +426,7 @@ class ShoppingSearchEngine:
             )
             return [], [attempt]
 
+        # Fetch, parse and record each method until one yields products.
         for method in provider.methods:
             html, attempt = await self._fetch(url, provider, method)
             attempts.append(attempt)
@@ -382,6 +448,11 @@ class ShoppingSearchEngine:
                 break
         return [], attempts
 
+    # Fetching
+
+    # Fetch a URL with the given method ("curl_cffi" or "httpx") and return the body (empty unless
+    # the response was 2xx and non-empty) with the attempt record. Failures never raise: they come
+    # back as an attempt with the error text.
     async def _fetch(self, url: str, provider: ShoppingProvider, method: str) -> tuple[str, ShoppingProviderAttempt]:
         started = time.perf_counter()
         try:
@@ -404,6 +475,7 @@ class ShoppingSearchEngine:
             )
             return text if ok else "", attempt
         except Exception as exc:
+            # Any transport error (or unknown method) becomes a failed attempt instead of propagating.
             return "", ShoppingProviderAttempt(
                 provider=provider.name,
                 lane=provider.lane,
@@ -414,6 +486,7 @@ class ShoppingSearchEngine:
                 error=f"{type(exc).__name__}: {exc}",
             )
 
+    # Fetch a URL with httpx (following redirects) and return the status code and body text.
     async def _fetch_httpx(self, url: str, timeout_sec: float) -> tuple[int, str]:
         async with httpx.AsyncClient(
             headers=HEADERS,
@@ -423,6 +496,8 @@ class ShoppingSearchEngine:
             response = await client.get(url)
         return response.status_code, response.text
 
+    # Fetch a URL with curl_cffi impersonating Chrome 124 (blocking call, run in a worker thread)
+    # and return the status code and body text.
     def _fetch_curl_cffi(self, url: str, timeout_sec: float) -> tuple[int, str]:
         from curl_cffi import requests as cffi_req
 
@@ -435,6 +510,10 @@ class ShoppingSearchEngine:
         )
         return int(response.status_code), response.text
 
+    # Merging
+
+    # Pick the primary and secondary quotas, top up to the total limit from the leftovers of
+    # either lane, and drop duplicates by URL (or id).
     def _merge_products(
         self,
         primary: list[ShoppingProduct],
@@ -459,6 +538,7 @@ class ShoppingSearchEngine:
                 break
         return out
 
+    # Merge the lanes' products and return them with the merge time in milliseconds.
     def _timed_merge(
         self,
         primary: list[ShoppingProduct],
@@ -471,11 +551,13 @@ class ShoppingSearchEngine:
         products = self._merge_products(primary, secondary, primary_limit, secondary_limit, total_limit)
         return products, int((time.perf_counter() - started) * 1000)
 
+    # Attach favicon URLs to the products and return the time taken in milliseconds.
     def _timed_attach_favicons(self, products: list[ShoppingProduct]) -> int:
         started = time.perf_counter()
         self._attach_favicons(products)
         return int((time.perf_counter() - started) * 1000)
 
+    # Drop products that repeat an earlier URL (or id), keeping the first occurrence.
     def _dedupe_products(self, products: list[ShoppingProduct]) -> list[ShoppingProduct]:
         seen: set[str] = set()
         out: list[ShoppingProduct] = []
@@ -487,12 +569,15 @@ class ShoppingSearchEngine:
             out.append(product)
         return out
 
+    # Set each product's favicon proxy URL from its source domain (derived from the URL if unset).
     def _attach_favicons(self, products: list[ShoppingProduct]) -> None:
         for product in products:
             domain = product.source_domain or source_domain(product.url)
             product.favicon_url = self.assets.favicon_proxy_url(domain)
 
 
+# Run one shopping search with a fresh engine, then convert the product prices with exchange
+# rates. The time spent on conversion is added to the reported timings.
 async def search_shopping(
     query: str,
     *,
@@ -516,6 +601,7 @@ async def search_shopping(
     return result
 
 
+# Convert a search result into plain JSON-serializable dicts and lists.
 def result_to_jsonable(result: ShoppingSearchResult) -> dict[str, Any]:
     return {
         "query": result.query,
@@ -534,12 +620,16 @@ def result_to_jsonable(result: ShoppingSearchResult) -> dict[str, Any]:
     }
 
 
+# Per-lane results (products, attempts, elapsed ms) collected while a search is running, so a
+# search cut short by the deadline can still use the lanes that finished.
 class _SearchBuffer:
+    # Create empty per-lane storage for the primary and secondary lanes.
     def __init__(self) -> None:
         self.products: dict[str, list[ShoppingProduct]] = {"primary": [], "secondary": []}
         self.attempts: dict[str, list[ShoppingProviderAttempt]] = {"primary": [], "secondary": []}
         self.elapsed_ms: dict[str, int] = {"primary": 0, "secondary": 0}
 
+    # Store the finished results of a lane.
     def update(
         self,
         lane: str,

@@ -12,6 +12,7 @@ from Settings import host_locale, host_theme
 pytestmark = [pytest.mark.unit]
 
 
+# Redirect the host locale snapshot to a temporary file and return its path.
 @pytest.fixture
 def isolated_locale_file(tmp_path, monkeypatch):
     path = tmp_path / "host_locale.json"
@@ -19,6 +20,7 @@ def isolated_locale_file(tmp_path, monkeypatch):
     return path
 
 
+# Redirect the host theme snapshot to a temporary file and return its path.
 @pytest.fixture
 def isolated_theme_file(tmp_path, monkeypatch):
     path = tmp_path / "host_theme.json"
@@ -26,10 +28,10 @@ def isolated_theme_file(tmp_path, monkeypatch):
     return path
 
 
-# Locale normalization.
+# Locale normalization
 
-
-# Language normalization maps host codes onto supported values.
+# Verify that host language codes are normalized to the supported values: case is ignored, region and script
+# parts get their canonical casing, and unknown or blank codes fall back to English.
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
@@ -47,10 +49,10 @@ def test_normalize_host_language(raw, expected):
     assert host_locale.normalize_host_language(raw) == expected
 
 
-# Locale snapshots.
+# Locale snapshots
 
-
-# The locale snapshot round-trips through disk.
+# Verify that a saved locale snapshot is written to disk and read back unchanged, including its language and
+# display name.
 def test_host_locale_roundtrip(isolated_locale_file):
     payload = {"language": "de", "displayName": "Deutsch"}
 
@@ -62,14 +64,14 @@ def test_host_locale_roundtrip(isolated_locale_file):
     assert host_locale.get_display_name() == "Deutsch"
 
 
-# Atomic writes leave no temporary file behind.
+# Verify that saving a locale snapshot leaves no temporary .tmp file next to the snapshot.
 def test_atomic_write_leaves_no_temp_file(isolated_locale_file):
     host_locale.save_host_locale_payload({"language": "en"})
 
     assert not isolated_locale_file.with_name("host_locale.json.tmp").exists()
 
 
-# Rejecting non-dict payloads keeps the previous snapshot intact.
+# Verify that saving a non-dict locale payload raises TypeError and keeps the previous snapshot intact.
 def test_save_host_locale_rejects_non_dict(isolated_locale_file):
     host_locale.save_host_locale_payload({"language": "ru"})
 
@@ -79,14 +81,15 @@ def test_save_host_locale_rejects_non_dict(isolated_locale_file):
     assert host_locale.get_language() == "ru"
 
 
-# A missing snapshot degrades to English defaults.
+# Verify that without a locale snapshot the language defaults to English and there is no display name.
 def test_missing_locale_snapshot_defaults_to_english(isolated_locale_file):
     assert host_locale.load_host_locale() is None
     assert host_locale.get_language() == "en"
     assert host_locale.get_display_name() is None
 
 
-# A corrupt or non-object snapshot file is ignored rather than raised.
+# Verify that a locale snapshot file that is corrupt or not a JSON object is ignored instead of raising, and the
+# language falls back to English.
 @pytest.mark.parametrize("content", ["{broken", "[1, 2]", '"text"'])
 def test_invalid_locale_snapshot_is_ignored(isolated_locale_file, content):
     isolated_locale_file.write_text(content, encoding="utf-8")
@@ -95,7 +98,7 @@ def test_invalid_locale_snapshot_is_ignored(isolated_locale_file, content):
     assert host_locale.get_language() == "en"
 
 
-# A UTF-8 BOM prefix (written by some host processes) is tolerated.
+# Verify that a locale snapshot with a UTF-8 BOM prefix (written by some host processes) is still parsed.
 def test_locale_snapshot_with_bom_is_parsed(isolated_locale_file):
     isolated_locale_file.write_text(
         "﻿" + json.dumps({"language": "fr", "displayName": "Français"}),
@@ -106,17 +109,16 @@ def test_locale_snapshot_with_bom_is_parsed(isolated_locale_file):
     assert host_locale.get_display_name() == "Français"
 
 
-# An empty displayName is reported as absent.
+# Verify that a blank displayName is reported as absent.
 def test_blank_display_name_is_absent(isolated_locale_file):
     host_locale.save_host_locale_payload({"language": "en", "displayName": "   "})
 
     assert host_locale.get_display_name() is None
 
 
-# Theme snapshots.
+# Theme snapshots
 
-
-# The theme snapshot round-trips and degrades gracefully like the locale one.
+# Verify that a missing theme snapshot loads as None and a saved one is read back unchanged.
 def test_host_theme_roundtrip_and_missing_file(isolated_theme_file):
     assert host_theme.load_host_theme() is None
 
@@ -126,7 +128,7 @@ def test_host_theme_roundtrip_and_missing_file(isolated_theme_file):
     assert host_theme.load_host_theme() == payload
 
 
-# Non-dict theme payloads are rejected outright.
+# Verify that saving a non-dict theme payload raises TypeError and stores nothing.
 def test_host_theme_rejects_non_dict(isolated_theme_file):
     with pytest.raises(TypeError):
         host_theme.save_host_theme_payload("dark")
@@ -134,7 +136,7 @@ def test_host_theme_rejects_non_dict(isolated_theme_file):
     assert host_theme.load_host_theme() is None
 
 
-# A corrupt theme snapshot is ignored rather than raised.
+# Verify that a corrupt theme snapshot file loads as None instead of raising.
 def test_invalid_theme_snapshot_is_ignored(isolated_theme_file):
     isolated_theme_file.write_text("{broken", encoding="utf-8")
 

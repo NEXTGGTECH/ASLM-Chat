@@ -14,28 +14,38 @@ from core.read import service as read_service
 from custom_domains import GenericRequest
 
 
+# Fake page cache that never has an entry and ignores writes.
 class _Cache:
+    # Report that nothing is cached.
     def get_cached(self, _key):
         return None
 
+    # Report that no entry is fresh.
     def is_fresh(self, _key):
         return False
 
+    # Ignore the page that would be cached.
     def cache_page(self, *_args, **_kwargs):
         return None
 
 
+# Fake profile store that records fetch attempts and ignores reputation updates.
 class _Profiles:
+    # Start with no recorded attempts.
     def __init__(self):
         self.attempts = []
 
+    # Remember the attempt made for the URL.
     def record(self, url, attempt):
         self.attempts.append((url, attempt))
 
+    # Ignore the reputation update.
     def record_reputation(self, *_args, **_kwargs):
         return None
 
 
+# Build a ReadPageService without running its constructor, wired to the fake cache and profiles, with
+# the browser fallback allowed and no domain-specific fetch strategy.
 def _service() -> read_service.ReadPageService:
     service = read_service.ReadPageService.__new__(read_service.ReadPageService)
     service._cfg = SimpleNamespace(extraction=SimpleNamespace(min_content_length=40))
@@ -46,16 +56,21 @@ def _service() -> read_service.ReadPageService:
     return service
 
 
+# Verify that an empty HTTP response (status 402) is retried through the browser, and that the
+# browser's content becomes the successful result with the browser method.
 def test_empty_http_response_retries_through_browser(monkeypatch):
     service = _service()
     calls = []
 
+    # Return an empty HTTP response with status 402.
     async def fetch_candidate(_url, **_kwargs):
         return read_service.RawFetch(None, METHOD_HTTPX, status=402), None
 
+    # Report the browser as usable.
     async def browser_ok():
         return True
 
+    # Record the URL and return a page fetched through the browser.
     async def fetch_browser(url, _timeout):
         calls.append(url)
         html = "<html><body>browser content</body></html>"
@@ -75,16 +90,21 @@ def test_empty_http_response_retries_through_browser(monkeypatch):
     assert calls == ["https://example.com/page"]
 
 
+# Verify that when the first attempt already went through the browser and came back empty, the browser
+# fallback is not run a second time and the read fails.
 def test_empty_browser_first_response_is_not_retried(monkeypatch):
     service = _service()
     browser_calls = []
 
+    # Return an empty response from the browser method.
     async def fetch_candidate(_url, **_kwargs):
         return read_service.RawFetch(None, METHOD_BROWSER, "chromium", 0), None
 
+    # Report the browser as usable.
     async def browser_ok():
         return True
 
+    # Fail the test if the browser fallback runs again.
     async def fetch_browser(_url, _timeout):
         browser_calls.append(_url)
         raise AssertionError("browser fallback must not run twice")
@@ -99,15 +119,20 @@ def test_empty_browser_first_response_is_not_retried(monkeypatch):
     assert browser_calls == []
 
 
+# Verify that when the browser fallback also returns nothing, the failure message keeps the original
+# HTTP status (402) instead of the browser's.
 def test_failed_browser_fallback_keeps_original_http_status(monkeypatch):
     service = _service()
 
+    # Return an empty HTTP response with status 402.
     async def fetch_candidate(_url, **_kwargs):
         return read_service.RawFetch(None, METHOD_HTTPX, status=402), None
 
+    # Report the browser as usable.
     async def browser_ok():
         return True
 
+    # Return an empty browser response with status 0.
     async def fetch_browser(url, _timeout):
         return read_service.RawFetch(None, METHOD_BROWSER, "chromium", 0), None
 
@@ -121,7 +146,8 @@ def test_failed_browser_fallback_keeps_original_http_status(monkeypatch):
     assert result.markdown.endswith("(HTTP 402)")
 
 
-# Preserve short but valid Onion content instead of treating the quality threshold as emptiness.
+# Verify that short but valid Onion content stays a success with a "very little content" note, instead
+# of the quality threshold being treated as emptiness.
 def test_short_onion_page_remains_a_success(monkeypatch):
     service = _service()
     service._cfg = SimpleNamespace(extraction=SimpleNamespace(min_content_length=800))

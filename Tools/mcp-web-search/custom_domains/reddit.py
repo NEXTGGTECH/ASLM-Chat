@@ -13,10 +13,13 @@ from custom_domains.reddit_parse import try_extract_markdown
 
 logger = logging.getLogger("custom_domains.reddit")
 
+# Matches a Reddit thread comments page URL (any host variant of reddit.com).
 _REDDIT_PATTERN = re.compile(r"reddit\.com/r/[^/]+/comments/")
 
 
-# True when URL looks like a Reddit thread comments page.
+# URL helpers
+
+# Return True when the URL looks like a Reddit thread comments page.
 def is_reddit(url: str) -> bool:
     return bool(_REDDIT_PATTERN.search(url))
 
@@ -41,9 +44,13 @@ def reddit_thread_url(url: str, host: str | None = None) -> str:
     return urlunparse((parsed.scheme, host or parsed.netloc, path, "", "", ""))
 
 
-# Format Reddit thread JSON as markdown (post + nested comments).
+# Content extraction
+
+# Format Reddit thread JSON as markdown (post + nested comments), capped at 15,000 characters.
 def reddit_data_to_markdown(data: list[Any], url: str) -> str:
     lines: list[str] = []
+
+    # Post header: subreddit, author, score, title and self text.
     try:
         post = data[0]["data"]["children"][0]["data"]
     except (IndexError, KeyError, TypeError):
@@ -54,6 +61,8 @@ def reddit_data_to_markdown(data: list[Any], url: str) -> str:
         lines.append(post["selftext"])
     lines.append("")
 
+    # Append the comments (kind "t1") indented by depth and recurse into their replies; deleted
+    # and empty bodies are skipped.
     def _comments(children: list, depth: int = 0) -> None:
         for child in children:
             if child.get("kind") != "t1":
@@ -69,6 +78,7 @@ def reddit_data_to_markdown(data: list[Any], url: str) -> str:
             if isinstance(replies, dict):
                 _comments(replies["data"]["children"], depth + 1)
 
+    # The second listing of the thread JSON holds the top-level comments.
     if len(data) > 1:
         _comments(data[1]["data"]["children"])
 
@@ -106,7 +116,10 @@ def _strip_reddit_nav(text: str) -> str:
     return text[m.start() :].strip() if m else text
 
 
-# Fetch thread JSON via curl_cffi TLS impersonation.
+# Fetching
+
+# Fetch thread JSON via curl_cffi TLS impersonation (blocking). Return None when the response is
+# not a listing array.
 def _fetch_reddit_json_curl(json_url: str, thread_url: str, timeout: float) -> list[Any] | None:
     from curl_cffi import requests as _r
 
@@ -134,6 +147,7 @@ def _fetch_reddit_json_curl(json_url: str, thread_url: str, timeout: float) -> l
 async def _fetch_reddit_browser_page(thread_url: str, timeout: float) -> str | None:
     from core.fetch.browser.client import browser_fetch
 
+    # Render the page; a failed render ends this path.
     result = await browser_fetch(thread_url, nav_timeout=max(float(timeout), 30.0), wait_sec=5.0)
     if not result.ok:
         logger.debug(
@@ -141,6 +155,7 @@ async def _fetch_reddit_browser_page(thread_url: str, timeout: float) -> str | N
         )
         return None
 
+    # Path 1: structural parse of the HTML, accepted only when it yields substantial content.
     if result.html:
         try:
             markdown = try_extract_markdown(result.html, thread_url)
@@ -150,6 +165,7 @@ async def _fetch_reddit_browser_page(thread_url: str, timeout: float) -> str | N
         if markdown and len(markdown) >= 200:
             return markdown
 
+    # Path 2: the visible text with navigation and footer cruft removed.
     text = _strip_reddit_nav(result.text or "")
     if len(text.strip()) < 200:
         logger.debug("reddit browser inner_text too short (%d chars) for %s", len(text), thread_url)
@@ -157,12 +173,13 @@ async def _fetch_reddit_browser_page(thread_url: str, timeout: float) -> str | N
     return text
 
 
-# Fetch a thread; two methods only, ordered to look like a human before touching the API:
+# Fetch a thread and return its markdown or an "Error: ..." string. Two methods only, ordered to
+# look like a human before touching the API:
 #   1. warm-browser page (old.reddit) — a normal user browsing the light host; works even
 #      when the IP is rate-limited, and doesn't feed the antibot extra .json suspicion
 #   2. curl_cffi .json               — the public API, structured fallback (post score +
 #      nested comments); host is irrelevant — www and old .json behave identically, and
-#      a rate-limited IP loses both, which is exactly why the page render goes first
+#      a rate-limited IP loses both, which is exactly why the page render goes first.
 async def fetch_reddit_json(url: str, timeout: float = 15.0) -> str:
     # 1. Render the old.reddit thread page and strip its nav header.
     try:
@@ -188,6 +205,8 @@ async def fetch_reddit_json(url: str, timeout: float = 15.0) -> str:
     return f"Error: Reddit fetch failed for {url}"
 
 
+# Handler
+
 from custom_domains.base import FetchContext, PageResult
 
 # Reddit needs room for a warm-browser render of the thread page + the .json fallback.
@@ -198,9 +217,10 @@ _REDDIT_READ_TIMEOUT_SEC = 60.0
 class RedditHandler:
     name = "reddit"
     fallback_to_generic = False
-    scope = "read_page"  # browser/JSON path too slow for web_search inline parsing
+    # The browser/JSON path is too slow for web_search inline parsing.
+    scope = "read_page"
 
-    # True for Reddit thread comment URLs.
+    # Return True for Reddit thread comment URLs.
     def matches(self, url: str) -> bool:
         return is_reddit(url)
 
@@ -218,4 +238,5 @@ class RedditHandler:
         )
 
 
+# Handler instance registered in custom_domains/__init__.py.
 HANDLER = RedditHandler()

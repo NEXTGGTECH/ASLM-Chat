@@ -6,6 +6,8 @@ import shutil
 from pathlib import Path
 from unittest.mock import patch
 
+# Package root of mcp-sandbox; its sandbox source directory is put on sys.path and the host workspace is
+# set at import time so the sandbox package can be imported.
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 os.environ["SANDBOX_HOST_WORKSPACE"] = str(ROOT)
@@ -27,9 +29,12 @@ def setup():
             else:
                 c.unlink(missing_ok=True)
         except Exception:
+            # Skip entries that cannot be removed (for example locked files); the cleanup is best effort.
             pass
 
 
+# Verify that a plain cat of a file above the cat size limit (50KB) returns a structured preview with a
+# file header and a [next] suggestions marker.
 def test_large_file_auto_preview():
     # Must exceed MAX_CAT_FILE_BYTES (50KB) to trigger auto-preview
     content = "\n".join(f"def func_{i}(arg): return arg + {i}" for i in range(1, 4001))
@@ -42,6 +47,7 @@ def test_large_file_auto_preview():
     assert "[next]" in stdout, "Missing next suggestions"
 
 
+# Verify that a plain cat of a small file returns exactly its content, with no preview header.
 def test_small_file_metadata_header():
     handle_tool("write", {"path": "small.txt", "content": "hello\nworld\n"})
     result = handle_tool("bash", {"command": "cat small.txt"})
@@ -51,6 +57,8 @@ def test_small_file_metadata_header():
     assert stdout == "hello\nworld\n"
 
 
+# Verify that `head -n 5` is executed by real bash (exec_bash mock) and not routed: its output is returned
+# unchanged.
 def test_head_metadata():
     content = "\n".join(f"line{i}" for i in range(1, 101))
     handle_tool("write", {"path": "lines.txt", "content": content})
@@ -75,6 +83,8 @@ def test_head_metadata():
     assert not result["result"].get("routed", False)
 
 
+# Verify that a recursive case-insensitive grep over a few files is executed by real bash (exec_bash
+# mock) and not routed.
 def test_grep_with_few_results():
     handle_tool("write", {"path": "src/main.py", "content": "print('hello')\n"})
     handle_tool("write", {"path": "src/other.txt", "content": "HELLO\n"})
@@ -98,6 +108,7 @@ def test_grep_with_few_results():
     assert not result["result"].get("routed", False)
 
 
+# Verify that a recursive grep over 40 files falls through to real bash (exec_bash mock) and is not routed.
 def test_grep_falls_through_to_real_bash_with_many_files():
     # Grep is not routed through the legacy intent controller; exec_bash handles it.
     for i in range(40):
@@ -123,5 +134,3 @@ def test_grep_falls_through_to_real_bash_with_many_files():
     stdout = result["result"]["stdout"]
     assert "foo" in stdout
     assert not result["result"].get("routed", False)
-
-

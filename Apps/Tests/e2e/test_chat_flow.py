@@ -15,7 +15,8 @@ from Apps.Tests.fakes.ollama_server import ollama_server  # noqa: F401 - registe
 pytestmark = [pytest.mark.e2e]
 
 
-# Shared fixture stack: fake Ollama runtime wired into real settings.
+# Provide the shared fixture stack: the fake Ollama server wired into real (isolated) settings.
+# Yield the fake server.
 @pytest.fixture
 def chat_backend(ollama_server, isolated_settings, db):
     from Settings import settings as project_settings
@@ -24,6 +25,7 @@ def chat_backend(ollama_server, isolated_settings, db):
         {"ollama-service": True, "ollama-service_port": ollama_server.port},
         sync_tool_configs=False,
     )
+
     # Only the process-manager boundary is faked; generation flows through
     # the real llm_api dispatch into API.ollama and the fake HTTP server.
     with (
@@ -34,7 +36,7 @@ def chat_backend(ollama_server, isolated_settings, db):
         yield ollama_server
 
 
-# Post one chat request through the Django test client.
+# Post one chat request as JSON to the chat API through the Django test client.
 def _post_chat(payload: dict):
     from django.test import Client
 
@@ -46,20 +48,23 @@ def _post_chat(payload: dict):
     )
 
 
-# Full chat cycle.
+# Full chat cycle
 
-
-# A new chat streams its answer and persists the turn pair.
+# Verify that a new chat streams the engine answer and persists the user and assistant messages.
 def test_chat_api_full_flow_persists_streamed_answer(chat_backend):
+    # Arrange: the fake engine answers with two text chunks.
     chat_backend.enqueue_text("Hello ", "from fake Ollama")
 
+    # Act: send the first message of a new chat.
     response = _post_chat({"message": "Hi there", "model": "fake-model", "engine": "ollama-service"})
 
+    # Assert: the streamed body carries both chunks.
     assert response.status_code == 200
     body = b"".join(response.streaming_content).decode("utf-8")
     assert "Hello " in body
     assert "from fake Ollama" in body
 
+    # Assert: the chat holds the user message and the full assistant answer.
     chat_id = response.headers.get("X-Chat-ID")
     assert chat_id
     chat = Chat.objects.get(id=chat_id)
@@ -74,7 +79,8 @@ def test_chat_api_full_flow_persists_streamed_answer(chat_backend):
     assert request["messages"][-1]["content"] == "Hi there"
 
 
-# A second turn appends to the existing chat.
+# Verify that a second message sent with the chat id appends to the existing chat and persists the
+# second assistant answer.
 def test_chat_api_second_turn_appends_to_existing_chat(chat_backend):
     chat_backend.enqueue_text("First answer")
     first = _post_chat({"message": "One", "model": "fake-model", "engine": "ollama-service"})
@@ -85,6 +91,7 @@ def test_chat_api_second_turn_appends_to_existing_chat(chat_backend):
 
     assert second.status_code == 200
     assert second.headers.get("X-Chat-ID") == chat_id
+
     # The stream must be consumed for the final assistant message to persist.
     body = b"".join(second.streaming_content).decode("utf-8")
     assert "Second answer" in body
@@ -96,10 +103,9 @@ def test_chat_api_second_turn_appends_to_existing_chat(chat_backend):
     assert "Second answer" in contents[3][1]
 
 
-# Request validation.
+# Request validation
 
-
-# Disabled engines are rejected before any chat or message is created.
+# Verify that a disabled engine is rejected with a 400 before any chat or message is created.
 def test_chat_api_rejects_disabled_engine(chat_backend, isolated_settings):
     from Settings import settings as project_settings
 
@@ -112,7 +118,7 @@ def test_chat_api_rejects_disabled_engine(chat_backend, isolated_settings):
     assert Chat.objects.count() == 0
 
 
-# A missing model is rejected before any chat or message is created.
+# Verify that a request without a model is rejected with a 400 before any chat is created.
 def test_chat_api_rejects_missing_model(chat_backend):
     response = _post_chat({"message": "Hi", "engine": "ollama-service"})
 
@@ -120,10 +126,10 @@ def test_chat_api_rejects_missing_model(chat_backend):
     assert Chat.objects.count() == 0
 
 
-# Failure handling.
+# Failure handling
 
-
-# An unreachable engine surfaces inside the stream, not as a crashed request.
+# Verify that an unreachable engine surfaces as an error inside the 200 stream instead of a crashed
+# request.
 def test_chat_api_streams_error_when_engine_unreachable(chat_backend):
     chat_backend.stop()
 
