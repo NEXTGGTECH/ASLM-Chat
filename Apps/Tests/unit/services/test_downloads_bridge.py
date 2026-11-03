@@ -14,6 +14,8 @@ from Services import downloads_bridge
 pytestmark = [pytest.mark.unit]
 
 
+# Ollama library search page fixture: one valid model card, a tag deep link and a non-library link
+# (the last two must be skipped by the parser).
 SEARCH_PAGE_HTML = """
 <html><body>
 <ul role="list">
@@ -42,6 +44,8 @@ SEARCH_PAGE_HTML = """
 """
 
 
+# Ollama model page fixture: summary, meta counters, a desktop variant grid with a mobile-only row
+# whose metadata backfills the empty desktop columns, and the readme editor with no "latest" tag.
 DETAIL_PAGE_HTML = """
 <html><head><title>Llama 3.2 - Ollama</title></head><body>
 <textarea id="summary-textarea">Llama 3.2 summary text</textarea>
@@ -78,10 +82,10 @@ def _variant(key: str, title: str) -> dict:
     return {"resourceKey": key, "title": title}
 
 
-# Query normalization.
+# Query normalization
 
-
-# Mixed filter keys split into sort and capability groups.
+# Verify that mixed filter keys are split into one sort key and a de-duplicated, sorted capability
+# tuple, and that unknown keys are ignored.
 def test_normalize_search_query_splits_sort_and_capability_filters():
     query = downloads_bridge._normalize_search_query(
         "  code models  ",
@@ -93,7 +97,7 @@ def test_normalize_search_query_splits_sort_and_capability_filters():
     assert query.capabilities == ("tools", "vision")
 
 
-# An empty query normalizes to the default sort.
+# Verify that an empty query without filters normalizes to the default sort and no capabilities.
 def test_normalize_search_query_defaults_to_recent_sort():
     query = downloads_bridge._normalize_search_query("", [])
 
@@ -102,7 +106,8 @@ def test_normalize_search_query_defaults_to_recent_sort():
     assert query.capabilities == ()
 
 
-# Query parameters encode text, capabilities, and non-default sorts.
+# Verify that search parameters encode the query text, each capability and a non-default sort, and
+# that the default sort is not sent.
 def test_build_search_params_encodes_query_filters_and_sort():
     params = downloads_bridge._build_search_params(
         downloads_bridge._normalize_search_query(
@@ -124,10 +129,10 @@ def test_build_search_params_encodes_query_filters_and_sort():
     assert ("o", "popular") not in default_params
 
 
-# Resource keys.
+# Resource keys
 
-
-# Variant resource keys build and split symmetrically.
+# Verify that variant resource keys are built with and without a tag and split back into the model
+# slug.
 def test_variant_resource_key_roundtrip():
     assert downloads_bridge._variant_resource_key("llama3.2", "3b") == "ollama:llama3.2:3b"
     assert downloads_bridge._variant_resource_key("llama3.2", "") == "ollama:llama3.2"
@@ -135,10 +140,10 @@ def test_variant_resource_key_roundtrip():
     assert downloads_bridge._resource_key_to_slug("plain") == "plain"
 
 
-# Size parsing.
+# Size parsing
 
-
-# Size text parses across units and rejects junk.
+# Verify that size text parses to bytes across decimal and binary units and that junk or empty text
+# yields None.
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
@@ -154,10 +159,10 @@ def test_parse_size_bytes(raw, expected):
     assert downloads_bridge._parse_size_bytes(raw) == expected
 
 
-# Platform variant filtering.
+# Platform variant filtering
 
-
-# MLX detection covers the common tag shapes.
+# Verify that MLX detection recognizes common tag shapes in model references and variant records
+# (including None).
 def test_mlx_detection_covers_common_tag_shapes():
     assert downloads_bridge._is_mlx_model_ref("ollama:gemma4:12b-mlx") is True
     assert downloads_bridge._is_mlx_model_ref("mlx") is True
@@ -169,7 +174,8 @@ def test_mlx_detection_covers_common_tag_shapes():
     assert downloads_bridge._variant_is_mlx(None) is False
 
 
-# Host platform filtering keeps only matching variants.
+# Verify that host filtering keeps only the classic variants (and renumbers their sort order) on
+# hosts that do not want MLX, and only the MLX variants on hosts that do.
 def test_filter_variants_for_host_keeps_matching_platform(monkeypatch):
     variants = [
         _variant("ollama:m:12b", "12b"),
@@ -188,7 +194,8 @@ def test_filter_variants_for_host_keeps_matching_platform(monkeypatch):
     assert mlx[0]["sortOrder"] == 0
 
 
-# The default variant prefers the "latest" tag.
+# Verify that the default variant is the "latest" tag when present, otherwise the only variant, and
+# an empty key for no variants.
 def test_select_default_variant_prefers_latest():
     variants = [_variant("ollama:m:12b", "12b"), _variant("ollama:m:latest", "latest")]
     assert downloads_bridge._select_default_variant_key(variants) == "ollama:m:latest"
@@ -197,10 +204,10 @@ def test_select_default_variant_prefers_latest():
     assert downloads_bridge._select_default_variant_key([]) == ""
 
 
-# Search page parsing.
+# Search page parsing
 
-
-# The current card markup parses with meta counters and capability chips.
+# Verify that the current card markup parses into one item with its meta counters and capability
+# chips while tag deep links and non-library links are skipped.
 def test_parse_search_items_reads_current_markup():
     items = downloads_bridge._parse_search_items(_parse(SEARCH_PAGE_HTML))
 
@@ -220,28 +227,31 @@ def test_parse_search_items_reads_current_markup():
     assert "5 weeks ago" in details_text
 
 
-# Foreign markup yields no items instead of raising.
+# Verify that markup without model cards yields no items instead of raising.
 def test_parse_search_items_returns_empty_for_foreign_markup():
     assert downloads_bridge._parse_search_items(_parse("<html><body><p>nothing</p></body></html>")) == []
 
 
-# Model page parsing.
+# Model page parsing
 
-
-# The model page yields meta, variants (with mobile fallback), and readme.
+# Verify that the model page parses into the item meta, its variants (with the mobile-row fallback
+# for missing columns) and the readme markdown block.
 def test_parse_item_detail_extracts_meta_variants_and_readme():
     detail = downloads_bridge._parse_item_detail("llama3.2", DETAIL_PAGE_HTML)
 
+    # Item meta.
     assert detail["resourceKey"] == "ollama:llama3.2"
     assert detail["title"] == "Llama 3.2 - Ollama"
     assert detail["summary"] == "Llama 3.2 summary text"
     assert detail["homepageUrl"] == "https://ollama.com/library/llama3.2"
 
+    # Variants.
     variants = detail["variants"]
     assert [variant["title"] for variant in variants] == ["3b", "1b"]
     by_title = {variant["title"]: variant for variant in variants}
     assert by_title["3b"]["size"] == 2_000_000_000
     assert by_title["3b"]["summary"] == "3B params"
+
     # Missing desktop columns are backfilled from the mobile row metadata.
     assert by_title["1b"]["size"] == 1_300_000_000
     assert by_title["1b"]["summary"] == "1B params"
@@ -249,6 +259,7 @@ def test_parse_item_detail_extracts_meta_variants_and_readme():
     # No "latest" tag exists on the fixture page, so the first variant wins.
     assert detail["defaultVariantResourceKey"] == "ollama:llama3.2:3b"
 
+    # Meta counters and the readme block.
     details_text = json.dumps(detail["details"])
     assert "18.7M" in details_text
     assert "2 weeks ago" in details_text
@@ -258,7 +269,8 @@ def test_parse_item_detail_extracts_meta_variants_and_readme():
     assert "Llama 3.2 README body." in readme_block["content"]
 
 
-# Legacy quick-start blocks are dropped from cached details.
+# Verify that the legacy quick-start block is dropped from cached detail payloads and other blocks
+# stay.
 def test_sanitize_detail_payload_drops_legacy_quick_start_block():
     detail = {
         "blocks": [
@@ -272,10 +284,10 @@ def test_sanitize_detail_payload_drops_legacy_quick_start_block():
     assert [block["id"] for block in sanitized["blocks"]] == ["readme"]
 
 
-# Install manifests.
+# Install manifests
 
-
-# Install manifests target an ollama pull action.
+# Verify that an install manifest carries the resource key and one ollama_pull action for the model
+# tag.
 def test_install_manifest_targets_ollama_pull():
     manifest = downloads_bridge._build_install_manifest("ollama:llama3.2:3b")
 
@@ -285,7 +297,7 @@ def test_install_manifest_targets_ollama_pull():
     assert action["model"] == "llama3.2:3b"
 
 
-# Uninstall manifests target an ollama remove action.
+# Verify that an uninstall manifest holds one ollama_remove action for the model.
 def test_uninstall_manifest_targets_ollama_remove():
     manifest = downloads_bridge._build_uninstall_manifest("ollama:llama3.2")
 
@@ -293,7 +305,8 @@ def test_uninstall_manifest_targets_ollama_remove():
     assert manifest["actions"][0]["model"] == "llama3.2"
 
 
-# MLX builds are rejected on classic-only hosts.
+# Verify that installing an MLX build is rejected on a host that does not want MLX variants, while a
+# family-level key stays installable.
 def test_install_rejects_mlx_build_on_classic_host(monkeypatch):
     monkeypatch.setattr(downloads_bridge, "_host_wants_mlx_variants", lambda: False)
 
@@ -304,16 +317,15 @@ def test_install_rejects_mlx_build_on_classic_host(monkeypatch):
     assert downloads_bridge._build_install_manifest("ollama:gemma4")["title"] == "gemma4"
 
 
-# An empty resource key fails with a clear error.
+# Verify that building a manifest from an empty resource key raises a ValueError naming resourceKey.
 def test_build_manifest_requires_resource_key():
     with pytest.raises(ValueError, match="resourceKey"):
         downloads_bridge._build_install_manifest("")
 
 
-# Dispatch contract.
+# Dispatch contract
 
-
-# list_categories answers with the static Ollama category.
+# Verify that the list_categories operation answers with the single static Ollama category.
 def test_dispatch_lists_categories():
     response = downloads_bridge.dispatch({"operation": "list_categories"})
 
@@ -323,7 +335,7 @@ def test_dispatch_lists_categories():
     assert categories[0]["id"] == downloads_bridge.OLLAMA_CATEGORY_ID
 
 
-# Unknown operations and categories fail with explicit errors.
+# Verify that an unknown operation and an unknown category id each fail with an explicit error.
 def test_dispatch_rejects_unknown_operations_and_categories():
     response = downloads_bridge.dispatch({"operation": "teleport"})
     assert response["success"] is False
@@ -334,7 +346,7 @@ def test_dispatch_rejects_unknown_operations_and_categories():
     assert "Unsupported categoryId" in response["error"]
 
 
-# list_items delegates to the search loader with normalized flags.
+# Verify that the list_items operation delegates to the search loader and returns its items.
 def test_dispatch_list_items_delegates_to_search_loader(monkeypatch):
     monkeypatch.setattr(
         downloads_bridge,
@@ -359,7 +371,8 @@ def test_dispatch_list_items_delegates_to_search_loader(monkeypatch):
     assert response["items"][0]["resourceKey"] == "ollama:llama3.2"
 
 
-# describe_item requires a resource key and delegates to the detail loader.
+# Verify that the describe_item operation fails without a resource key and otherwise delegates to the
+# detail loader.
 def test_dispatch_describe_item_requires_resource_key(monkeypatch):
     response = downloads_bridge.dispatch(
         {"operation": "describe_item", "categoryId": downloads_bridge.OLLAMA_CATEGORY_ID}
@@ -383,7 +396,7 @@ def test_dispatch_describe_item_requires_resource_key(monkeypatch):
     assert response["itemDetail"]["resourceKey"] == "ollama:llama3.2"
 
 
-# resolve_install and resolve_uninstall answer with their manifests.
+# Verify that resolve_install and resolve_uninstall answer with the pull and remove manifests.
 def test_dispatch_resolve_operations_produce_manifests():
     install = downloads_bridge.dispatch(
         {
@@ -404,10 +417,9 @@ def test_dispatch_resolve_operations_produce_manifests():
     assert uninstall["uninstallManifest"]["actions"][0]["type"] == "ollama_remove"
 
 
-# CLI contract.
+# CLI contract
 
-
-# run_cli answers one stdin request with one JSON response line.
+# Verify that run_cli answers one stdin request with one JSON response line and exit code 0.
 def test_run_cli_answers_single_request(monkeypatch, capsys):
     monkeypatch.setattr(
         sys, "stdin", io.StringIO(json.dumps({"operation": "list_categories"}) + "\n")
@@ -421,7 +433,8 @@ def test_run_cli_answers_single_request(monkeypatch, capsys):
     assert response["categories"][0]["id"] == downloads_bridge.OLLAMA_CATEGORY_ID
 
 
-# Errors surface as failed responses, not as crashes.
+# Verify that run_cli reports an unsupported operation as a failed response with exit code 0 instead
+# of crashing.
 def test_run_cli_reports_errors_as_failed_response(monkeypatch, capsys):
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({"operation": "nope"}) + "\n"))
 
@@ -433,7 +446,8 @@ def test_run_cli_reports_errors_as_failed_response(monkeypatch, capsys):
     assert "Unsupported downloads bridge operation" in response["error"]
 
 
-# Empty, broken, and valid stdin map to {}, {}, and the parsed document.
+# Verify that empty and broken stdin read as an empty request and valid JSON stdin as the parsed
+# document.
 def test_read_request_tolerates_empty_and_broken_input(monkeypatch):
     monkeypatch.setattr(sys, "stdin", io.StringIO(""))
     assert downloads_bridge._read_request() == {}

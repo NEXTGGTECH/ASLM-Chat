@@ -14,7 +14,11 @@ from Services import github_html_fallback, user_mcp_client
 pytestmark = [pytest.mark.unit]
 
 
+# Cover the GitHub public HTML search fallback: URL building, result parsing and its use by the
+# user MCP client after an API rate limit.
 class GitHubHtmlFallbackTests(SimpleTestCase):
+    # Verify that the search URL keeps the query text, repository scope, issue type, sort, order and
+    # page.
     def test_build_url_preserves_query_scope_and_sort(self):
         url = github_html_fallback.build_github_html_search_url(
             "search_issues",
@@ -34,6 +38,8 @@ class GitHubHtmlFallbackTests(SimpleTestCase):
         self.assertIn("o=desc", url)
         self.assertIn("p=2", url)
 
+    # Verify that repository search results are parsed from public HTML into absolute GitHub URLs and
+    # snippets.
     def test_parse_repository_results_from_public_html(self):
         html = """
         <div data-testid="results-list">
@@ -59,6 +65,8 @@ class GitHubHtmlFallbackTests(SimpleTestCase):
         ])
         self.assertIn("Lightweight coding agent", results[0]["snippet"])
 
+    # Verify that a GitHub MCP search call that hits the API rate limit returns the HTML fallback result
+    # produced for the same tool name and arguments.
     @patch.object(github_html_fallback, "search_github_html")
     @patch.object(user_mcp_client._session_manager, "request")
     def test_github_mcp_search_uses_html_only_after_rate_limit(
@@ -87,6 +95,8 @@ class GitHubHtmlFallbackTests(SimpleTestCase):
             {"query": "deep research"},
         )
 
+    # Verify that a rate-limited GitHub call that is not a search (create_issue) returns the API
+    # message and never uses the HTML fallback.
     @patch.object(github_html_fallback, "search_github_html")
     @patch.object(user_mcp_client._session_manager, "request")
     def test_non_search_github_call_does_not_use_html_fallback(
@@ -107,4 +117,3 @@ class GitHubHtmlFallbackTests(SimpleTestCase):
 
         self.assertIn("API rate limit exceeded", result)
         fallback_mock.assert_not_called()
-

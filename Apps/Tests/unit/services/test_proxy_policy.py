@@ -15,13 +15,16 @@ from Settings.proxy_policy import apply_loopback_proxy_bypass, build_proxy_envir
 pytestmark = [pytest.mark.unit]
 
 
-# Verify loopback proxy bypass configuration and transport behavior.
+# Cover the loopback proxy bypass configuration and the transport behavior built on it.
 class LoopbackProxyPolicyTests(SimpleTestCase):
-    # Start a small HTTP server that identifies which endpoint received a request.
+    # Start a small HTTP server on a free localhost port that answers every GET with its label and
+    # records the request paths; return the server, its thread and the recorded paths.
     def _start_http_server(self, label):
         requests = []
 
+        # Request handler that records the path and replies with the server label as plain text.
         class Handler(BaseHTTPRequestHandler):
+            # Answer one GET request with the server label.
             def do_GET(self):
                 requests.append(self.path)
                 body = label.encode("utf-8")
@@ -31,6 +34,7 @@ class LoopbackProxyPolicyTests(SimpleTestCase):
                 self.end_headers()
                 self.wfile.write(body)
 
+            # Silence the default per-request access log.
             def log_message(self, _format, *_args):
                 return
 
@@ -45,12 +49,15 @@ class LoopbackProxyPolicyTests(SimpleTestCase):
         server.server_close()
         thread.join(timeout=2)
 
+    # Verify that applying the policy merges existing bypass entries from both NO_PROXY spellings with
+    # the loopback hosts, and that a second application yields the same result.
     def test_policy_merges_existing_bypass_and_loopback_hosts_idempotently(self):
         environ = {
             "NO_PROXY": "corp.example;127.0.0.1;[::1]",
             "no_proxy": "internal.example,LOCALHOST",
         }
 
+        # Act: apply the policy twice to the same environment.
         first = apply_loopback_proxy_bypass(
             environ,
             system_proxies={},
@@ -62,6 +69,7 @@ class LoopbackProxyPolicyTests(SimpleTestCase):
             system_bypass=[],
         )
 
+        # Assert: both spellings hold the same merged, de-duplicated host set.
         self.assertEqual(first, second)
         self.assertEqual(environ["NO_PROXY"], environ["no_proxy"])
         tokens = {token.casefold() for token in first.split(",")}
@@ -76,6 +84,8 @@ class LoopbackProxyPolicyTests(SimpleTestCase):
             },
         )
 
+    # Verify that the policy copies the system proxies into both environment spellings and keeps the
+    # native system bypass entries next to the loopback hosts.
     def test_policy_preserves_external_system_proxy_and_native_bypass(self):
         environ = {}
 
@@ -94,6 +104,8 @@ class LoopbackProxyPolicyTests(SimpleTestCase):
         self.assertIn("corp.internal", environ["NO_PROXY"])
         self.assertIn("localhost", environ["NO_PROXY"])
 
+    # Verify that an explicitly empty proxy variable and a wildcard NO_PROXY are respected and not
+    # overridden by the system proxy.
     def test_policy_does_not_replace_explicit_empty_proxy_or_wildcard(self):
         environ = {"HTTP_PROXY": "", "NO_PROXY": "*"}
 
@@ -108,6 +120,8 @@ class LoopbackProxyPolicyTests(SimpleTestCase):
         self.assertEqual(merged, "*")
         self.assertEqual(environ["no_proxy"], "*")
 
+    # Verify that the IPv6 loopback bypass entry is parsed by httpx into a valid no-proxy mount for
+    # [::1].
     def test_ipv6_loopback_builds_valid_httpx_bypass_pattern(self):
         import httpx._utils
 
@@ -122,6 +136,9 @@ class LoopbackProxyPolicyTests(SimpleTestCase):
 
             self.assertIsNone(mounts["all://[::1]"])
 
+    # Verify that the user process overlay keeps the custom environment, lets custom proxy values win
+    # over the parent's, adds the parent's other proxy keys and bypass entries, and leaks no unrelated
+    # parent variables.
     def test_user_process_overlay_keeps_custom_env_and_only_parent_proxy_keys(self):
         parent_environment = {
             "HTTP_PROXY": "http://parent-proxy.example:8080",
@@ -146,9 +163,12 @@ class LoopbackProxyPolicyTests(SimpleTestCase):
         self.assertIn("mcp.internal", overlay["NO_PROXY"])
         self.assertIn("::1", overlay["NO_PROXY"])
 
+    # Verify that, with a proxy configured, httpx and the urllib helpers reach loopback hosts (by IP
+    # and by name) directly while external URLs still go through the proxy.
     def test_httpx_bypasses_loopback_but_keeps_proxy_for_external_urls(self):
         import httpx
 
+        # Arrange: an origin server and a fake proxy server, each recording the request paths.
         origin, origin_thread, origin_requests = self._start_http_server("origin")
         proxy, proxy_thread, proxy_requests = self._start_http_server("proxy")
         origin_port = origin.server_address[1]
@@ -158,6 +178,7 @@ class LoopbackProxyPolicyTests(SimpleTestCase):
         # "example.invalid" resolution; pin both so only proxy routing decides.
         real_getaddrinfo = socket.getaddrinfo
 
+        # Resolve localhost to 127.0.0.1, fail example.invalid and defer other hosts to the real lookup.
         def pinned_getaddrinfo(host, *args, **kwargs):
             if host == "localhost":
                 return real_getaddrinfo("127.0.0.1", *args, **kwargs)
@@ -166,6 +187,8 @@ class LoopbackProxyPolicyTests(SimpleTestCase):
             return real_getaddrinfo(host, *args, **kwargs)
 
         try:
+            # Act: apply the policy with the fake proxy in the environment and issue loopback and
+            # external requests through httpx and the urllib helpers.
             proxy_url = f"http://127.0.0.1:{proxy_port}"
             with (
                 patch.dict(
@@ -200,6 +223,7 @@ class LoopbackProxyPolicyTests(SimpleTestCase):
                 ) as response:
                     policy_external_body = response.read().decode("utf-8")
 
+            # Assert: loopback requests hit the origin, external ones hit the proxy.
             self.assertEqual(by_ip.text, "origin")
             self.assertEqual(by_name.text, "origin")
             self.assertEqual(external.text, "proxy")
@@ -218,5 +242,6 @@ class LoopbackProxyPolicyTests(SimpleTestCase):
                 ],
             )
         finally:
+            # Always stop both servers, even when an assertion fails.
             self._stop_http_server(origin, origin_thread)
             self._stop_http_server(proxy, proxy_thread)

@@ -21,6 +21,7 @@ def _ollama_service():
     return importlib.import_module("Services.ollama-service")
 
 
+# Redirect the Ollama service PID file into a temporary directory and return its path.
 @pytest.fixture
 def isolated_pid_file(tmp_path, monkeypatch):
     module = _ollama_service()
@@ -29,11 +30,12 @@ def isolated_pid_file(tmp_path, monkeypatch):
     return pid_file
 
 
-# Desired-state policy (migrated from the original suite).
+# Desired-state policy (migrated from the original suite)
 
-
-# Verify Ollama desired-state policy.
+# Cover the Ollama desired-state policy and the rule that runtime output is never persisted.
 class OllamaDesiredStateTests(SimpleTestCase):
+    # Verify that the service should run when the engine is enabled even though another engine (lms)
+    # is the active one.
     @patch("Settings.settings.get_llm_engine", return_value="lms")
     @patch("Settings.settings.get", return_value=True)
     def test_desired_state_runs_when_enabled_even_if_active_engine_differs(self, _mock_get, _mock_active):
@@ -41,6 +43,8 @@ class OllamaDesiredStateTests(SimpleTestCase):
         state = ollama_service._get_desired_state("ollama-service")
         self.assertTrue(state.should_run)
 
+    # Verify that the service module has no log file, never refers to a service log file name and
+    # pipes the process output instead.
     def test_service_never_persists_runtime_output_in_module_settings(self):
         ollama_service = _ollama_service()
         source = Path(ollama_service.__file__).read_text(encoding="utf-8")
@@ -50,10 +54,10 @@ class OllamaDesiredStateTests(SimpleTestCase):
         self.assertIn("stdout=subprocess.PIPE", source)
 
 
-# PID bookkeeping.
+# PID bookkeeping
 
-
-# The PID file round-trips through write, read, and clear.
+# Verify that the PID file round-trips through write, read and clear, and that clearing a missing file
+# is a no-op.
 def test_pid_file_roundtrip(isolated_pid_file):
     module = _ollama_service()
 
@@ -64,11 +68,12 @@ def test_pid_file_roundtrip(isolated_pid_file):
 
     module._clear_pid()
     assert module._read_pid() is None
+
     # Clearing a missing file is a no-op.
     module._clear_pid()
 
 
-# A corrupt PID file reads as "no managed process".
+# Verify that a corrupt PID file reads as no managed process.
 def test_corrupt_pid_file_reads_as_none(isolated_pid_file):
     module = _ollama_service()
     isolated_pid_file.write_text("not-a-number", encoding="utf-8")
@@ -76,7 +81,8 @@ def test_corrupt_pid_file_reads_as_none(isolated_pid_file):
     assert module._read_pid() is None
 
 
-# Liveness checks distinguish running processes from absent PIDs.
+# Verify that the liveness check reports the current process as running and a missing or zero PID as
+# not running.
 def test_liveness_check_distinguishes_running_processes():
     module = _ollama_service()
 
@@ -85,10 +91,10 @@ def test_liveness_check_distinguishes_running_processes():
     assert module._is_pid_running(0) is False
 
 
-# Launch environment.
+# Launch environment
 
-
-# The launch environment binds the configured port and models directory.
+# Verify that the launch environment binds the configured port as the host address and passes the
+# configured models directory.
 def test_service_environment_binds_configured_port_and_models(isolated_settings):
     module = _ollama_service()
     project_settings.save_settings(
@@ -103,7 +109,7 @@ def test_service_environment_binds_configured_port_and_models(isolated_settings)
     assert env["OLLAMA_MODELS"] == "D:/models"
 
 
-# An unconfigured models directory is dropped from the environment.
+# Verify that the models directory variable is left out of the environment when it is not configured.
 def test_service_environment_drops_models_setting_when_unconfigured(isolated_settings):
     module = _ollama_service()
 
@@ -112,17 +118,17 @@ def test_service_environment_drops_models_setting_when_unconfigured(isolated_set
     assert "OLLAMA_MODELS" not in env
 
 
-# Console log formatting.
+# Console log formatting
 
-
-# ANSI escapes and trailing line breaks are stripped for the ASLM console.
+# Verify that ANSI escape sequences and trailing line breaks are stripped from a console line.
 def test_sanitize_console_line_strips_ansi_and_newlines():
     module = _ollama_service()
 
     assert module._sanitize_console_line("\x1b[32mgreen text\x1b[0m\r\n") == "green text"
 
 
-# Long lines truncate to the debug-level limit with an ellipsis.
+# Verify that a long console line is truncated to the debug-level limit with a trailing ellipsis and
+# a short line is left unchanged.
 def test_truncate_console_line_applies_debug_limit(isolated_settings):
     module = _ollama_service()
     long_line = "x" * 1000
@@ -135,7 +141,7 @@ def test_truncate_console_line_applies_debug_limit(isolated_settings):
     assert module._truncate_console_line("short") == "short"
 
 
-# Trace logging extends the truncation limit.
+# Verify that the trace console log level raises the line truncation limit.
 def test_truncate_console_line_extends_limit_for_trace(isolated_settings):
     module = _ollama_service()
     project_settings.save_settings({"console_log_level": "trace"}, sync_tool_configs=False)
@@ -145,7 +151,7 @@ def test_truncate_console_line_extends_limit_for_trace(isolated_settings):
     assert len(truncated) == 900
 
 
-# Structured key=value log lines parse into a dictionary.
+# Verify that a structured key=value log line (with a quoted value) parses into a dictionary.
 def test_parse_structured_log_fields_extracts_key_values():
     module = _ollama_service()
 
@@ -154,17 +160,17 @@ def test_parse_structured_log_fields_extracts_key_values():
     assert fields == {"ts": "123", "message": "hello world", "tokens": "42"}
 
 
-# Unparsable lines yield no fields instead of raising.
+# Verify that an unparsable log line yields no fields instead of raising.
 def test_parse_structured_log_fields_tolerates_unparsable_lines():
     module = _ollama_service()
 
     assert module._parse_structured_log_fields('"unterminated') == {}
 
 
-# Desired state policy.
+# Desired state policy
 
-
-# The desired state follows the engine enablement flag.
+# Verify that the desired state is disabled and not running by default and becomes enabled and
+# running, with ollama-service as the active engine, once the engine flag is set.
 def test_desired_state_follows_engine_enablement(isolated_settings):
     module = _ollama_service()
 
@@ -180,7 +186,7 @@ def test_desired_state_follows_engine_enablement(isolated_settings):
     assert state.active_engine == "ollama-service"
 
 
-# Requested engine aliases normalize to canonical ids.
+# Verify that the requested engine alias "ollama" normalizes to the canonical ollama-service id.
 def test_desired_state_normalizes_requested_engine_alias(isolated_settings):
     module = _ollama_service()
 

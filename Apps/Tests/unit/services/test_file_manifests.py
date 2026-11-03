@@ -20,8 +20,7 @@ from Services.file_manifests import (
 pytestmark = [pytest.mark.unit]
 
 
-# Fixture builders for real binary documents.
-
+# Fixture builders for real binary documents
 
 # Build a genuine DOCX through python-docx.
 def _build_docx(paragraphs: list[str]) -> bytes:
@@ -89,10 +88,10 @@ def _build_pptx(slides: list[str]) -> bytes:
     return stream.getvalue()
 
 
-# Text uploads.
+# Text uploads
 
-
-# A plain text upload produces a complete manifest.
+# Verify that a plain text upload produces a complete manifest with name, MIME type, size, hash, text
+# preview, sandbox path and the sandbox tool recommendation.
 def test_text_upload_manifest_fields():
     content = "Hello from ASLM.\nSecond line.\n"
 
@@ -116,7 +115,7 @@ def test_text_upload_manifest_fields():
     assert manifest.vision_available is False
 
 
-# Binary content is never decoded as text.
+# Verify that binary content is not decoded as text and gets no text preview.
 def test_binary_upload_has_no_text():
     payload = bytes(range(256)) * 64
 
@@ -126,7 +125,7 @@ def test_binary_upload_has_no_text():
     assert manifest.text_preview is None
 
 
-# Non-UTF-8 text encodings are recovered for declared text uploads.
+# Verify that cp1251-encoded text is decoded correctly when the upload is declared as text/plain.
 def test_cp1251_text_decodes_for_declared_text_uploads():
     raw_text = "Привет из ASLM"
 
@@ -140,7 +139,8 @@ def test_cp1251_text_decodes_for_declared_text_uploads():
     assert "Привет из ASLM" in manifest.text_preview
 
 
-# Oversized text is truncated with a marker and recommends file_search.
+# Verify that oversized text is truncated with a marker, reports its total length and recommends the
+# file_search tool.
 def test_oversized_text_is_truncated_and_recommends_file_search():
     content = ("line\n" * 60_000).encode("utf-8")
 
@@ -152,10 +152,9 @@ def test_oversized_text_is_truncated_and_recommends_file_search():
     assert "file_search" in manifest.recommended_tools
 
 
-# Table previews.
+# Table previews
 
-
-# CSV uploads render a pipe-separated table preview.
+# Verify that a CSV upload renders a pipe-separated table preview.
 def test_csv_upload_builds_table_preview():
     content = "name,city\nAlice,New York\nBob,San Francisco\n"
 
@@ -167,7 +166,7 @@ def test_csv_upload_builds_table_preview():
     assert "Bob | San Francisco" in manifest.table_preview
 
 
-# TSV previews use the tab delimiter.
+# Verify that a TSV upload is split on tabs and rendered as a pipe-separated table preview.
 def test_tsv_upload_uses_tab_delimiter():
     content = "col1\tcol2\none\ttwo\n"
 
@@ -180,10 +179,10 @@ def test_tsv_upload_uses_tab_delimiter():
     assert "one | two" in manifest.table_preview
 
 
-# Archives.
+# Archives
 
-
-# Zip uploads expose their tree and recommend the archive tool.
+# Verify that a zip upload lists its entries as an archive tree, recommends the sandbox and archive
+# tools and has no text.
 def test_zip_upload_builds_tree_and_recommends_archive_tool():
     stream = io.BytesIO()
     with zipfile.ZipFile(stream, "w") as archive:
@@ -202,10 +201,10 @@ def test_zip_upload_builds_tree_and_recommends_archive_tool():
     assert manifest.text_available is False
 
 
-# Office documents.
+# Office documents
 
-
-# DOCX uploads extract their paragraph text.
+# Verify that a DOCX upload without a declared MIME type gets the Word MIME type and its paragraph
+# text extracted.
 def test_docx_upload_extracts_paragraph_text():
     docx_bytes = _build_docx(["ASLM chat export", "Second paragraph"])
 
@@ -217,7 +216,7 @@ def test_docx_upload_extracts_paragraph_text():
     assert "Second paragraph" in manifest.text_preview
 
 
-# XLSX uploads resolve shared strings into a table preview.
+# Verify that an XLSX upload resolves shared strings into a table preview and recommends no tools.
 def test_xlsx_upload_builds_table_preview():
     xlsx_bytes = _build_xlsx(
         ["Name", "City"],
@@ -233,7 +232,7 @@ def test_xlsx_upload_builds_table_preview():
     assert manifest.recommended_tools == []
 
 
-# PPTX uploads extract slide text with slide numbers.
+# Verify that a PPTX upload extracts the slide text prefixed with slide numbers.
 def test_pptx_upload_extracts_slide_text():
     pptx_bytes = _build_pptx(["Title slide", "Bullet slide"])
 
@@ -245,7 +244,7 @@ def test_pptx_upload_extracts_slide_text():
     assert "Slide 2:" in manifest.text_preview
 
 
-# PDF uploads extract the embedded text layer.
+# Verify that a PDF upload extracts the embedded text layer.
 def test_pdf_upload_extracts_text():
     pdf_bytes = _build_pdf("ASLM PDF fixture text")
 
@@ -255,10 +254,9 @@ def test_pdf_upload_extracts_text():
     assert "ASLM PDF fixture text" in manifest.text_preview
 
 
-# Vision gating.
+# Vision gating
 
-
-# Image vision availability follows the model capability flag.
+# Verify that an image upload is only vision-available when the model supports vision.
 def test_image_upload_vision_depends_on_model_support():
     png_bytes = b"\x89PNG\r\n\x1a\nfake-image-bytes"
 
@@ -271,10 +269,10 @@ def test_image_upload_vision_depends_on_model_support():
     assert with_vision.vision_available is True
 
 
-# Name and MIME normalization.
+# Name and MIME normalization
 
-
-# Upload names reduce to a safe basename.
+# Verify that upload names reduce to a safe basename (no directories or traversal) and blank names
+# fall back to a default name.
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
@@ -289,17 +287,16 @@ def test_normalize_upload_name(raw, expected):
     assert normalize_upload_name(raw) == expected
 
 
-# Explicit MIME wins, then the extension, then octet-stream.
+# Verify that an explicit MIME type wins, then the file extension, then application/octet-stream.
 def test_guess_upload_mime_prefers_explicit_then_extension():
     assert guess_upload_mime("a.txt", "text/x-custom") == "text/x-custom"
     assert guess_upload_mime("a.json") == "application/json"
     assert guess_upload_mime("a.unknownext") == "application/octet-stream"
 
 
-# Text detection heuristics.
+# Text detection heuristics
 
-
-# Text detection follows MIME type, known names, and extensions.
+# Verify that text detection follows the MIME type, known text file names and extensions.
 @pytest.mark.parametrize(
     ("name", "mime", "expected"),
     [
