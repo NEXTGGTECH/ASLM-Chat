@@ -6,9 +6,12 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeou
 from io import BytesIO
 from pathlib import Path
 
+# Time limit of one conversion and the largest document (in bytes) that is converted at all.
 MARKITDOWN_TIMEOUT_SECONDS = 8
 MARKITDOWN_MAX_INPUT_BYTES = 32 * 1024 * 1024
 
+# Lazily created shared converter, and a flag set once importing markitdown has failed so the
+# import is not retried on every call.
 _MARKITDOWN_INSTANCE = None
 _MARKITDOWN_IMPORT_ERROR = False
 
@@ -23,6 +26,7 @@ def _get_markitdown_instance():
     try:
         from markitdown import MarkItDown
     except Exception:
+        # markitdown is an optional dependency: remember the failure and run without it.
         _MARKITDOWN_IMPORT_ERROR = True
         return None
     _MARKITDOWN_INSTANCE = MarkItDown(enable_plugins=False)
@@ -56,7 +60,9 @@ def extract_markdown(file_bytes: bytes, *, name: str, mime: str) -> str:
         try:
             return future.result(timeout=MARKITDOWN_TIMEOUT_SECONDS).strip()
         except FuturesTimeoutError:
+            # A conversion that outruns the limit is dropped (a cancel cannot stop an already running one).
             future.cancel()
             return ""
         except Exception:
+            # Any converter failure on a malformed document simply yields no text.
             return ""

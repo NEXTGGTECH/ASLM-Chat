@@ -18,7 +18,9 @@ from urllib.parse import urljoin
 from Apps.UI.locale_catalog import resolve_effective_locale_from_snapshot, translate, translate_plural
 from Settings.host_theme import load_host_theme
 
-# Bridge configuration
+# Cache locations under Data (search results, parsed model details and rendered detail HTML),
+# the HTTP timeout in seconds, the cache schema version (a cache file with another version is
+# discarded) and the largest variant size in bytes that fits a signed 64-bit integer.
 BASE_DIR = Path(__file__).resolve().parent.parent
 CACHE_DIR = BASE_DIR / "Data" / "downloads_bridge_cache"
 DETAIL_CACHE_DIR = CACHE_DIR / "ollama_details"
@@ -28,17 +30,23 @@ REQUEST_TIMEOUT_SECONDS = 20
 CACHE_SCHEMA_VERSION = 1
 MAX_VARIANT_SIZE_BYTES = (1 << 63) - 1
 
+# Source page and the identity of the single catalog category the bridge reports to ASLM.
 OLLAMA_SEARCH_URL = "https://ollama.com/search"
 OLLAMA_CATEGORY_ID = "ollama-library"
 OLLAMA_CATEGORY_TITLE = "Ollama Models"
 OLLAMA_CATEGORY_DESCRIPTION = "Models published in the official Ollama library."
 OLLAMA_GROUP_KEY = "ollama-models"
 OLLAMA_TARGET_REF = "ollama_models"
+
+# Version of the JSON protocol spoken with the ASLM host, stamped on every response.
 PROTOCOL_VERSION = 1
 
+# Default sort, and the prefixes that tell sort filters from capability filters in filter keys.
 DEFAULT_SORT_KEY = "popular"
 SORT_FILTER_PREFIX = "sort:"
 CAPABILITY_FILTER_PREFIX = "capability:"
+
+# Host theme color key used to tint each capability tag (see _build_resources).
 CAPABILITY_COLORS = {
     "vision": "SystemOrange",
     "tools": "SystemBlue",
@@ -49,7 +57,8 @@ CAPABILITY_COLORS = {
 
 # Search query model
 
-# Normalized Ollama search request arguments.
+# Normalized Ollama search request arguments: the free-text query, the sort key and the selected
+# capability filters.
 @dataclass(frozen=True)
 class OllamaSearchQuery:
     query_text: str
@@ -59,7 +68,9 @@ class OllamaSearchQuery:
 
 # Response helpers
 
-# Build a standard bridge response payload.
+# Build a standard bridge response payload. Only the sections that are passed are included. When
+# the response carries items, an item detail or filters, the named assets and colors of the
+# items are attached as "resources" and the visible texts are localized.
 def _response(
     *,
     success: bool = True,
@@ -72,6 +83,7 @@ def _response(
     warnings: list[str] | None = None,
     error: str | None = None,
 ) -> dict[str, Any]:
+    # Start with the mandatory fields, then add each optional section that was provided.
     payload: dict[str, Any] = {
         "protocolVersion": PROTOCOL_VERSION,
         "success": success,
@@ -91,6 +103,8 @@ def _response(
         payload["uninstallManifest"] = uninstall_manifest
     if error:
         payload["error"] = error
+
+    # Attach icons and colors for the items and the detail, and localize at the response boundary.
     owners = [*(items or []), *([item_detail] if item_detail else [])]
     resources = _build_resources(owners) if owners else None
     if resources:
@@ -99,7 +113,10 @@ def _response(
 
 
 # Resolve named assets and the current host palette when sending a response, not when caching items.
+# Return the "resources" section ({"colors": ..., "icons": ...}, empty parts omitted) and set
+# textColor/backgroundColor keys on the detail and tag fields that use a capability color.
 def _build_resources(owners: list[dict[str, Any]]) -> dict[str, Any]:
+    # Read the host palette and the surface color the tag backgrounds are blended with.
     theme = load_host_theme() or {}
     palette = theme.get("colors") or {}
     if not isinstance(palette, dict):
@@ -107,6 +124,9 @@ def _build_resources(owners: list[dict[str, Any]]) -> dict[str, Any]:
     surface = _color_channels(palette.get("BackgroundSecondary"))
     colors: dict[str, str] = {}
     icons: dict[str, dict[str, str]] = {}
+
+    # Capability icons get a text color from the palette and a background that mixes that color
+    # (1 part) with the surface (4 parts); the downloads and update icons only need their image.
     for owner in owners:
         for field in [*owner.get("details", []), *owner.get("tags", [])]:
             icon = field.get("icon")
@@ -129,6 +149,7 @@ def _build_resources(owners: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 # Host palette values use RGB or MAUI ARGB hex, with alpha first.
+# Return the (alpha, red, green, blue) channels (alpha 255 for RGB), or None for any other value.
 def _color_channels(value: Any) -> tuple[int, ...] | None:
     if not isinstance(value, str) or not re.fullmatch(r"#(?:[0-9a-fA-F]{6}|[0-9a-fA-F]{8})", value):
         return None
@@ -140,7 +161,8 @@ def _color_channels(value: Any) -> tuple[int, ...] | None:
 
 # Request helpers
 
-# Read and validate the JSON request from stdin.
+# Read and validate the JSON request from stdin. Return an empty dict when the input is empty,
+# invalid JSON or not a JSON object.
 def _read_request() -> dict[str, Any]:
     raw_payload = sys.stdin.read().strip()
     if not raw_payload:
@@ -149,6 +171,7 @@ def _read_request() -> dict[str, Any]:
     try:
         payload = json.loads(raw_payload)
     except json.JSONDecodeError:
+        # A malformed request is handled like an empty one; the caller reports the missing fields.
         return {}
 
     return payload if isinstance(payload, dict) else {}
@@ -172,7 +195,8 @@ def _normalize_filter_key(value: str | None) -> str:
     return _normalize_text(value).lower()
 
 
-# Remove duplicates while keeping the first occurrence.
+# Normalize the values, drop empty ones and remove duplicates (case-insensitive) while keeping the
+# first occurrence.
 def _deduplicate_preserving_order(values: list[str]) -> list[str]:
     seen: set[str] = set()
     deduplicated: list[str] = []
@@ -208,7 +232,8 @@ def _ensure_cache_dirs() -> None:
     SEARCH_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 
-# Read a JSON cache payload.
+# Read a JSON cache payload. Return None when the file is missing or unreadable, has another
+# schema version or an outdated item layout, so the caller rebuilds the payload.
 def _read_cache(path: Path) -> Any | None:
     if not path.exists():
         return None
@@ -218,6 +243,7 @@ def _read_cache(path: Path) -> Any | None:
         if not isinstance(payload, dict) or payload.get("_cacheSchema") != CACHE_SCHEMA_VERSION:
             return None
         payload.pop("_cacheSchema")
+
         # Rebuild incompatible cached payloads in place; never translate the old wire format.
         for item in payload.get("items", [payload]):
             if "detail" in item:
@@ -236,10 +262,11 @@ def _read_cache(path: Path) -> Any | None:
                     return None
         return payload
     except Exception:
+        # A corrupt or unexpectedly shaped cache file is the same as a cache miss.
         return None
 
 
-# Write a JSON cache payload.
+# Write a JSON cache payload together with the current schema version.
 def _write_cache(path: Path, payload: Any) -> None:
     _ensure_cache_dirs()
     path.write_text(json.dumps({**payload, "_cacheSchema": CACHE_SCHEMA_VERSION}, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -267,15 +294,13 @@ def _resource_key_to_slug(resource_key: str) -> str:
     return normalized
 
 
-# Platform / runtime format helpers
-#
-# Ollama publishes classic (CUDA/Vulkan/Metal-via-llama.cpp) tags and macOS MLX
-# tags side-by-side (e.g. gemma4:12b vs gemma4:12b-mlx). The downloads bridge
-# runs on the user machine via ASLM, so filter by local OS:
-#   - Windows / Linux / other → classic tags only (exclude MLX)
-#   - macOS → MLX tags only
+# Platform and runtime format
 
-# Resolve the host OS family for model-format filtering.
+# Resolve the host OS family ("macos", "windows", "linux" or "other") for model-format filtering.
+# Ollama publishes classic (CUDA/Vulkan/Metal-via-llama.cpp) tags and macOS MLX tags side by side
+# (e.g. gemma4:12b vs gemma4:12b-mlx). The downloads bridge runs on the user machine via ASLM, so
+# it filters by the local OS: Windows, Linux and other hosts get classic tags only (no MLX), and
+# macOS gets MLX tags only.
 def _host_platform_family() -> str:
     system = platform.system().strip().lower()
     if system == "darwin" or sys.platform == "darwin":
@@ -308,6 +333,7 @@ def _is_mlx_model_ref(value: str | None) -> bool:
     # Common Ollama MLX tags: "12b-mlx", "e2b-mlx", rarely bare "mlx".
     if tag == "mlx" or tag.endswith("-mlx"):
         return True
+
     # Defensive: mlx as a discrete hyphen segment (foo-mlx-bar).
     if re.search(r"(^|-)mlx($|-)", tag):
         return True
@@ -325,7 +351,8 @@ def _variant_is_mlx(variant: dict[str, Any] | None) -> bool:
     return False
 
 
-# Keep only variants that match the host platform (classic vs MLX).
+# Keep only variants that match the host platform (classic vs MLX) and renumber their sortOrder
+# from zero. The input dicts are copied, not modified.
 def _filter_variants_for_host(variants: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
     wants_mlx = _host_wants_mlx_variants()
     filtered: list[dict[str, Any]] = []
@@ -343,7 +370,8 @@ def _filter_variants_for_host(variants: list[dict[str, Any]] | None) -> list[dic
     return filtered
 
 
-# Pick the default variant resource key after platform filtering.
+# Pick the default variant resource key after platform filtering: the "latest" variant when
+# there is one, otherwise the first variant, or an empty string when there are none.
 def _select_default_variant_key(variants: list[dict[str, Any]]) -> str:
     if not variants:
         return ""
@@ -355,7 +383,8 @@ def _select_default_variant_key(variants: list[dict[str, Any]]) -> str:
     return str(variants[0].get("resourceKey") or "")
 
 
-# Apply host platform variant filtering to a detail payload in place/copy.
+# Apply host platform variant filtering to a copy of a detail payload, updating its default
+# variant key and its variant count.
 def _apply_platform_variant_filter(detail: dict[str, Any]) -> dict[str, Any]:
     normalized = dict(detail or {})
     variants = normalized.get("variants")
@@ -370,13 +399,15 @@ def _apply_platform_variant_filter(detail: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
-# Reject install/uninstall of a format that cannot run on this host.
+# Reject install of a format that cannot run on this host: raise ValueError for a non-MLX model
+# on macOS or an MLX model elsewhere. Empty and tag-less keys are accepted.
 def _assert_resource_allowed_on_host(resource_key: str) -> None:
     normalized = _normalize_text(resource_key)
     if not normalized:
         return
 
     model_ref = normalized[len("ollama:") :].strip() if normalized.lower().startswith("ollama:") else normalized
+
     # Family-only keys (no tag) are allowed; the UI should prefer a variant key.
     if ":" not in model_ref:
         return
@@ -405,7 +436,9 @@ def _detail_cache_path(slug: str) -> Path:
     return DETAIL_CACHE_DIR / f"{safe_slug}.json"
 
 
-# Resolve the HTML detail cache path for a rendered block.
+# Resolve the HTML detail cache path for a rendered block. The name combines the sanitized slug and
+# block id with the theme fingerprint and the content digest (each cut to 16 characters), so a
+# changed theme or content produces a new file instead of reusing a stale one.
 def _detail_html_cache_path(
     slug: str,
     block_id: str,
@@ -419,7 +452,7 @@ def _detail_html_cache_path(
     return DETAIL_HTML_CACHE_DIR / f"{safe_slug}_{safe_block_id}_{safe_theme}_{safe_content}.html"
 
 
-# Default dark preview shell (matches base ASLM-Chat palette when host theme is absent).
+# Default dark preview shell tokens (match the base ASLM-Chat palette when the host theme is absent).
 _DEFAULT_PREVIEW_THEME: dict[str, str] = {
     "color_scheme": "dark",
     "bg": "#1c1c1e",
@@ -433,7 +466,8 @@ _DEFAULT_PREVIEW_THEME: dict[str, str] = {
 }
 
 
-# Load host-theme tokens for standalone preview HTML documents.
+# Load host-theme tokens for standalone preview HTML documents. The result carries a fingerprint
+# (hash of the rendered shell) that is part of the HTML cache file name.
 def _resolve_preview_theme() -> dict[str, str]:
     tokens = dict(_DEFAULT_PREVIEW_THEME)
     try:
@@ -446,6 +480,7 @@ def _resolve_preview_theme() -> dict[str, str]:
     except Exception:
         # Bridge must stay available even if the theme module is missing.
         pass
+
     # Include the rendered shell so CSS changes also refresh already-cached Readmes.
     shell = _build_html_document("", "", "", tokens)
     tokens["fingerprint"] = hashlib.sha256(shell.encode("utf-8")).hexdigest()[:16]
@@ -455,6 +490,7 @@ def _resolve_preview_theme() -> dict[str, str]:
 # Escape a CSS color/token value for safe interpolation into a style block.
 def _css_token(value: str, fallback: str) -> str:
     text = str(value or "").strip() or fallback
+
     # Preview tokens are always resolved host colors or hardcoded defaults; still
     # strip characters that could break out of a CSS declaration.
     return re.sub(r"[^#(),.%a-zA-Z0-9\s_-]", "", text) or fallback
@@ -476,7 +512,7 @@ def _resolve_model_page_url(slug: str) -> str:
     return f"https://ollama.com{_resolve_model_page_path(slug)}"
 
 
-# Build the cache path for a search query.
+# Build the cache path for a search query from a hash of its text, sort key and capabilities.
 def _search_cache_path(search_query: OllamaSearchQuery) -> Path:
     identity = json.dumps(
         {
@@ -493,7 +529,7 @@ def _search_cache_path(search_query: OllamaSearchQuery) -> Path:
 
 # HTTP helpers
 
-# Request text content from a remote page.
+# Request text content from a remote page. Raise for an HTTP error status.
 def _request_text(url: str, params: list[tuple[str, str]] | None = None) -> str:
     import requests
 
@@ -523,14 +559,19 @@ def _absolutize_url(candidate: str | None, base_url: str) -> str:
 # Payload formatting helpers
 
 # Localize only at the response boundary: disk caches retain Ollama's original labels.
+# Return a localized copy: the sort filter titles, the download counts and update times of the
+# items, and the "text"/"image" words in variant summaries.
 def _localize_response(payload: dict[str, Any]) -> dict[str, Any]:
     localized = deepcopy(payload)
     locale = resolve_effective_locale_from_snapshot()
+
+    # Sort filter titles.
     for entry in localized.get("filters", []):
         key = entry.get("key")
         if key in {"sort:popular", "sort:newest"}:
             entry["title"] = translate(f"downloadsBridge.filters.{key.split(':', 1)[1]}", locale=locale)
 
+    # Items and the item detail share the same field layout.
     owners = [*localized.get("items", [])]
     if localized.get("itemDetail") is not None:
         owners.append(localized["itemDetail"])
@@ -538,6 +579,8 @@ def _localize_response(payload: dict[str, Any]) -> dict[str, Any]:
         for field in owner.get("details", []):
             text = _normalize_text(field.get("text"))
             if field.get("icon") == "downloads":
+                # Turn "1.2M downloads" into a plural-aware localized text, but only when the
+                # count expands to a whole number; otherwise keep the original label.
                 match = re.fullmatch(r"(\d[\d,]*(?:\.\d+)?\s*[KMBT]?)\s+(?:downloads?|pulls?)", text, re.IGNORECASE)
                 if match:
                     display_count = match.group(1)
@@ -550,6 +593,8 @@ def _localize_response(payload: dict[str, Any]) -> dict[str, Any]:
                         )
             elif field.get("icon") == "update":
                 field["text"] = _localize_updated_text(text, locale)
+
+        # Variant summaries mention the supported input types ("text", "image").
         for variant in owner.get("variants", []):
             variant["summary"] = re.sub(
                 r"\b(text|image)\b",
@@ -561,6 +606,7 @@ def _localize_response(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 # Preserve unknown provider labels; never invent a timestamp for an unrecognized value.
+# Known phrases ("just now", "yesterday", "3 days ago", ...) are translated for the locale.
 def _localize_updated_text(value: str, locale: str) -> str:
     normalized = _strip_leading_label(value, ("updated",)).lower()
     aliases = {
@@ -594,6 +640,8 @@ def _build_details(pull_count: str, updated_text: str) -> list[dict[str, Any]]:
     ]
 
 
+# Build tag fields from capability names; duplicates are removed and the known capabilities get
+# an icon and are shown in the catalog.
 def _build_tags(values: list[str]) -> list[dict[str, Any]]:
     return [
         {"text": value, **({"icon": value.lower(), "showInCatalog": True} if value.lower() in CAPABILITY_COLORS else {})}
@@ -614,9 +662,12 @@ def _build_ollama_category() -> dict[str, Any]:
 
 
 # Build default Ollama filter payloads when live filter data is not available.
+# The sort filters come first, then one filter per capability, each marked selected from the query.
 def _build_default_filter_payloads(search_query: OllamaSearchQuery) -> list[dict[str, Any]]:
     active_capabilities = set(search_query.capabilities)
     active_sort = search_query.sort_key or DEFAULT_SORT_KEY
+
+    # Sort filters (popular and newest).
     filters: list[dict[str, Any]] = [
         {
             "key": f"{SORT_FILTER_PREFIX}popular",
@@ -634,6 +685,7 @@ def _build_default_filter_payloads(search_query: OllamaSearchQuery) -> list[dict
         },
     ]
 
+    # Capability filters.
     for index, capability in enumerate(("cloud", "embedding", "vision", "tools", "thinking")):
         filters.append(
             {
@@ -650,13 +702,16 @@ def _build_default_filter_payloads(search_query: OllamaSearchQuery) -> list[dict
 
 # HTML rendering helpers
 
-# Build a standalone HTML document for preview blocks.
+# Build a standalone HTML document for preview blocks: the themed page shell around the inner
+# HTML. The page URL becomes the base href so relative links keep working offline, and every
+# theme value is sanitized before it is interpolated into the style block.
 def _build_html_document(
     inner_html: str,
     page_url: str,
     title: str,
     theme: dict[str, str] | None = None,
 ) -> str:
+    # Resolve the theme tokens, falling back to the default dark palette for missing or unsafe values.
     tokens = theme or _resolve_preview_theme()
     defaults = _DEFAULT_PREVIEW_THEME
     color_scheme = _css_token(tokens.get("color_scheme", ""), defaults["color_scheme"])
@@ -668,6 +723,8 @@ def _build_html_document(
     border = _css_token(tokens.get("border", ""), defaults["border"])
     text = _css_token(tokens.get("text", ""), defaults["text"])
     link = _css_token(tokens.get("link", ""), defaults["link"])
+
+    # Escape the title for the <title> element.
     safe_title = (
         str(title or "")
         .replace("&", "&amp;")
@@ -675,6 +732,8 @@ def _build_html_document(
         .replace(">", "&gt;")
     )
 
+    # The page template: CSS variables from the theme tokens, then typography, code, table and
+    # image styles for the README content (doubled braces are literal CSS braces in the f-string).
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -854,10 +913,12 @@ def _build_html_document(
 
 
 # Pull the themed body content back out of a previously written preview HTML file.
+# Return an empty string when the document cannot be parsed or has no content container.
 def _extract_preview_inner_html(document: str) -> str:
     try:
         soup = _make_soup(document)
     except Exception:
+        # An unparsable cached file is treated as having no content; the caller falls back to other sources.
         return ""
     content = soup.select_one("div.content")
     if content is None:
@@ -865,7 +926,8 @@ def _extract_preview_inner_html(document: str) -> str:
     return content.decode_contents()
 
 
-# Write a themed standalone HTML file for one preview block.
+# Write a themed standalone HTML file for one preview block and return its path. An existing file
+# for the same content and theme is reused, because the file name encodes both.
 def _write_themed_preview_file(
     *,
     slug: str,
@@ -887,14 +949,16 @@ def _write_themed_preview_file(
     return str(cache_path)
 
 
-# Normalize and cache a rendered HTML block.
+# Normalize a rendered HTML block (absolute media and link URLs, scrollable tables) and cache it
+# as a themed HTML file. Return the file path.
 def _create_html_block_file(slug: str, block_id: str, title: str, node_html: str, page_url: str) -> str:
     fragment = _make_soup(node_html)
 
-    # Normalize media links so cached files keep working offline
+    # Normalize media links so cached files keep working offline.
     for node in fragment.select("[src]"):
         node["src"] = _absolutize_url(node.get("src"), page_url)
 
+    # Anchor links stay in-page links on the source page; other links become absolute.
     for node in fragment.select("[href]"):
         href = _normalize_text(node.get("href"))
         if href.startswith("#"):
@@ -902,7 +966,7 @@ def _create_html_block_file(slug: str, block_id: str, title: str, node_html: str
         else:
             node["href"] = _absolutize_url(href, page_url)
 
-    # Wrap raw tables to preserve layout inside the embedded preview
+    # Wrap raw tables to preserve layout inside the embedded preview.
     for table in list(fragment.select("table")):
         parent_classes = table.parent.get("class", []) if table.parent else []
         if "table-wrap" in parent_classes:
@@ -921,6 +985,7 @@ def _create_html_block_file(slug: str, block_id: str, title: str, node_html: str
 
 
 # Rebuild html-file preview paths so cached details follow the current host theme.
+# The detail dict is updated in place and returned.
 def _retheme_detail_html_blocks(detail: dict[str, Any], slug: str) -> dict[str, Any]:
     blocks = detail.get("blocks")
     if not isinstance(blocks, list) or not blocks:
@@ -932,6 +997,7 @@ def _retheme_detail_html_blocks(detail: dict[str, Any], slug: str) -> dict[str, 
     updated_blocks: list[Any] = []
 
     for block in blocks:
+        # Only blocks in the html-file format carry a themed file; everything else is kept as is.
         if not isinstance(block, dict):
             updated_blocks.append(block)
             continue
@@ -943,16 +1009,19 @@ def _retheme_detail_html_blocks(detail: dict[str, Any], slug: str) -> dict[str, 
 
         content_url = _normalize_text(next_block.get("contentUrl"))
         old_path = Path(content_url) if content_url else None
+
         # Already themed for the active host palette.
         if old_path is not None and theme_fp in old_path.name and old_path.is_file():
             updated_blocks.append(next_block)
             continue
 
+        # Recover the inner HTML from the old file, then render it again with the current theme.
         inner_html = ""
         if old_path is not None and old_path.is_file():
             try:
                 inner_html = _extract_preview_inner_html(old_path.read_text(encoding="utf-8"))
             except OSError:
+                # An unreadable old file is handled like a missing one (inline content fallback below).
                 inner_html = ""
         if not inner_html:
             # Fall back to inline markdown/html content when present.
@@ -980,7 +1049,8 @@ def _retheme_detail_html_blocks(detail: dict[str, Any], slug: str) -> dict[str, 
 
 # Search query helpers
 
-# Normalize query text and selected filters.
+# Normalize query text and selected filters into an OllamaSearchQuery. Unknown filter keys are
+# ignored, the last sort filter wins, and capabilities are deduplicated and sorted.
 def _normalize_search_query(query_text: str, filter_keys: list[str] | None) -> OllamaSearchQuery:
     normalized_query = _normalize_text(query_text)
     normalized_filters = [_normalize_filter_key(value) for value in filter_keys or [] if _normalize_filter_key(value)]
@@ -988,7 +1058,7 @@ def _normalize_search_query(query_text: str, filter_keys: list[str] | None) -> O
     sort_key = DEFAULT_SORT_KEY
     capabilities: list[str] = []
 
-    # Split mixed filter keys into sort and capability groups
+    # Split mixed filter keys into sort and capability groups.
     for filter_key in normalized_filters:
         if filter_key.startswith(SORT_FILTER_PREFIX):
             candidate = filter_key.removeprefix(SORT_FILTER_PREFIX).strip()
@@ -1009,7 +1079,8 @@ def _normalize_search_query(query_text: str, filter_keys: list[str] | None) -> O
     )
 
 
-# Build Ollama search parameters from the normalized query.
+# Build Ollama search parameters from the normalized query: q (text), c (one per capability) and
+# o (sort order, omitted for the default sort).
 def _build_search_params(search_query: OllamaSearchQuery) -> list[tuple[str, str]]:
     params: list[tuple[str, str]] = []
 
@@ -1060,6 +1131,7 @@ def _strip_leading_label(text: str, labels: tuple[str, ...]) -> str:
 
 
 # Extract pull/tag/updated meta from one Ollama search card (current + legacy markup).
+# Return the (pull count, tag count, updated) texts with their labels removed, empty when absent.
 def _extract_search_card_meta(list_item: Any) -> tuple[str, str, str]:
     pull_count_text = ""
     tag_count_text = ""
@@ -1098,16 +1170,17 @@ def _extract_search_card_meta(list_item: Any) -> tuple[str, str, str]:
     return pull_count_text, tag_count_text, updated_text
 
 
-# Parse filter payloads from the Ollama search page.
+# Parse filter payloads from the Ollama search page: the sort options of its select control and
+# the capability checkboxes. The query decides which of them are marked selected.
 def _parse_filter_payloads(soup: Any, search_query: OllamaSearchQuery) -> list[dict[str, Any]]:
     payloads: list[dict[str, Any]] = []
     active_capabilities = set(search_query.capabilities)
     active_sort = search_query.sort_key or DEFAULT_SORT_KEY
 
-    # Parse sort options from the primary desktop select first
+    # Parse sort options from the primary desktop select first.
     sort_options = soup.select("#desktop-sort-select option")
     if not sort_options:
-        # Keep a generic fallback because Ollama has changed this control before
+        # Keep a generic fallback because Ollama has changed this control before.
         sort_options = soup.select("select option")
 
     if sort_options:
@@ -1126,7 +1199,7 @@ def _parse_filter_payloads(soup: Any, search_query: OllamaSearchQuery) -> list[d
                 }
             )
 
-    # Parse capability checkboxes exposed by the search UI
+    # Parse capability checkboxes exposed by the search UI.
     for index, input_node in enumerate(soup.select("input[type='checkbox'][name='c'][value]")):
         value = _normalize_filter_key(input_node.get("value"))
         if not value:
@@ -1140,7 +1213,7 @@ def _parse_filter_payloads(soup: Any, search_query: OllamaSearchQuery) -> list[d
                 "key": f"{CAPABILITY_FILTER_PREFIX}{value}",
                 "title": title,
                 "kind": "capability",
-                # Respect both the requested query and the page's own checked state
+                # Respect both the requested query and the page's own checked state.
                 "selected": value in active_capabilities or input_node.has_attr("checked"),
                 "sortOrder": 100 + index,
             }
@@ -1149,7 +1222,8 @@ def _parse_filter_payloads(soup: Any, search_query: OllamaSearchQuery) -> list[d
     return payloads
 
 
-# Parse model cards from the Ollama search page.
+# Parse model cards from the Ollama search page into compact catalog items, one per model family.
+# Cards that are not library links, point to a tag or repeat a slug are skipped.
 def _parse_search_items(soup: Any) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     seen_slugs: set[str] = set()
@@ -1163,7 +1237,7 @@ def _parse_search_items(soup: Any) -> list[dict[str, Any]]:
         list_items = soup.select("ul.grid > li")
 
     for index, list_item in enumerate(list_items):
-        # Resolve the card identity from its main library link
+        # Resolve the card identity from its main library link.
         anchor = list_item.select_one("a[href^='/library/'], a[href*='/library/']")
         if anchor is None:
             anchor = list_item.select_one("a[href]")
@@ -1229,7 +1303,7 @@ def _parse_search_items(soup: Any) -> list[dict[str, Any]]:
         pull_count_text, tag_count_text, updated_text = _extract_search_card_meta(list_item)
         variant_count = _parse_int(tag_count_text)
 
-        # Build the compact bridge card payload used by the ASLM catalog list
+        # Build the compact bridge card payload used by the ASLM catalog list.
         items.append(
             {
                 "resourceKey": f"ollama:{slug}",
@@ -1255,19 +1329,22 @@ def _parse_search_items(soup: Any) -> list[dict[str, Any]]:
     return items
 
 
-# Load search results with cache fallback.
+# Load search results with cache fallback. Return (items, filters, warnings).
+# With prefer_cached the cache is served without a network call (default filters when nothing is
+# cached yet); otherwise the live page is fetched and cached, and a failed or empty live parse
+# falls back to the previous cache with a warning. Without a cache a fetch error is raised.
 def _load_search_payload(
     query_text: str,
     filter_keys: list[str] | None,
     prefer_cached: bool,
     force_refresh: bool,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
-    # Resolve the cache entry for the current search request
+    # Resolve the cache entry for the current search request.
     search_query = _normalize_search_query(query_text, filter_keys)
     cache_path = _search_cache_path(search_query)
     cached = _read_cache(cache_path)
 
-    # Serve the cached payload immediately when the caller requests it
+    # Serve the cached payload immediately when the caller requests it.
     if cached and prefer_cached and not force_refresh:
         return list(cached.get("items", [])), list(cached.get("filters", [])), []
 
@@ -1277,7 +1354,7 @@ def _load_search_payload(
         return [], _build_default_filter_payloads(search_query), []
 
     try:
-        # Refresh the cache from the live Ollama search page
+        # Refresh the cache from the live Ollama search page.
         html = _request_text(OLLAMA_SEARCH_URL, _build_search_params(search_query))
         soup = _make_soup(html)
         filters = _parse_filter_payloads(soup, search_query) or _build_default_filter_payloads(search_query)
@@ -1288,6 +1365,7 @@ def _load_search_payload(
                 "Ollama search returned no parseable model cards. "
                 "The library page markup may have changed."
             )
+
         # Avoid overwriting a good cache with an empty parse result.
         if items or not cached:
             _write_cache(cache_path, {"items": items, "filters": filters})
@@ -1299,7 +1377,7 @@ def _load_search_payload(
             )
         return items, filters, warnings
     except Exception as exc:
-        # Fall back to the previous cache when live refresh fails
+        # Fall back to the previous cache when live refresh fails.
         if cached:
             return (
                 list(cached.get("items", [])),
@@ -1326,16 +1404,17 @@ def _parse_size_bytes(value: str) -> int | None:
     return int(size) if size <= MAX_VARIANT_SIZE_BYTES else None
 
 
-# Parse available model variants from the model page.
+# Parse available model variants from the model page: one entry per tag with its size, input
+# summary and page URL, in page order.
 def _parse_variant_payloads(soup: BeautifulSoup, slug: str) -> list[dict[str, Any]]:
     variants: list[dict[str, Any]] = []
     seen_models: set[str] = set()
     page_path = _resolve_model_page_path(slug)
 
-    # Variant links reuse the model page path and append the tag after a colon
+    # Variant links reuse the model page path and append the tag after a colon.
     prefix = f"{page_path}:"
 
-    # Capture the mobile variant rows first because they include fallback metadata
+    # Capture the mobile variant rows first because they include fallback metadata.
     mobile_rows: dict[str, dict[str, str]] = {}
     for mobile_anchor in soup.find_all("a", href=True):
         href = str(mobile_anchor.get("href", "")).strip()
@@ -1347,7 +1426,8 @@ def _parse_variant_payloads(soup: BeautifulSoup, slug: str) -> list[dict[str, An
             continue
 
         secondary_text = mobile_anchor.find("p", class_=lambda value: value and "text-neutral-500" in value)
-        # The mobile row often keeps metadata that is omitted from the desktop grid
+
+        # The mobile row often keeps metadata that is omitted from the desktop grid.
         detail_text = _normalize_separator(_normalize_text(secondary_text.get_text(" ", strip=True) if secondary_text else ""))
         segments = [segment.strip() for segment in detail_text.split("|") if segment.strip()]
         mobile_rows[href] = {
@@ -1355,7 +1435,7 @@ def _parse_variant_payloads(soup: BeautifulSoup, slug: str) -> list[dict[str, An
             "input": segments[2] if len(segments) > 2 else "",
         }
 
-    # Parse the main grid and backfill missing fields from the mobile rows
+    # Parse the main grid and backfill missing fields from the mobile rows.
     for row in soup.select("div.group.sm\\:grid"):
         anchor = row.find("a", href=lambda value: isinstance(value, str) and value.startswith(prefix))
         if anchor is None:
@@ -1363,7 +1443,8 @@ def _parse_variant_payloads(soup: BeautifulSoup, slug: str) -> list[dict[str, An
 
         href = str(anchor.get("href", "")).strip()
         model_name = href.removeprefix("/library/").lstrip("/") if href.startswith("/library/") else href.lstrip("/")
-        # Skip duplicates when the same tag appears in multiple responsive containers
+
+        # Skip duplicates when the same tag appears in multiple responsive containers.
         if model_name in seen_models:
             continue
 
@@ -1396,7 +1477,8 @@ def _parse_variant_payloads(soup: BeautifulSoup, slug: str) -> list[dict[str, An
     return variants
 
 
-# Extract the raw markdown readme from the page.
+# Extract the raw markdown readme from the page's editor textarea. Return an empty string when
+# the page has none.
 def _extract_readme_markdown(soup: BeautifulSoup) -> str:
     editor = soup.select_one("textarea#editor")
     if editor is None:
@@ -1407,7 +1489,8 @@ def _extract_readme_markdown(soup: BeautifulSoup) -> str:
     return "\n".join(lines).strip()
 
 
-# Extract and cache the rendered HTML readme block.
+# Extract and cache the rendered HTML readme block. Return the cached file path, or an empty
+# string when the page has no rendered readme.
 def _extract_readme_html_file(slug: str, soup: BeautifulSoup, page_url: str) -> str:
     readme_node = soup.select_one("#readme #display") or soup.select_one("#display")
     if readme_node is None:
@@ -1423,6 +1506,7 @@ def _extract_readme_html_file(slug: str, soup: BeautifulSoup, page_url: str) -> 
 
 
 # Extract pull/download and updated labels from a model detail page.
+# Return the (pull count, updated) texts with their labels removed, empty when absent.
 def _extract_detail_page_meta(soup: Any) -> tuple[str, str]:
     pull_count_text = ""
     updated_text = ""
@@ -1459,17 +1543,19 @@ def _extract_detail_page_meta(soup: Any) -> tuple[str, str]:
     return pull_count_text, updated_text
 
 
-# Parse full item details from the model page.
+# Parse full item details from the model page: title, summary, counters, variants and the readme
+# block (rendered HTML file preferred, markdown as fallback).
 def _parse_item_detail(slug: str, html: str) -> dict[str, Any]:
     soup = _make_soup(html)
     page_url = _resolve_model_page_url(slug)
 
-    # Read the primary page metadata
+    # Read the primary page metadata.
     title = _normalize_text(soup.title.get_text(" ", strip=True) if soup.title else slug)
     summary_node = soup.select_one("textarea#summary-textarea")
     summary = _normalize_text(summary_node.get_text(" ", strip=True) if summary_node else "")
 
     pull_count_text, updated_text = _extract_detail_page_meta(soup)
+
     # Resolve variants; host platform filtering is applied later so cached details
     # stay reusable and are filtered at serve time.
     variants = _parse_variant_payloads(soup, slug)
@@ -1479,8 +1565,8 @@ def _parse_item_detail(slug: str, html: str) -> dict[str, Any]:
     )
     default_variant = _select_default_variant_key(variants)
 
-    # Prefer the rendered readme block because it matches the source page styling
-    # Keep markdown as a fallback for pages that do not expose the rendered section
+    # Prefer the rendered readme block because it matches the source page styling.
+    # Keep markdown as a fallback for pages that do not expose the rendered section.
     readme_html_file = _extract_readme_html_file(slug, soup, page_url)
     readme = _extract_readme_markdown(soup)
     blocks: list[dict[str, Any]] = []
@@ -1510,6 +1596,7 @@ def _parse_item_detail(slug: str, html: str) -> dict[str, Any]:
             }
         )
 
+    # Assemble the detail payload.
     return {
         "resourceKey": f"ollama:{slug}",
         "categoryId": OLLAMA_CATEGORY_ID,
@@ -1527,12 +1614,13 @@ def _parse_item_detail(slug: str, html: str) -> dict[str, Any]:
     }
 
 
-# Sanitize detail payloads loaded from cache or network.
+# Sanitize detail payloads loaded from cache or network: drop retired blocks and the variants
+# that cannot run on this host.
 def _sanitize_detail_payload(detail: dict[str, Any]) -> dict[str, Any]:
     normalized = dict(detail or {})
     blocks = normalized.get("blocks")
     if isinstance(blocks, list):
-        # Older cached payloads may still contain blocks removed from the new UI
+        # Older cached payloads may still contain blocks removed from the new UI.
         normalized["blocks"] = [
             block for block in blocks
             if _normalize_filter_key((block or {}).get("id")) != "quick-start"
@@ -1542,23 +1630,26 @@ def _sanitize_detail_payload(detail: dict[str, Any]) -> dict[str, Any]:
     return _apply_platform_variant_filter(normalized)
 
 
-# Load detail payloads with cache fallback.
+# Load detail payloads with cache fallback. Return (detail, warnings).
+# With prefer_cached the sanitized cache is served without a network call; otherwise the live
+# page is fetched and cached. When the live refresh fails, a preferred cache is used with a
+# warning; without one the error is raised.
 def _load_item_detail(
     slug: str,
     prefer_cached: bool,
     force_refresh: bool,
 ) -> tuple[dict[str, Any], list[str]]:
-    # Resolve the cache entry for the requested model
+    # Resolve the cache entry for the requested model.
     cache_path = _detail_cache_path(slug)
     cached = _read_cache(cache_path) if prefer_cached or not force_refresh else None
 
-    # Serve sanitized cached details immediately when requested
+    # Serve sanitized cached details immediately when requested.
     if cached and prefer_cached and not force_refresh:
         detail = _retheme_detail_html_blocks(_sanitize_detail_payload(dict(cached)), slug)
         return detail, []
 
     try:
-        # Refresh the cache from the live model page
+        # Refresh the cache from the live model page.
         detail = _retheme_detail_html_blocks(
             _sanitize_detail_payload(_parse_item_detail(slug, _request_text(_resolve_model_page_url(slug)))),
             slug,
@@ -1567,7 +1658,7 @@ def _load_item_detail(
         _write_cache(cache_path, detail)
         return detail, []
     except Exception as exc:
-        # Fall back to cached details when refresh fails
+        # Fall back to cached details when refresh fails.
         if cached and prefer_cached:
             detail = _retheme_detail_html_blocks(_sanitize_detail_payload(dict(cached)), slug)
             return detail, [f"Using cached details for {slug}: {exc}"]
@@ -1576,7 +1667,8 @@ def _load_item_detail(
 
 # Manifest builders
 
-# Build an install manifest for a selected resource.
+# Build an install manifest for a selected resource: a single ollama_pull action for the model.
+# Raise ValueError when the key is empty or the model format cannot run on this host.
 def _build_install_manifest(resource_key: str) -> dict[str, Any]:
     model_name = _resource_key_to_slug(resource_key)
     if not model_name:
@@ -1601,15 +1693,16 @@ def _build_install_manifest(resource_key: str) -> dict[str, Any]:
     }
 
 
-# Build an uninstall manifest for a selected resource.
+# Build an uninstall manifest for a selected resource: a single ollama_remove action for the model.
+# Raise ValueError when the key is empty.
 def _build_uninstall_manifest(resource_key: str) -> dict[str, Any]:
     model_name = _resource_key_to_slug(resource_key)
     if not model_name:
         raise ValueError("Missing resourceKey for resolve_uninstall.")
+
     # Uninstall is allowed for any previously installed ref, including formats
     # that are no longer offered for this host (e.g. leftover MLX on Windows).
     # Only block clearly malformed keys; platform install guard stays on install.
-
     return {
         "resourceKey": f"ollama:{model_name}",
         "categoryId": OLLAMA_CATEGORY_ID,
@@ -1635,7 +1728,7 @@ def _handle_list_categories() -> dict[str, Any]:
     return _response(categories=[_build_ollama_category()])
 
 
-# Handle the list_items operation.
+# Handle the list_items operation: return the catalog items and filters of the Ollama category.
 def _handle_list_items(
     category_id: str,
     query_text: str,
@@ -1650,7 +1743,8 @@ def _handle_list_items(
     return _response(items=items, filters=filters, warnings=warnings)
 
 
-# Handle the describe_item operation.
+# Handle the describe_item operation: return the detail of one model family (the variant tag of
+# the resource key is ignored).
 def _handle_describe_item(
     category_id: str,
     resource_key: str,
@@ -1692,9 +1786,11 @@ def _handle_resolve_uninstall(category_id: str, resource_key: str) -> dict[str, 
 
 # Dispatch helpers
 
-# Route a bridge request to the matching handler.
+# Route a bridge request to the matching handler. The request fields are operation, categoryId,
+# resourceKey, queryText, filters, preferCached and forceRefresh; an unknown operation returns an
+# error response.
 def dispatch(request: dict[str, Any]) -> dict[str, Any]:
-    # Normalize the incoming request fields first
+    # Normalize the incoming request fields first.
     operation = _normalize_text(request.get("operation")).lower()
     category_id = _normalize_text(request.get("categoryId"))
     resource_key = _normalize_text(request.get("resourceKey"))
@@ -1704,7 +1800,7 @@ def dispatch(request: dict[str, Any]) -> dict[str, Any]:
     prefer_cached = bool(request.get("preferCached"))
     force_refresh = bool(request.get("forceRefresh"))
 
-    # Route the request explicitly so unsupported operations fail clearly
+    # Route the request explicitly so unsupported operations fail clearly.
     if operation == "list_categories":
         return _handle_list_categories()
     if operation == "list_items":
@@ -1721,11 +1817,13 @@ def dispatch(request: dict[str, Any]) -> dict[str, Any]:
 
 # CLI entry point
 
-# Execute the bridge in stdin/stdout mode.
+# Execute the bridge in stdin/stdout mode: read one JSON request from stdin and print one JSON
+# response to stdout. An unexpected error becomes an error response, and the exit code is 0.
 def run_cli() -> int:
     try:
         response = dispatch(_read_request())
     except Exception as exc:
+        # Report the failure in the response so the host always receives valid JSON.
         response = _response(success=False, error=str(exc))
 
     print(json.dumps(response, ensure_ascii=True))

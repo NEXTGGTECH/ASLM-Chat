@@ -16,16 +16,24 @@ from Services.file_manifests import UploadedFileManifest, build_uploaded_file_ma
 from Services.file_manifests import guess_upload_mime
 
 
+# Host locations: the mcp-sandbox tree, the folder inside it that receives user uploads, and the
+# separate folder that holds the private manifests of those uploads.
 SANDBOX_ROOT = settings.BASE_DIR / "Tools" / "mcp-sandbox" / "_sandbox"
 USER_UPLOAD_ROOT = SANDBOX_ROOT / "User"
 USER_FILE_MANIFEST_ROOT = settings.BASE_DIR / "Tools" / "user_files"
+
+# Path of USER_UPLOAD_ROOT as the model sees it inside the sandbox, and the suffix of manifest files.
 SANDBOX_MODEL_PREFIX = "/workspace/_sandbox/User"
 UPLOAD_MANIFEST_SUFFIX = ".manifest.json"
+
+# Size limits in bytes: the largest accepted upload, and the largest upload still kept in memory
+# so that its full manifest (text preview, archive tree) can be built.
 MAX_UPLOAD_BYTES = 16 * 1024 * 1024 * 1024
 INLINE_MANIFEST_MAX_BYTES = 64 * 1024 * 1024
 
 
-# Host and model paths for one upload destination.
+# Host and model paths for one upload destination: the tool server id, the host upload folder
+# and the path prefix under which the model sees that folder.
 @dataclass(frozen=True)
 class UploadStorageTarget:
     server_id: str
@@ -48,13 +56,15 @@ def normalize_tool_server_ids(tool_server_ids: list[str] | None) -> list[str]:
     return normalized
 
 
-# Route UI uploads to the mcp-sandbox tree.
+# Route UI uploads to the mcp-sandbox tree. The tool server ids are accepted for the caller's
+# convenience but do not change the target: every upload goes to the sandbox.
 def resolve_upload_storage_target(tool_server_ids: list[str] | None = None) -> UploadStorageTarget:
     _ = tool_server_ids
     return UploadStorageTarget("sandbox", USER_UPLOAD_ROOT, SANDBOX_MODEL_PREFIX)
 
 
-# Safe scope.
+# Turn a scope value into a safe directory name: unsafe characters become underscores, the result
+# is at most 96 characters, and an empty value maps to "pending".
 def _safe_scope(value: str | None) -> str:
     raw_value = str(value or "").strip()
     if not raw_value:
@@ -62,7 +72,7 @@ def _safe_scope(value: str | None) -> str:
     return re.sub(r"[^a-zA-Z0-9_.-]+", "_", raw_value)[:96] or "pending"
 
 
-# Stored file name.
+# Build the on-disk file name "<file id>__<sanitized original name>" so equal names never collide.
 def _stored_file_name(file_id: str, original_name: str) -> str:
     safe_name = normalize_upload_name(original_name)
     safe_name = re.sub(r"[\x00-\x1f<>:\"|?*]+", "_", safe_name).strip(" .") or "uploaded-file"
@@ -74,6 +84,9 @@ def _stored_file_name(file_id: str, original_name: str) -> str:
 def display_kind_for_upload(name: str, mime: str) -> tuple[str, str]:
     suffix = Path(normalize_upload_name(name)).suffix.lower()
     normalized_mime = str(mime or "").lower()
+
+    # Media first (by MIME or extension), then archives, Office/PDF documents, code, plain text,
+    # and a generic "file" fallback.
     if normalized_mime.startswith("image/"):
         return "image", "Image"
     if normalized_mime.startswith("audio/") or suffix in {".mp3", ".wav", ".ogg", ".oga", ".m4a", ".aac", ".flac", ".opus"}:
@@ -101,7 +114,8 @@ def display_kind_for_upload(name: str, mime: str) -> tuple[str, str]:
     return "file", "File"
 
 
-# Return the small user-facing upload payload.
+# Return the small user-facing upload payload (identity, size, display kind and content URL)
+# for a manifest object or a stored manifest dict.
 def public_upload_payload(manifest: UploadedFileManifest | dict[str, Any], *, status: str = "ready") -> dict[str, Any]:
     if isinstance(manifest, UploadedFileManifest):
         file_id = manifest.file_id
@@ -127,7 +141,8 @@ def public_upload_payload(manifest: UploadedFileManifest | dict[str, Any], *, st
     }
 
 
-# Return a model-facing manifest that respects the selected sandbox state.
+# Return a model-facing manifest that respects the selected sandbox state: when the sandbox is
+# off, the sandbox path is hidden and the sandbox tool is removed from the recommended tools.
 def model_upload_payload(manifest: dict[str, Any], *, sandbox_enabled: bool = False) -> dict[str, Any]:
     payload = dict(manifest or {})
     if not sandbox_enabled:
@@ -140,18 +155,18 @@ def model_upload_payload(manifest: dict[str, Any], *, sandbox_enabled: bool = Fa
     return payload
 
 
-# Manifest sidecar path.
+# Return the legacy sidecar manifest path that sits next to an uploaded file.
 def _manifest_sidecar_path(file_path: Path) -> Path:
     return file_path.with_name(f"{file_path.name}{UPLOAD_MANIFEST_SUFFIX}")
 
 
-# Manifest storage dir.
+# Return the manifest folder for a content hash (one folder per sha256, "unknown" when it is empty).
 def _manifest_storage_dir(sha256: str) -> Path:
     safe_sha = re.sub(r"[^a-fA-F0-9]+", "", str(sha256 or "").lower())
     return USER_FILE_MANIFEST_ROOT / (safe_sha or "unknown")
 
 
-# Manifest storage path.
+# Return the path of a manifest inside the hash folder, named after the sanitized file id.
 def _manifest_storage_path(manifest: UploadedFileManifest | dict[str, Any]) -> Path:
     if isinstance(manifest, UploadedFileManifest):
         sha256 = manifest.sha256
@@ -163,7 +178,7 @@ def _manifest_storage_path(manifest: UploadedFileManifest | dict[str, Any]) -> P
     return _manifest_storage_dir(sha256) / f"{safe_id}{UPLOAD_MANIFEST_SUFFIX}"
 
 
-# Write manifest.
+# Write the manifest as JSON into external manifest storage, creating folders as needed.
 def _write_manifest(manifest: UploadedFileManifest) -> None:
     manifest_path = _manifest_storage_path(manifest)
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -173,17 +188,20 @@ def _write_manifest(manifest: UploadedFileManifest) -> None:
     )
 
 
-# Model sandbox path.
+# Build the path of a stored upload as the model sees it: prefix, scope folder and stored name.
 def _model_sandbox_path(model_prefix: str, scope: str, stored_name: str) -> str:
     return f"{model_prefix}/{scope}/{stored_name}".replace("\\", "/")
 
 
 # Map a stored manifest sandbox_path back to a host file path.
+# Raise FileNotFoundError when the path is missing, outside the upload prefix or not a file,
+# and ValueError when it would escape the upload root.
 def resolve_uploaded_file_host_path(manifest: dict[str, Any]) -> Path:
     sandbox_path = str((manifest or {}).get("sandbox_path") or "").strip().replace("\\", "/")
     if not sandbox_path:
         raise FileNotFoundError("Uploaded file content is not available")
 
+    # Strip the model prefix and resolve under the upload root, refusing path traversal.
     mcp_prefix = f"{SANDBOX_MODEL_PREFIX}/"
     if not sandbox_path.startswith(mcp_prefix):
         raise FileNotFoundError("Uploaded file content is not available")
@@ -198,12 +216,12 @@ def resolve_uploaded_file_host_path(manifest: dict[str, Any]) -> Path:
     return target
 
 
-# File sha256.
+# Return the SHA-256 hex digest of the file bytes.
 def _file_sha256(file_bytes: bytes) -> str:
     return hashlib.sha256(file_bytes or b"").hexdigest()
 
 
-# Format upload size.
+# Format a byte count for error messages as GB, MB or bytes.
 def _format_upload_size(size_bytes: int) -> str:
     if size_bytes >= 1024 * 1024 * 1024:
         return f"{size_bytes / (1024 * 1024 * 1024):.1f} GB"
@@ -212,12 +230,16 @@ def _format_upload_size(size_bytes: int) -> str:
     return f"{size_bytes} bytes"
 
 
-# Stream upload to temp.
+# Stream the upload chunk by chunk into a temporary file under <incoming_root>/_incoming while
+# hashing it. Return the temp path, the size, the SHA-256 hex digest and the full bytes (None when
+# the file exceeds INLINE_MANIFEST_MAX_BYTES). Raise ValueError above MAX_UPLOAD_BYTES; the temp
+# file is removed on any failure.
 def _stream_upload_to_temp(
     uploaded_file: Any,
     *,
     incoming_root: Path,
 ) -> tuple[Path, int, str, bytes | None]:
+    # Prepare the temp target, the running hash and the in-memory copy of the file.
     incoming_dir = incoming_root / "_incoming"
     incoming_dir.mkdir(parents=True, exist_ok=True)
     temp_path = incoming_dir / f"{uuid.uuid4().hex}.upload"
@@ -226,6 +248,8 @@ def _stream_upload_to_temp(
     inline_chunks: list[bytes] = []
     keep_inline = True
 
+    # Copy the chunks to disk, enforcing the size limit and dropping the in-memory copy once the
+    # file is too big to keep inline.
     chunks = uploaded_file.chunks() if hasattr(uploaded_file, "chunks") else [uploaded_file.read()]
     try:
         with temp_path.open("wb") as handle:
@@ -248,6 +272,7 @@ def _stream_upload_to_temp(
         try:
             temp_path.unlink(missing_ok=True)
         except OSError:
+            # The temp file is already gone or locked; the original error is re-raised below.
             pass
         raise
 
@@ -255,7 +280,7 @@ def _stream_upload_to_temp(
     return temp_path, size_bytes, sha256.hexdigest(), inline_bytes
 
 
-# Load manifest from sidecar.
+# Read a manifest JSON file. Return None when it is unreadable, invalid or not a JSON object.
 def _load_manifest_from_sidecar(sidecar_path: Path) -> dict[str, Any] | None:
     try:
         manifest = json.loads(sidecar_path.read_text(encoding="utf-8"))
@@ -264,7 +289,7 @@ def _load_manifest_from_sidecar(sidecar_path: Path) -> dict[str, Any] | None:
     return manifest if isinstance(manifest, dict) else None
 
 
-# Iterate manifest paths for sha.
+# Yield the stored manifest files in the folder of the given content hash.
 def _iter_manifest_paths_for_sha(sha256: str):
     manifest_dir = _manifest_storage_dir(sha256)
     if not manifest_dir.exists():
@@ -272,7 +297,8 @@ def _iter_manifest_paths_for_sha(sha256: str):
     yield from manifest_dir.glob(f"*{UPLOAD_MANIFEST_SUFFIX}")
 
 
-# Find stored manifest.
+# Find a stored manifest whose hash, size and name (and sandbox path, when given) all match.
+# Return None when there is none.
 def _find_stored_manifest(
     *,
     sha256: str,
@@ -296,7 +322,9 @@ def _find_stored_manifest(
     return None
 
 
-# Find existing upload.
+# Find an already stored copy of the same upload in the target folder, using the in-memory bytes.
+# Return the stored file path and its manifest (None when no manifest exists and the match was
+# made by comparing the file content), or None when there is no copy.
 def _find_existing_upload(
     target_dir: Path,
     *,
@@ -312,6 +340,8 @@ def _find_existing_upload(
     for file_path in target_dir.iterdir():
         if not file_path.is_file() or file_path.name.endswith(UPLOAD_MANIFEST_SUFFIX):
             continue
+
+        # First choice: a manifest in external storage that describes exactly this file.
         expected_sandbox_path = _model_sandbox_path(model_prefix, safe_scope, file_path.name)
         manifest = _find_stored_manifest(
             sha256=expected_sha256,
@@ -322,6 +352,8 @@ def _find_existing_upload(
         if manifest:
             return file_path, manifest
 
+        # Second choice: a legacy sidecar manifest next to the file. A sidecar that describes a
+        # different file rules this file out.
         sidecar_path = _manifest_sidecar_path(file_path)
         manifest = _load_manifest_from_sidecar(sidecar_path) if sidecar_path.exists() else None
         if manifest:
@@ -335,16 +367,20 @@ def _find_existing_upload(
             ):
                 return file_path, manifest
             continue
+
+        # No manifest at all: fall back to comparing the file content byte for byte.
         try:
             existing_bytes = file_path.read_bytes()
         except OSError:
+            # An unreadable candidate cannot be the same upload; check the next file.
             continue
         if existing_bytes == file_bytes:
             return file_path, None
     return None
 
 
-# Find existing upload by hash.
+# Find an already stored copy of a large upload that was not kept in memory, through its stored
+# manifest alone. Return the stored file path and manifest, or None when there is no such copy.
 def _find_existing_upload_by_hash(
     target_dir: Path,
     *,
@@ -371,7 +407,7 @@ def _find_existing_upload_by_hash(
     return None
 
 
-# Manifest from dict.
+# Build a manifest object from a stored dict. Return None when its fields do not match the dataclass.
 def _manifest_from_dict(manifest: dict[str, Any]) -> UploadedFileManifest | None:
     try:
         return UploadedFileManifest(**manifest)
@@ -379,7 +415,8 @@ def _manifest_from_dict(manifest: dict[str, Any]) -> UploadedFileManifest | None
         return None
 
 
-# Normalize existing manifest for path.
+# Parse a stored manifest and make sure its sandbox_path points at the given stored file,
+# patching it when the manifest was written for another location. Return None when it is invalid.
 def _normalize_existing_manifest_for_path(
     manifest: dict[str, Any],
     *,
@@ -400,7 +437,8 @@ def _normalize_existing_manifest_for_path(
     return _manifest_from_dict(patched)
 
 
-# Build lightweight upload manifest.
+# Build a manifest without any text, archive or table preview, for uploads too large to read
+# into memory. Only identity, size, hash, sandbox path and image vision support are filled in.
 def _build_lightweight_upload_manifest(
     *,
     file_id: str,
@@ -412,6 +450,7 @@ def _build_lightweight_upload_manifest(
     model_supports_vision: bool,
     tool_server_id: str = "sandbox",
 ) -> UploadedFileManifest:
+    # Only the MIME type is derived; every preview field stays empty.
     clean_mime = guess_upload_mime(clean_name, mime)
     recommended_tools = [tool_server_id] if sandbox_path else []
     return UploadedFileManifest(
@@ -433,6 +472,8 @@ def _build_lightweight_upload_manifest(
 
 
 # Persist one Django uploaded file and return its private manifest plus public payload.
+# The file is stored in a folder named after its content hash, so a repeated upload of the same
+# file reuses the existing copy (and its manifest) instead of storing it again.
 def save_upload_to_sandbox(
     uploaded_file: Any,
     *,
@@ -440,11 +481,13 @@ def save_upload_to_sandbox(
     model_supports_vision: bool = False,
     tool_server_ids: list[str] | None = None,
 ) -> tuple[UploadedFileManifest, dict[str, Any]]:
+    # Reject oversized files by their declared size before reading anything.
     clean_name = normalize_upload_name(getattr(uploaded_file, "name", "") or "uploaded-file")
     declared_size_bytes = int(getattr(uploaded_file, "size", 0) or 0)
     if declared_size_bytes > MAX_UPLOAD_BYTES:
         raise ValueError(f"File is too large (max {_format_upload_size(MAX_UPLOAD_BYTES)})")
 
+    # Stream the upload to a temp file and derive the destination folder from its hash.
     storage_target = resolve_upload_storage_target(tool_server_ids)
     mime = str(getattr(uploaded_file, "content_type", "") or "")
     temp_path, size_bytes, file_sha256, file_bytes = _stream_upload_to_temp(
@@ -455,6 +498,7 @@ def save_upload_to_sandbox(
     target_dir = storage_target.upload_root / safe_scope
     target_dir.mkdir(parents=True, exist_ok=True)
 
+    # Look for an existing copy: by content when the bytes are in memory, by manifest otherwise.
     try:
         existing_upload = (
             _find_existing_upload(
@@ -472,6 +516,9 @@ def save_upload_to_sandbox(
                 clean_name=clean_name,
             )
         )
+
+        # Reuse the existing copy: drop the fresh temp file and return its manifest, rebuilding the
+        # manifest when it is missing or invalid.
         if existing_upload:
             existing_path, existing_manifest = existing_upload
             temp_path.unlink(missing_ok=True)
@@ -515,6 +562,8 @@ def save_upload_to_sandbox(
             _write_manifest(rebuilt_manifest)
             return rebuilt_manifest, public_upload_payload(rebuilt_manifest)
 
+        # New file: move the temp file into place and write a full manifest (or a lightweight one
+        # for large files).
         file_id = uuid.uuid4().hex
         stored_name = _stored_file_name(file_id, clean_name)
         target_path = target_dir / stored_name
@@ -549,6 +598,7 @@ def save_upload_to_sandbox(
         try:
             temp_path.unlink(missing_ok=True)
         except OSError:
+            # The temp file is already gone or locked; the original error is re-raised below.
             pass
         raise
 

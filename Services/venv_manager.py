@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Any
 
 
+# Project root, the file that declares all venvs and their packages, the name of the per-venv file
+# that stores the installed package hash, and the environment variable that names the active venv.
 BASE_DIR = Path(__file__).resolve().parent.parent
 REQUIREMENTS_FILE = BASE_DIR / "Settings" / "venv_requirements.json"
 STATE_FILE_NAME = ".aslm_venv_state.json"
@@ -43,12 +45,14 @@ def load_config() -> dict[str, Any]:
     try:
         payload = json.loads(REQUIREMENTS_FILE.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
+        # An unreadable or invalid file is treated like a missing one: no venvs configured.
         return {"fileVersion": 1, "venvs": []}
 
     return payload if isinstance(payload, dict) else {"fileVersion": 1, "venvs": []}
 
 
-# Return normalized venv definitions from the requirements file.
+# Return normalized venv definitions from the requirements file. Entries without an id or a path
+# are skipped; the package and tool lists are cleaned to non-empty strings.
 def iter_venv_configs() -> list[dict[str, Any]]:
     raw_venvs = load_config().get("venvs", [])
     if not isinstance(raw_venvs, list):
@@ -64,6 +68,7 @@ def iter_venv_configs() -> list[dict[str, Any]]:
         if not venv_id or not relative_path:
             continue
 
+        # Accept only list values for the package and tool lists.
         packages = raw_item.get("packages", [])
         if not isinstance(packages, list):
             packages = []
@@ -74,6 +79,7 @@ def iter_venv_configs() -> list[dict[str, Any]]:
         if not isinstance(tools, list):
             tools = []
 
+        # "tool" is a single tool directory name, "tools" a list of them (see get_tool_venv_id).
         venvs.append(
             {
                 "id": venv_id,
@@ -141,9 +147,9 @@ def get_tool_python(tool_dir_name: str) -> Path | None:
 # Subprocess environments
 
 # Prepare child-process storage without changing the host process or adding module data roots.
+# On Linux, keep browser downloads in their venv and scratch files in the ASLM profile; on other
+# platforms return an unchanged copy of the current environment.
 def get_subprocess_environment(python_path: Path) -> dict[str, str]:
-    """Keep Linux browser downloads in their venv and scratch files in the ASLM profile."""
-
     environment = os.environ.copy()
     if not sys.platform.startswith("linux"):
         return environment
@@ -169,6 +175,7 @@ def get_subprocess_environment(python_path: Path) -> dict[str, str]:
 # Internal helpers
 
 # Run one subprocess command and optionally stream output to the console.
+# Return True when the command exits with code 0.
 def _run(
     command: list[str],
     *,
@@ -178,6 +185,8 @@ def _run(
 ) -> bool:
     working_dir = str(cwd or BASE_DIR)
     environment = get_subprocess_environment(Path(command[0]))
+
+    # Logging mode: stream the merged stdout/stderr line by line with the log prefix.
     if log:
         try:
             process = subprocess.Popen(
@@ -207,6 +216,7 @@ def _run(
             )
         return return_code == 0
 
+    # Silent mode: capture the output and report only success or failure.
     try:
         result = subprocess.run(
             command,
@@ -217,6 +227,7 @@ def _run(
             check=False,
         )
     except Exception:
+        # The command could not be started; the caller only needs the failure result.
         return False
 
     return result.returncode == 0
@@ -298,6 +309,7 @@ def _pip_install(
     if not packages:
         return True
 
+    # Build the pip command; no_deps installs the packages without resolving their dependencies.
     command = [
         str(python_path),
         "-m",
@@ -310,6 +322,7 @@ def _pip_install(
         command.append("--no-deps")
     command.extend(packages)
 
+    # Log what is about to be installed, then run pip.
     if log:
         suffix = " (no deps)" if no_deps else ""
         _print_log(
@@ -335,6 +348,7 @@ def _install_packages(
     if not python_path.exists():
         return False
 
+    # Install the regular packages first, then the no-deps ones; stop at the first failure.
     if packages and not _pip_install(
         python_path, packages, no_deps=False, log=log, label=venv_id, log_prefix=log_prefix
     ):
@@ -356,6 +370,8 @@ def _install_packages(
 # Public venv lifecycle
 
 # Create or update one configured ASLM-Chat venv when packages changed.
+# Return True when the venv is ready: created if missing, and packages installed unless the hash
+# stored from the last successful install already matches the configured packages.
 def ensure_venv(venv_id: str, *, log: bool = True, log_prefix: str | None = None) -> bool:
     config = get_venv_config(venv_id)
     if config is None:
@@ -368,9 +384,11 @@ def ensure_venv(venv_id: str, *, log: bool = True, log_prefix: str | None = None
     packages = list(config.get("packages", []))
     packages_no_deps = list(config.get("packages_no_deps", []))
 
+    # Create the venv when its Python executable is missing.
     if not python_path.exists() and not _create_venv(venv_id, log, log_prefix):
         return False
 
+    # Skip the install when the package hash matches the last successful install.
     state = _read_state(venv_path)
     if state.get("packagesHash") == _packages_signature(packages, packages_no_deps):
         if not python_path.exists():
@@ -384,6 +402,7 @@ def ensure_venv(venv_id: str, *, log: bool = True, log_prefix: str | None = None
                 _print_log(f"Venv '{venv_id}' is up to date.", log_prefix=log_prefix)
             return True
 
+    # Install the packages and remember their hash only after a successful install.
     if not _install_packages(venv_id, packages, packages_no_deps, log, log_prefix):
         return False
 
@@ -391,7 +410,8 @@ def ensure_venv(venv_id: str, *, log: bool = True, log_prefix: str | None = None
     return True
 
 
-# Create or update every venv listed in the requirements file.
+# Create or update every venv listed in the requirements file, all in parallel.
+# Return True only when every venv is ready.
 def ensure_all(*, log: bool = True) -> bool:
     configs = iter_venv_configs()
     if not configs:
@@ -400,6 +420,7 @@ def ensure_all(*, log: bool = True) -> bool:
     if log:
         _print_log(f"Preparing {len(configs)} venv(s) in parallel.")
 
+    # Start one worker per venv and collect the results as they finish.
     ok = True
     with ThreadPoolExecutor(max_workers=len(configs)) as executor:
         futures = {
@@ -416,6 +437,7 @@ def ensure_all(*, log: bool = True) -> bool:
             try:
                 venv_ok = future.result()
             except Exception as exc:
+                # An unexpected crash in one worker marks only that venv as failed.
                 venv_ok = False
                 if log:
                     _print_log(
