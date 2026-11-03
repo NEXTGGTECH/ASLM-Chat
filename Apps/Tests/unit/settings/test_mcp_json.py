@@ -12,6 +12,7 @@ from Settings import mcp_json
 pytestmark = [pytest.mark.unit]
 
 
+# Redirect the MCP directory and mcp.json to a temporary location and return the (not yet created) directory.
 @pytest.fixture
 def isolated_mcp(tmp_path, monkeypatch):
     mcp_dir = tmp_path / "MCP"
@@ -20,10 +21,9 @@ def isolated_mcp(tmp_path, monkeypatch):
     return mcp_dir
 
 
-# Bootstrap.
+# Bootstrap
 
-
-# ensure_default_mcp_json creates the directory and a valid empty document.
+# Verify that ensure_default_mcp_json creates the directory and a valid empty document.
 def test_ensure_default_creates_empty_document(isolated_mcp):
     mcp_json.ensure_default_mcp_json()
 
@@ -31,7 +31,7 @@ def test_ensure_default_creates_empty_document(isolated_mcp):
     assert document == {"mcpServers": {}}
 
 
-# An existing file is never overwritten by the bootstrap.
+# Verify that the bootstrap never overwrites an existing mcp.json.
 def test_ensure_default_preserves_existing_document(isolated_mcp):
     path = isolated_mcp / "mcp.json"
     path.parent.mkdir(parents=True)
@@ -42,11 +42,12 @@ def test_ensure_default_preserves_existing_document(isolated_mcp):
     assert json.loads(path.read_text(encoding="utf-8"))["mcpServers"]["custom"]["command"] == "run"
 
 
-# Entry parsing.
+# Entry parsing
 
-
-# Stdio entries normalize command, args, env, and cwd.
+# Verify that a command-based entry is parsed as a stdio server with its config key, derived lowercase server id,
+# command, args, env and cwd, and without url or headers.
 def test_iter_entries_parses_stdio_server(isolated_mcp):
+    # Arrange: a module directory whose mcp.json holds one stdio server.
     module_dir = isolated_mcp.parent
     (module_dir / "MCP").mkdir(exist_ok=True)
     (module_dir / "MCP" / "mcp.json").write_text(
@@ -65,8 +66,10 @@ def test_iter_entries_parses_stdio_server(isolated_mcp):
         encoding="utf-8",
     )
 
+    # Act: parse the module's user MCP entries.
     entries = mcp_json.iter_user_mcp_entries_for(module_dir, set())
 
+    # Assert: the single entry carries the normalized stdio fields.
     assert len(entries) == 1
     entry = entries[0]
     assert entry.config_key == "Filesystem"
@@ -80,7 +83,7 @@ def test_iter_entries_parses_stdio_server(isolated_mcp):
     assert entry.headers is None
 
 
-# HTTP entries carry url and headers instead of a command.
+# Verify that a url-based entry is parsed as an http server with its url and headers and without a command.
 def test_iter_entries_parses_http_server(isolated_mcp):
     module_dir = isolated_mcp.parent
     (module_dir / "MCP").mkdir(exist_ok=True)
@@ -108,7 +111,8 @@ def test_iter_entries_parses_http_server(isolated_mcp):
     assert entry.command is None
 
 
-# Entries specifying both url and command are ambiguous and skipped.
+# Verify that entries with both url and command, with neither, with an empty name or that are not objects are
+# skipped, and only the valid entry is returned.
 def test_iter_entries_skips_ambiguous_and_empty_entries(isolated_mcp):
     module_dir = isolated_mcp.parent
     (module_dir / "MCP").mkdir(exist_ok=True)
@@ -132,7 +136,8 @@ def test_iter_entries_skips_ambiguous_and_empty_entries(isolated_mcp):
     assert [entry.config_key for entry in entries] == ["good"]
 
 
-# Server ids avoid collisions with reserved ids by prefixing.
+# Verify that a server id that collides with a reserved id gets a "user_" prefix, while other names are turned
+# into plain ids with underscores for spaces.
 def test_iter_entries_generates_unique_ids_against_reserved(isolated_mcp):
     module_dir = isolated_mcp.parent
     (module_dir / "MCP").mkdir(exist_ok=True)
@@ -153,7 +158,7 @@ def test_iter_entries_generates_unique_ids_against_reserved(isolated_mcp):
     assert [entry.server_id for entry in entries] == ["user_echo", "echo_two"]
 
 
-# Broken documents degrade to an empty entry list instead of raising.
+# Verify that a document that is not valid JSON yields an empty entry list instead of raising.
 def test_iter_entries_returns_empty_for_invalid_document(isolated_mcp):
     module_dir = isolated_mcp.parent
     (module_dir / "MCP").mkdir(exist_ok=True)
@@ -162,15 +167,15 @@ def test_iter_entries_returns_empty_for_invalid_document(isolated_mcp):
     assert mcp_json.iter_user_mcp_entries_for(module_dir, set()) == []
 
 
-# A missing document simply yields no entries.
+# Verify that a missing mcp.json yields an empty entry list.
 def test_iter_entries_returns_empty_for_missing_file(tmp_path):
     assert mcp_json.iter_user_mcp_entries_for(tmp_path, set()) == []
 
 
-# Document validation.
+# Document validation
 
-
-# Document validation rejects malformed server definitions.
+# Verify that validation raises ValueError for malformed documents: a missing or non-object mcpServers, entries
+# that are not objects, entries with both or neither of url and command, and wrongly typed args, env or headers.
 @pytest.mark.parametrize(
     "document",
     [
@@ -192,7 +197,7 @@ def test_validate_mcp_document_rejects_invalid_documents(document):
         mcp_json.validate_mcp_document(document)
 
 
-# Well-formed stdio and HTTP documents pass validation.
+# Verify that well-formed stdio and http server definitions pass validation without an error.
 def test_validate_mcp_document_accepts_valid_servers():
     mcp_json.validate_mcp_document(
         {
@@ -204,10 +209,9 @@ def test_validate_mcp_document_accepts_valid_servers():
     )
 
 
-# Persistence.
+# Persistence
 
-
-# save_raw_text normalizes JSON and persists it atomically.
+# Verify that save_raw_text writes the document as normalized JSON that ends with a newline.
 def test_save_raw_text_persists_normalized_document(isolated_mcp):
     mcp_json.save_raw_text('{"mcpServers":{"srv":{"command":"run"}}}')
 
@@ -216,7 +220,8 @@ def test_save_raw_text_persists_normalized_document(isolated_mcp):
     assert (isolated_mcp / "mcp.json").read_text(encoding="utf-8").endswith("\n")
 
 
-# Invalid JSON or invalid documents leave the stored file untouched.
+# Verify that save_raw_text raises ValueError for invalid JSON or an invalid document and leaves the stored file
+# unchanged.
 def test_save_raw_text_rejects_invalid_input(isolated_mcp):
     mcp_json.save_raw_text('{"mcpServers":{"srv":{"command":"run"}}}')
     before = (isolated_mcp / "mcp.json").read_text(encoding="utf-8")
@@ -229,7 +234,8 @@ def test_save_raw_text_rejects_invalid_input(isolated_mcp):
     assert (isolated_mcp / "mcp.json").read_text(encoding="utf-8") == before
 
 
-# load_parsed returns the parsed document or raises a readable error.
+# Verify that load_parsed returns the saved document and raises a readable ValueError for a non-object root and
+# for invalid JSON.
 def test_load_parsed_roundtrip_and_errors(isolated_mcp):
     mcp_json.save_raw_text('{"mcpServers": {}}')
 
@@ -244,7 +250,8 @@ def test_load_parsed_roundtrip_and_errors(isolated_mcp):
         mcp_json.load_parsed()
 
 
-# The signature changes with the file state so caches can invalidate.
+# Verify that the file signature is None while mcp.json is missing and a tuple starting with the file path once
+# it exists.
 def test_signature_tracks_file_presence(isolated_mcp):
     assert mcp_json.mcp_json_signature_for(isolated_mcp.parent) is None
 

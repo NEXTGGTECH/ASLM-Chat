@@ -13,10 +13,9 @@ from Settings import settings as project_settings
 pytestmark = [pytest.mark.unit]
 
 
-# Loading.
+# Loading
 
-
-# A fresh install without settings.json boots on the documented defaults.
+# Verify that a fresh install without a settings file boots on the documented defaults.
 def test_load_without_settings_file_returns_defaults(isolated_settings):
     data = project_settings.load_settings()
 
@@ -26,7 +25,7 @@ def test_load_without_settings_file_returns_defaults(isolated_settings):
     assert data["sandbox-memory-limit"] == 6
 
 
-# Stored values win over defaults, missing keys fall back to defaults.
+# Verify that stored values win over the defaults while keys missing from the file fall back to the defaults.
 def test_load_merges_stored_payload_over_defaults(isolated_settings):
     isolated_settings.joinpath("settings_file.json").write_text(
         json.dumps({"ui-port": 30123, "web-search-max-results": 25}),
@@ -40,7 +39,7 @@ def test_load_merges_stored_payload_over_defaults(isolated_settings):
     assert data["debug"] is True
 
 
-# A corrupt settings file degrades to defaults instead of crashing boot.
+# Verify that a corrupt settings file falls back to the defaults instead of crashing the boot.
 def test_corrupt_settings_file_falls_back_to_defaults(isolated_settings):
     isolated_settings.joinpath("settings_file.json").write_text("{not json", encoding="utf-8")
 
@@ -49,14 +48,15 @@ def test_corrupt_settings_file_falls_back_to_defaults(isolated_settings):
     assert data["ui-port"] == 20000
 
 
-# A settings file holding a JSON array (not an object) is ignored.
+# Verify that a settings file holding a JSON array instead of an object is ignored and the defaults are used.
 def test_non_object_settings_file_is_ignored(isolated_settings):
     isolated_settings.joinpath("settings_file.json").write_text("[1, 2]", encoding="utf-8")
 
     assert project_settings.load_settings()["ui-port"] == 20000
 
 
-# Removed legacy tool keys are silently dropped from loaded snapshots.
+# Verify that removed legacy tool keys are dropped from the loaded settings, even when the file or an environment
+# variable still provides them, while other keys are kept.
 @pytest.mark.parametrize("key", [
     "sandbox-image-source",
     "web-search-query-rewriter-endpoint",
@@ -75,10 +75,10 @@ def test_removed_tool_setting_keys_are_dropped(isolated_settings, monkeypatch, k
     assert data["ui-port"] == 20001
 
 
-# Environment overrides.
+# Environment overrides
 
-
-# ASLM_* environment variables override the persisted values with coercion.
+# Verify that ASLM_* environment variables override the settings and their string values are coerced to the
+# proper types (integer, boolean).
 def test_environment_overrides_apply_with_value_normalization(isolated_settings, monkeypatch):
     monkeypatch.setenv("ASLM_UI_PORT", "31234")
     monkeypatch.setenv("ASLM_WEB_SEARCH_TOR_ENABLED", "true")
@@ -89,7 +89,8 @@ def test_environment_overrides_apply_with_value_normalization(isolated_settings,
     assert data["web-search-tor-enabled"] is True
 
 
-# Host-injected identity variables never become settings keys.
+# Verify that the identity variables injected by the host (ASLM_MODULE_ID, ASLM_MODULE_DIR) do not become
+# settings keys.
 def test_host_identity_environment_keys_are_ignored(isolated_settings, monkeypatch):
     monkeypatch.setenv("ASLM_MODULE_ID", "aslm-chat")
     monkeypatch.setenv("ASLM_MODULE_DIR", "C:/somewhere")
@@ -100,7 +101,8 @@ def test_host_identity_environment_keys_are_ignored(isolated_settings, monkeypat
     assert "module_dir" not in data
 
 
-# Historical mixed-separator keys resolve from environment variable names.
+# Verify that an environment variable name maps onto a historical key that mixes separators
+# (ollama-service_port).
 def test_environment_key_normalization_matches_historical_keys(isolated_settings, monkeypatch):
     monkeypatch.setenv("ASLM_OLLAMA_SERVICE_PORT", "31111")
 
@@ -109,10 +111,10 @@ def test_environment_key_normalization_matches_historical_keys(isolated_settings
     assert data["ollama-service_port"] == 31111
 
 
-# Saving.
+# Saving
 
-
-# save_settings persists and reloads through the cache.
+# Verify that save_settings persists the values so load_settings returns them and the settings file contains
+# them.
 def test_save_settings_roundtrip(isolated_settings):
     project_settings.save_settings({"ui-port": 30500})
 
@@ -122,7 +124,7 @@ def test_save_settings_roundtrip(isolated_settings):
     assert json.loads(isolated_settings.joinpath("settings_file.json").read_text(encoding="utf-8"))["ui-port"] == 30500
 
 
-# Saving settings regenerates the derived tool configuration documents.
+# Verify that saving settings regenerates the derived web search API key and browser agent configuration files.
 def test_save_settings_syncs_generated_tool_configs(isolated_settings):
     payload = {"web-search-tavily-api-key": "tvly-secret-123", "browser-agent-headless": True}
 
@@ -139,7 +141,8 @@ def test_save_settings_syncs_generated_tool_configs(isolated_settings):
     assert browser_doc["browser_headless"] is True
 
 
-# Synchronization removes old rewriter overrides while preserving JSON-only options.
+# Verify that saving settings removes the old endpoint and model overrides of the query rewriter section while
+# keeping the options that exist only in the JSON file.
 def test_save_settings_removes_legacy_query_rewriter_overrides(isolated_settings):
     path = project_settings.WEB_SEARCH_CONFIG_FILE
     path.write_text(json.dumps({"query_rewriter": {
@@ -159,7 +162,7 @@ def test_save_settings_removes_legacy_query_rewriter_overrides(isolated_settings
     assert section["max_queries"] == 2
 
 
-# set() persists the value and mirrors it into the module manifest.
+# Verify that set() persists the value in the settings file and mirrors it into the module manifest.
 def test_set_persists_value_and_mirrors_manifest(isolated_settings, isolated_manifest):
     project_settings.set("ui-port", 30001, sync_runtime=False)
 
@@ -171,7 +174,8 @@ def test_set_persists_value_and_mirrors_manifest(isolated_settings, isolated_man
     assert mirrored["ui-port"] == 30001
 
 
-# Host account keys never leave the local settings file.
+# Verify that a host account key is stored in the local settings file but never mirrored into the module
+# manifest.
 def test_host_key_settings_are_not_mirrored_to_manifest(isolated_settings, isolated_manifest):
     # The manifest advertises the key so only the guard, not its absence,
     # can make this test pass.
@@ -189,7 +193,7 @@ def test_host_key_settings_are_not_mirrored_to_manifest(isolated_settings, isola
     assert stored["key-gh"] == "gh-token"
 
 
-# Sharing one TCP port between two services produces a collision warning.
+# Verify that two services configured with the same TCP port produce a port collision warning on load.
 def test_port_collision_logs_warning(isolated_settings, caplog):
     isolated_settings.joinpath("settings_file.json").write_text(
         json.dumps({"ui-port": 30000, "ollama-service_port": 30000}),
@@ -202,10 +206,10 @@ def test_port_collision_logs_warning(isolated_settings, caplog):
     assert any("port collision" in record.message.lower() for record in caplog.records)
 
 
-# Engine resolution.
+# Engine resolution
 
-
-# Requesting an engine that is not enabled falls back to the first enabled one.
+# Verify that requesting an engine that is not enabled (also through an alias) resolves to the first enabled
+# engine.
 def test_resolve_enabled_engine_falls_back_to_first_enabled(isolated_settings):
     project_settings.save_settings({"openai": True}, sync_tool_configs=False)
 
@@ -213,14 +217,15 @@ def test_resolve_enabled_engine_falls_back_to_first_enabled(isolated_settings):
     assert project_settings.resolve_enabled_engine("gemini") == "openai"
 
 
-# The active engine is preserved when it is enabled.
+# Verify that the configured LLM engine is kept when it is enabled.
 def test_resolve_enabled_engine_keeps_enabled_engine(isolated_settings):
     project_settings.save_settings({"openai": True, "llm-engine": "openai"}, sync_tool_configs=False)
 
     assert project_settings.get_llm_engine() == "openai"
 
 
-# Engine URLs are built from the configured endpoints.
+# Verify that engine URLs are built from the configured port or address: loopback with the port for the managed
+# Ollama service, no trailing slash for OpenAI and an added https scheme for Google GenAI.
 def test_get_engine_url_builds_endpoints(isolated_settings):
     project_settings.save_settings(
         {
@@ -236,7 +241,8 @@ def test_get_engine_url_builds_endpoints(isolated_settings):
     assert project_settings.get_engine_url("google-genai") == "https://generativelanguage.googleapis.com"
 
 
-# The OpenAI key getter prefers the stored key and falls back to the env var.
+# Verify that the OpenAI API key is empty by default, comes from the OPENAI_API_KEY environment variable when no
+# key is stored, and that a stored key wins over the environment.
 def test_openai_api_key_falls_back_to_environment(isolated_settings, monkeypatch):
     assert project_settings.get_openai_api_key() == ""
 
@@ -247,10 +253,10 @@ def test_openai_api_key_falls_back_to_environment(isolated_settings, monkeypatch
     assert project_settings.get_openai_api_key() == "stored-key"
 
 
-# Value normalization.
+# Value normalization
 
-
-# Address normalization strips schemes and trailing slashes for storage.
+# Verify that address normalization strips the scheme and trailing slash for storage and keeps a bare host and
+# port.
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
@@ -264,7 +270,8 @@ def test_normalize_engine_address(raw, expected):
     assert project_settings.normalize_engine_address(raw) == expected
 
 
-# Engine aliases resolve to canonical identifiers.
+# Verify that engine aliases resolve to their canonical identifiers and a missing name resolves to the managed
+# Ollama service.
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
@@ -280,7 +287,8 @@ def test_normalize_engine_name(raw, expected):
     assert project_settings.normalize_engine_name(raw) == expected
 
 
-# Scalar coercion covers the value formats arriving from environment variables.
+# Verify that string values from environment variables are coerced to numbers (also with a decimal comma),
+# booleans, null and JSON objects, and plain text is kept.
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
@@ -298,7 +306,8 @@ def test_normalize_setting_value(raw, expected):
     assert project_settings.normalize_setting_value(raw) == expected
 
 
-# Gigabyte settings reject non-positive and non-numeric values.
+# Verify that a gigabyte value is accepted as a positive number or numeric string, while zero, negative,
+# non-numeric and boolean values are replaced by the given default.
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
