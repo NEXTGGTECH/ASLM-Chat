@@ -22,6 +22,7 @@ def list_background_jobs() -> dict:
                     if returncode is not None:
                         JOB_REGISTRY.mark_done(job.job_id, returncode)
             except Exception:
+                # A job that vanished or cannot be polled is simply reported with its old status.
                 pass
     return {"jobs": JOB_REGISTRY.list_jobs()}
 
@@ -56,6 +57,7 @@ def kill_background_job(job_id: str) -> dict:
         try:
             process.wait(timeout=2)
         except Exception:
+            # The process may ignore the wait timeout or already be gone; the job is marked killed anyway.
             pass
     JOB_REGISTRY.mark_killed(job.job_id)
     return job.to_result()

@@ -75,11 +75,18 @@ from sandbox.workspace import (
 
 logger = logging.getLogger(__name__)
 
+# Image label and value that mark an image carrying the current supervisor runtime; older images are rebuilt.
 REQUIRED_IMAGE_LABEL = "org.aslm.sandbox.supervisor-runtime"
 REQUIRED_IMAGE_LABEL_VALUE = "container-v2"
+
+# Reply the in-container supervisor prints to a ping, proving it runs the expected protocol version.
 SUPERVISOR_PONG = "sandbox-supervisor-pong-v2"
+
+# Old and current model-facing directory for uploaded user files; old paths are rewritten in bash commands.
 LEGACY_UPLOAD_MODEL_ROOT = "/mnt/data/User"
 UPLOAD_MODEL_ROOT = f"{MODEL_WORKSPACE_CONTAINER.rstrip('/')}/User"
+
+# Default container directory for background job spool files (stdout, stderr and status of each job).
 DEFAULT_DOCKER_JOB_ROOT = "/workspace/.sandbox_jobs"
 
 
@@ -118,7 +125,7 @@ def _docker_job_root_candidates() -> list[str]:
 
 # Subprocess helpers
 
-# Run a subprocess command with UTF-8 text handling.
+# Run a subprocess command with captured UTF-8 text output (undecodable bytes are replaced).
 def _run_command(
     args: list[str],
     timeout: int = 30,
@@ -145,6 +152,7 @@ def _docker_cli_available() -> bool:
         result = _run_command(["docker", "--version"], timeout=5)
         return result.returncode == 0
     except Exception:
+        # Any failure to run the CLI (missing binary, timeout) means it is not usable.
         return False
 
 
@@ -163,19 +171,23 @@ def _auto_start_docker_enabled() -> bool:
 # Returns (launched, message); launched=True means a start was triggered and the
 # caller should poll the daemon, False means nothing could be started here.
 def _launch_docker_desktop() -> tuple[bool, str]:
+    # Windows: start the first Docker Desktop executable found.
     if sys.platform == "win32":
         for path in WINDOWS_DOCKER_DESKTOP_PATHS:
             if not os.path.isfile(path):
                 continue
+
+            # 0x00000008 is DETACHED_PROCESS: Docker Desktop must outlive this process.
             subprocess.Popen(
                 [path],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                creationflags=0x00000008,  # DETACHED_PROCESS
+                creationflags=0x00000008,
             )
             return True, "Docker Desktop is starting."
         return False, "Docker Desktop not found. Install or start it manually."
 
+    # macOS: open the Docker app bundle (found on disk, or by name).
     if sys.platform == "darwin":
         app_path = next((p for p in MACOS_DOCKER_DESKTOP_PATHS if os.path.isdir(p)), None)
         command = ["open", "-a", "Docker"] if app_path is None else ["open", app_path]
@@ -192,7 +204,10 @@ def _launch_docker_desktop() -> tuple[bool, str]:
             if result.returncode == 0:
                 return True, "Docker Desktop is starting."
         except Exception:
+            # systemctl may be missing or fail; fall back to starting the executable directly.
             pass
+
+        # Fall back to launching a Docker Desktop executable in its own session.
         for path in LINUX_DOCKER_DESKTOP_PATHS:
             if not os.path.isfile(path):
                 continue
@@ -205,7 +220,9 @@ def _launch_docker_desktop() -> tuple[bool, str]:
                 )
                 return True, "Docker Desktop is starting."
             except Exception:
+                # This executable could not be started; try the next candidate.
                 continue
+
         # The system docker daemon cannot be started without privileges from here.
         return (
             False,
@@ -216,16 +233,19 @@ def _launch_docker_desktop() -> tuple[bool, str]:
     return False, "Docker daemon is not running. Start Docker and try again."
 
 
-# Ensure the Docker daemon is available.
+# Ensure the Docker daemon is available, launching Docker Desktop and waiting up to
+# DOCKER_START_TIMEOUT_SECONDS for it when automatic start is enabled. Return (ok, message).
 def _ensure_docker_running() -> tuple[bool, str]:
     if not _docker_cli_available():
         return False, "Docker CLI not found. Install Docker Desktop first."
 
+    # Fast path: the daemon already answers.
     try:
         info_result = _docker_info(timeout=5)
         if info_result.returncode == 0:
             return True, "Docker daemon is running."
     except Exception:
+        # An unreachable daemon is handled below by launching it or reporting that it is not running.
         pass
 
     if not _auto_start_docker_enabled():
@@ -239,6 +259,7 @@ def _ensure_docker_running() -> tuple[bool, str]:
     if not launched:
         return False, message
 
+    # Poll the daemon every two seconds until it answers or the start timeout passes.
     deadline = time.time() + DOCKER_START_TIMEOUT_SECONDS
     while time.time() < deadline:
         time.sleep(2)
@@ -247,6 +268,7 @@ def _ensure_docker_running() -> tuple[bool, str]:
             if check_result.returncode == 0:
                 return True, "Docker started successfully."
         except Exception:
+            # The daemon is still starting up; keep polling until the deadline.
             continue
 
     return (
@@ -257,6 +279,7 @@ def _ensure_docker_running() -> tuple[bool, str]:
 
 # Container existence checks
 
+# Return whether a container named CONTAINER_NAME exists in any state.
 def _container_exists() -> bool:
     result = _run_command(
         ["docker", "ps", "-aq", "-f", f"name=^{CONTAINER_NAME}$"], timeout=10
@@ -266,6 +289,7 @@ def _container_exists() -> bool:
 
 # Image preparation
 
+# Return whether the docker image inspect JSON carries the required supervisor runtime label.
 def _image_has_required_runtime(inspect_stdout: str) -> bool:
     try:
         image_info = json.loads(inspect_stdout)
@@ -301,6 +325,8 @@ def _ensure_image(force_rebuild: bool = False) -> tuple[bool, str]:
 
 # Container run command
 
+# Return the host path of the Linux supervisor venv to bind-mount into the container, or None when none is
+# configured. Raise ValueError when the configured venv is a Windows venv or lacks bin/python or pyvenv.cfg.
 def _linux_venv_bind_source() -> str | None:
     if not SUPERVISOR_VENV_HOST:
         return None
@@ -334,6 +360,7 @@ def _build_run_command(
     restart_policy: str | None = "unless-stopped",
     auto_remove: bool = False,
 ) -> list[str]:
+    # Resource limits (CPU, memory, swap, process count) common to every sandbox container.
     command = [
         "docker", "run", "-d",
         "--name", container_name,
@@ -347,10 +374,11 @@ def _build_run_command(
         command.extend(["--restart", restart_policy])
     if auto_remove:
         command.append("--rm")
+
+    # Network isolation or bandwidth shaping, plus the storage limit below.
     # Do not add --security-opt no-new-privileges here unless the sudo model
     # is redesigned. The sandbox_user intentionally has passwordless sudo for
     # package-manager compatibility, and no-new-privileges would break sudo.
-
     if not NETWORK_ENABLED:
         command.extend(["--network", "none"])
     elif NETWORK_LIMIT_MBIT > 0:
@@ -359,6 +387,7 @@ def _build_run_command(
     if include_storage_limit and STORAGE_LIMIT:
         command.extend(["--storage-opt", f"size={STORAGE_LIMIT}"])
 
+    # Resolve the host directory mounted as the model workspace and the optional dev bind-mount sources.
     task_host_path = task_host_path or os.path.join(HOST_WORKSPACE, DEFAULT_TASK_DIR)
     os.makedirs(task_host_path, exist_ok=True)
     supervisor_src_host = SUPERVISOR_SRC_HOST
@@ -406,6 +435,7 @@ def _build_run_command(
         "-e", f"VECLIB_MAXIMUM_THREADS={THREAD_LIMIT}",
     ])
 
+    # In dev-bind mode, mount the supervisor source and venv from the host read-only.
     if DEV_BIND and supervisor_src_host and os.path.isdir(supervisor_src_host):
         command.extend(["-v", f"{supervisor_src_host}:{SUPERVISOR_SRC}:ro"])
 
@@ -418,6 +448,7 @@ def _build_run_command(
 
 # Container lifecycle
 
+# Serializes container creation, replacement and restart across threads.
 _container_lock = threading.Lock()
 
 
@@ -435,6 +466,9 @@ def _ensure_container_running(
         return _ensure_container_locked(image_name, max_retries, retry_delay)
 
 
+# Bring the container to the running state with the correct workspace mount, retrying up to max_retries
+# times with retry_delay seconds between attempts. The caller must hold _container_lock. Return (ok, message);
+# on failure the message names the last error.
 def _ensure_container_locked(
     image_name: str,
     max_retries: int,
@@ -448,6 +482,7 @@ def _ensure_container_locked(
 
         state = _inspect_container()
 
+        # No container yet: create it and wait for it to run; a container that never runs is removed.
         if state is None:
             ok, msg = _create_container(image_name)
             if not ok:
@@ -462,9 +497,11 @@ def _ensure_container_locked(
             last_error = run_msg
             continue
 
+        # Already running with the expected workspace mount: nothing to do.
         if state["running"] and state["volume_ok"]:
             return True, "Container is running."
 
+        # The container mounts a different workspace: replace it with a correctly mounted one.
         if not state["volume_ok"]:
             ok, msg = _force_remove()
             if not ok:
@@ -481,6 +518,7 @@ def _ensure_container_locked(
             last_error = run_msg
             continue
 
+        # Stopped container with the right mount: start it, and recreate it when starting fails.
         if state["exists"] and not state["running"]:
             ok, msg = _start_existing()
             if ok:
@@ -501,6 +539,8 @@ def _ensure_container_locked(
     return False, f"Failed after {max_retries} attempts. Last error: {last_error}"
 
 
+# Inspect the sandbox container. Return None when it does not exist or cannot be parsed, otherwise a dict
+# with exists, running, status and volume_ok (whether the expected host workspace is among its mounts).
 def _inspect_container() -> dict | None:
     result = _run_command(["docker", "inspect", CONTAINER_NAME], timeout=10)
     if result.returncode != 0:
@@ -525,9 +565,11 @@ def _inspect_container() -> dict | None:
             "volume_ok": expected_mount in actual_mount.split(),
         }
     except Exception:
+        # Unparseable inspect output is treated like a missing container so the caller recreates it.
         return None
 
 
+# Force-remove the sandbox container. A container that is already gone counts as success.
 def _force_remove() -> tuple[bool, str]:
     result = _run_command(["docker", "rm", "-f", CONTAINER_NAME], timeout=30)
     if result.returncode == 0:
@@ -537,6 +579,7 @@ def _force_remove() -> tuple[bool, str]:
     return False, result.stderr.strip()
 
 
+# Start the existing stopped container and confirm it is actually running afterwards.
 def _start_existing() -> tuple[bool, str]:
     result = _run_command(["docker", "start", CONTAINER_NAME], timeout=30)
     if result.returncode == 0:
@@ -548,6 +591,8 @@ def _start_existing() -> tuple[bool, str]:
     return False, result.stderr.strip()
 
 
+# Return whether docker's error output says the storage-opt size limit is unsupported by the storage
+# driver or filesystem, in which case the container is created without it.
 def _storage_limit_unsupported(stderr_text: str) -> bool:
     lowered = stderr_text.lower()
     return any(
@@ -557,11 +602,14 @@ def _storage_limit_unsupported(stderr_text: str) -> bool:
     )
 
 
+# Create and start the sandbox container from the image (building or pulling the image first when
+# needed). With a storage limit configured, retry once without it when the storage driver rejects it.
 def _create_container(image_name: str) -> tuple[bool, str]:
     build_ok, build_msg = _ensure_image()
     if not build_ok:
         return False, build_msg
 
+    # Storage limit configured: try with it first, then without it if it is unsupported.
     if STORAGE_LIMIT:
         try:
             cmd = _build_run_command(image_name, include_storage_limit=True)
@@ -580,6 +628,7 @@ def _create_container(image_name: str) -> tuple[bool, str]:
                 return True, f"Container '{CONTAINER_NAME}' created (no storage quota)."
         return False, result.stderr.strip()
 
+    # No storage limit configured.
     try:
         cmd = _build_run_command(image_name, include_storage_limit=False)
     except ValueError as exc:
@@ -591,8 +640,7 @@ def _create_container(image_name: str) -> tuple[bool, str]:
 
 
 # Poll until the container reaches 'running' state or the timeout expires.
-#
-# Returns False if the container enters a restart loop (crashes immediately)
+# Return False if the container enters a restart loop (crashes immediately)
 # so the caller can report a meaningful error rather than getting a confusing
 # 'Container is restarting' error from docker exec.
 def _wait_for_container_running(timeout_s: float = 10.0) -> tuple[bool, str]:
@@ -636,6 +684,9 @@ def restart_container() -> tuple[bool, str]:
     return False, result.stderr.strip() or "Failed to restart container."
 
 
+# Snapshots
+
+# Return the image tag for a snapshot: SNAPSHOT_IMAGE_PREFIX plus the name reduced to letters, digits and -_.
 def snapshot_image_name(name: str) -> str:
     safe_name = "".join(
         char if char.isalnum() or char in ("-", "_", ".") else "-" for char in name
@@ -644,6 +695,7 @@ def snapshot_image_name(name: str) -> str:
     return f"{SNAPSHOT_IMAGE_PREFIX}:{safe_name}"
 
 
+# Build one preflight check record: check name, pass/fail flag, message and optional details.
 def _snapshot_check_result(
     name: str,
     ok: bool,
@@ -663,15 +715,18 @@ def _snapshot_check_result(
 def _run_snapshot_preflight() -> dict:
     checks: list[dict] = []
 
+    # Record the outcome of one check in the result list.
     def add(name: str, ok: bool, message: str = "", details: dict | None = None) -> None:
         checks.append(_snapshot_check_result(name, ok, message=message, details=details))
 
+    # The supervisor must answer; without it the remaining probes cannot run.
     health_ok, health_message = healthcheck_container_supervisor(timeout_s=5)
     add("supervisor_healthcheck", health_ok, health_message)
 
     if not health_ok:
         return {"ok": False, "checks": checks}
 
+    # Job state must not live inside the model-writable workspace, or a snapshot would capture it.
     workspace_jobs = _docker_exec_shell(
         f"test ! -e {shlex.quote(MODEL_WORKSPACE_CONTAINER)}/.sandbox_jobs",
         timeout=10,
@@ -686,6 +741,7 @@ def _run_snapshot_preflight() -> dict:
         ),
     )
 
+    # The supervisor's job root must be a real (non-symlink) directory under /tmp.
     job_root_probe = _docker_exec_shell(
         (
             f"{shlex.quote(SUPERVISOR_VENV)}/bin/python - <<'PY'\n"
@@ -707,6 +763,7 @@ def _run_snapshot_preflight() -> dict:
         job_root_probe.stdout.strip() or job_root_probe.stderr.strip(),
     )
 
+    # Output handling probes: oversized stdout must be bounded and marked, invalid UTF-8 must not crash.
     cap_probe = _exec_bash_docker(
         "python3 - <<'PY'\nprint('A' * 120000)\nPY",
         timeout_s=15,
@@ -736,6 +793,8 @@ def _run_snapshot_preflight() -> dict:
         {"exit_code": invalid_utf8_probe.get("exit_code")},
     )
 
+    # Background job probe: a command that outlives its timeout must be backgrounded, then finish and be
+    # foregrounded with its output; the probe job is removed from the registry afterwards.
     bg_probe = _exec_bash_docker(
         "sleep 2; printf background-ok",
         timeout_s=1,
@@ -760,6 +819,7 @@ def _run_snapshot_preflight() -> dict:
             )
             JOB_REGISTRY.remove(str(job_id), cleanup=False)
         except Exception as exc:
+            # A failing foreground call fails the check; the error is reported in its details.
             fg_details["error"] = str(exc)
     add(
         "background_job_lifecycle",
@@ -768,14 +828,20 @@ def _run_snapshot_preflight() -> dict:
         fg_details,
     )
 
+    # The snapshot may proceed only when every check passed.
     ok = all(check["ok"] for check in checks)
     return {"ok": ok, "checks": checks}
 
 
+# Commit the running sandbox container to a snapshot image named after `name`. With preflight enabled, the
+# safety checks run first and a failing check aborts before docker commit. Return a dict with ok, and either
+# the snapshot image and preflight result or an error message.
 def snapshot_container(name: str = "stable", *, preflight: bool = True) -> dict:
     container_ok, message = _ensure_container_running()
     if not container_ok:
         return {"ok": False, "error": message}
+
+    # Run the preflight checks and refuse to commit when any of them fails.
     preflight_result: dict | None = None
     if preflight:
         preflight_result = _run_snapshot_preflight()
@@ -793,6 +859,8 @@ def snapshot_container(name: str = "stable", *, preflight: bool = True) -> dict:
                 ),
                 "preflight": preflight_result,
             }
+
+    # Commit the container to the snapshot image.
     image_name = snapshot_image_name(name)
     result = _run_command(["docker", "commit", CONTAINER_NAME, image_name], timeout=600)
     if result.returncode != 0:
@@ -811,6 +879,8 @@ def snapshot_container(name: str = "stable", *, preflight: bool = True) -> dict:
 
 # Supervisor stdio proxy
 
+# Build the docker exec command that runs the supervisor module in the container as root, with the
+# sandbox environment and PYTHONPATH set. Interactive mode keeps stdin open; supervisor_args are appended.
 def _supervisor_exec_command(
     *,
     interactive: bool = True,
@@ -838,6 +908,7 @@ def _supervisor_exec_command(
     return command
 
 
+# Start the supervisor in the container through docker exec with piped stdio, speaking MCP over stdin/stdout.
 def start_container_supervisor() -> subprocess.Popen:
     return subprocess.Popen(
         _supervisor_exec_command(interactive=True),
@@ -847,6 +918,8 @@ def start_container_supervisor() -> subprocess.Popen:
     )
 
 
+# Run the supervisor's --healthcheck in the container. Return (True, pong) on the expected v2 pong; an old
+# v1 pong is reported as a version mismatch that needs an image rebuild.
 def healthcheck_container_supervisor(timeout_s: int = 3) -> tuple[bool, str]:
     try:
         result = _run_command(
@@ -869,12 +942,16 @@ def healthcheck_container_supervisor(timeout_s: int = 3) -> tuple[bool, str]:
     return False, message
 
 
+# Return whether the error message says the supervisor venv's python is absent from the container.
 def _supervisor_python_missing(message: str) -> bool:
     lowered = message.lower()
     expected_python = f"{SUPERVISOR_VENV}/bin/python".lower()
     return expected_python in lowered and "no such file or directory" in lowered
 
 
+# Make sure the in-container supervisor answers its healthcheck, escalating on failure: retry the check,
+# then (when recreate_on_failure is set) recreate the container, and finally rebuild the image if the
+# supervisor venv is missing. Return (ok, message).
 def ensure_supervisor_ready(
     *,
     attempts: int = 2,
@@ -882,6 +959,8 @@ def ensure_supervisor_ready(
     recreate_on_failure: bool = True,
 ) -> tuple[bool, str]:
     last_error = ""
+
+    # Step 1: plain healthcheck, retried.
     for attempt in range(max(1, attempts)):
         ok, message = healthcheck_container_supervisor(timeout_s=timeout_s)
         if ok:
@@ -893,6 +972,7 @@ def ensure_supervisor_ready(
     if not recreate_on_failure:
         return False, last_error
 
+    # Step 2: recreate the container from the current image and check again.
     with _container_lock:
         removed, remove_message = _force_remove()
         if not removed:
@@ -913,6 +993,8 @@ def ensure_supervisor_ready(
         if attempt + 1 < attempts:
             time.sleep(0.2)
 
+    # Step 3: the supervisor venv is missing from the image, so rebuild the image, recreate the container
+    # and check once more.
     if _supervisor_python_missing(last_error):
         with _container_lock:
             removed, remove_message = _force_remove()
@@ -952,6 +1034,8 @@ def ensure_supervisor_ready(
     return False, f"Supervisor healthcheck failed after recreate: {last_error}"
 
 
+# Read the next available chunk from a pipe without waiting for a full buffer (read1, else readline, else
+# read). An empty result means end of stream.
 def _read_pipe_chunk(source) -> bytes:
     if hasattr(source, "read1"):
         return source.read1(8192)
@@ -960,6 +1044,7 @@ def _read_pipe_chunk(source) -> bytes:
     return source.read(8192)
 
 
+# Copy bytes from source to sink until the source ends, optionally closing the sink afterwards.
 def _forward_binary_stream(source, sink, close_sink: bool = False) -> None:
     try:
         while True:
@@ -969,15 +1054,19 @@ def _forward_binary_stream(source, sink, close_sink: bool = False) -> None:
             sink.write(chunk)
             sink.flush()
     except (BrokenPipeError, OSError):
+        # The reader or writer side went away; there is nothing more to forward.
         pass
     finally:
         if close_sink:
             try:
                 sink.close()
             except OSError:
+                # The sink is already closed or broken, which is the state we wanted.
                 pass
 
 
+# Read host stdin chunks into a queue until EOF, then set the eof event and enqueue a None sentinel so the
+# writer thread can stop. Runs in a thread that outlives individual supervisor processes.
 def _read_stdin_to_queue(
     input_stream, input_queue: Queue, eof: threading.Event
 ) -> None:
@@ -992,6 +1081,8 @@ def _read_stdin_to_queue(
         input_queue.put(None)
 
 
+# Feed queued stdin chunks to the supervisor process while it runs. The None sentinel (host EOF) closes the
+# process stdin; when the process dies first, unread chunks stay queued for the next supervisor.
 def _write_queue_to_process(
     input_queue: Queue,
     process: subprocess.Popen,
@@ -1004,27 +1095,34 @@ def _write_queue_to_process(
             try:
                 chunk = input_queue.get(timeout=0.1)
             except Empty:
+                # Nothing queued yet; loop to re-check whether the process is still running.
                 continue
             if chunk is None:
                 try:
                     process.stdin.close()
                 except OSError:
+                    # The pipe is already closed, which is what we wanted.
                     pass
                 return
             try:
                 process.stdin.write(chunk)
                 process.stdin.flush()
             except (BrokenPipeError, OSError):
+                # The supervisor stopped reading; the caller restarts it if needed.
                 return
     finally:
         if eof.is_set():
             try:
                 process.stdin.close()
             except OSError:
+                # The pipe is already closed, which is what we wanted.
                 pass
 
 
-# Pipe host stdio to the in-container MCP supervisor with reconnect.
+# Pipe host stdio to the in-container MCP supervisor with reconnect. The container and supervisor are
+# verified before each launch; when the supervisor exits while host stdin is still open it is restarted, up
+# to max_restarts times (None means no limit). Return the supervisor's last exit code, or 1 when the
+# container or supervisor could not be made ready.
 def pipe_to_container_supervisor(
     *,
     max_restarts: int | None = None,
@@ -1035,10 +1133,14 @@ def pipe_to_container_supervisor(
     input_stream = input_stream or sys.stdin.buffer
     output_stream = output_stream or sys.stdout.buffer
     error_stream = error_stream or sys.stderr.buffer
+
+    # The stdin reader is created once and shared by every supervisor run, so input read while one
+    # supervisor was dying is not lost.
     input_queue: Queue | None = None
     stdin_eof: threading.Event | None = None
     stdin_thread = None
 
+    # Start the shared stdin reader thread on first use and return its queue and EOF event.
     def _ensure_stdin_reader() -> tuple[Queue, threading.Event]:
         nonlocal input_queue, stdin_eof, stdin_thread
         if input_queue is None or stdin_eof is None:
@@ -1054,6 +1156,8 @@ def pipe_to_container_supervisor(
 
     _ensure_sandbox_config()
 
+    # Supervise loop: make the container and supervisor ready, run one supervisor with forwarding threads
+    # for stdin, stdout and stderr, and restart it if it exits before host stdin reached EOF.
     restarts = 0
     last_returncode = 1
     while max_restarts is None or restarts <= max_restarts:
@@ -1092,17 +1196,20 @@ def pipe_to_container_supervisor(
         stderr_thread.start()
         writer_thread.start()
 
+        # Wait for the supervisor to exit, then close its pipes and let the forwarding threads finish.
         last_returncode = process.wait()
         for pipe in (process.stdout, process.stderr):
             try:
                 if pipe is not None:
                     pipe.close()
             except OSError:
+                # The pipe is already closed; the threads reading it end on their own.
                 pass
         stdout_thread.join(timeout=5)
         stderr_thread.join(timeout=5)
         writer_thread.join(timeout=5)
 
+        # Host stdin ended: the session is over. Otherwise the supervisor died unexpectedly; restart it.
         if stdin_eof.is_set():
             return last_returncode
 
@@ -1117,9 +1224,10 @@ def pipe_to_container_supervisor(
     return last_returncode
 
 
-# ── Docker-exec bash backend (host-side fallback) ────────────────────
-# Used when IN_CONTAINER=False. Will be removed after full migration.
+# Docker-exec bash backend
 
+# Run a bash script in the sandbox container through docker exec. This and the functions below make up the
+# host-side bash backend used when IN_CONTAINER is False.
 def _docker_exec_shell(
     script: str,
     *,
@@ -1136,6 +1244,9 @@ def _docker_exec_shell(
     return _run_command(args, timeout=timeout)
 
 
+# Read a job's spool file ("stdout" or "stderr") from the container. In incremental mode only output
+# after the job's stored offset is returned and the offset is advanced; otherwise the whole file is read.
+# Large chunks are cut to a head and tail around a marker, using the same limits as foreground output.
 def _read_docker_job_file(
     job: BackgroundJob, stream: str, *, incremental: bool = True
 ) -> str:
@@ -1144,9 +1255,14 @@ def _read_docker_job_file(
     path = f"{job.container_job_dir.rstrip('/')}/{stream}"
     offset_attr = f"{stream}_offset"
     offset = int(getattr(job, offset_attr)) if incremental else 0
+
+    # Split the output budget between head and tail (head share clamped to 10%-90%).
     head_ratio = min(0.9, max(0.1, OUTPUT_HEAD_RATIO))
     head_bytes = max(1, int(MAX_OUTPUT_BYTES * head_ratio))
     tail_bytes = max(1, MAX_OUTPUT_BYTES - head_bytes)
+
+    # In-container reader script (a heredoc of Python source): it prints the new bytes from the offset, or
+    # the head and tail around a truncation marker when they exceed the budget, with CRLF turned into LF.
     reader = (
         "python3 - "
         f"{shlex.quote(path)} {offset} {MAX_OUTPUT_BYTES} {head_bytes} {tail_bytes} <<'PY'\n"
@@ -1189,6 +1305,8 @@ def _read_docker_job_file(
     content = result.stdout if result.returncode == 0 else ""
     if not incremental:
         return content
+
+    # Advance the stored offset to the current file size so the next read starts after this output.
     size_result = _docker_exec_shell(
         f"wc -c < {shlex.quote(path)} 2>/dev/null || true",
         timeout=10,
@@ -1201,9 +1319,13 @@ def _read_docker_job_file(
     return content
 
 
+# Refresh a docker background job from its spool directory: status, exit code, pid and process group, and
+# whether the process is still alive. Jobs of other runtimes, or a failed probe, leave the job unchanged.
 def _refresh_docker_job(job: BackgroundJob) -> BackgroundJob:
     if job.runtime != "docker" or job.container_job_dir is None:
         return job
+
+    # Probe the job files and the process in one shell call; the output is five lines, one per value.
     job_dir = shlex.quote(job.container_job_dir)
     result = _docker_exec_shell(
         (
@@ -1227,6 +1349,9 @@ def _refresh_docker_job(job: BackgroundJob) -> BackgroundJob:
     )
     if result.returncode != 0:
         return job
+
+    # Parse the five probe lines (status, exit code, pid, pgid, alive); a missing or malformed value keeps
+    # what the job already has.
     lines = result.stdout.splitlines()
     status = lines[0].strip() if lines else job.status
     exit_code = job.exit_code
@@ -1244,6 +1369,8 @@ def _refresh_docker_job(job: BackgroundJob) -> BackgroundJob:
     if pid is not None:
         job.pid = pid
     alive = lines[4].strip() if len(lines) > 4 else "unknown"
+
+    # Update the registry; a job marked running whose process is gone is treated as finished.
     if status == "done":
         JOB_REGISTRY.mark_done(job.job_id, exit_code)
     elif status == "killed":
@@ -1255,16 +1382,20 @@ def _refresh_docker_job(job: BackgroundJob) -> BackgroundJob:
     return job
 
 
+# List all background jobs after refreshing the state of the running docker ones.
 def list_background_jobs() -> dict:
     for job in JOB_REGISTRY.list_jobs():
         if job.get("runtime") == "docker" and job.get("status") == "running":
             try:
                 _refresh_docker_job(JOB_REGISTRY.get(job["job_id"]))
             except Exception:
+                # A job that cannot be refreshed is listed with its last known state.
                 pass
     return {"jobs": JOB_REGISTRY.list_jobs()}
 
 
+# Return the job state together with the stdout and stderr produced since the previous read. The output is
+# capped like foreground output, and `truncated` is set when the spool read or the cap cut anything.
 def foreground_background_job(job_id: str) -> dict:
     job = _refresh_docker_job(JOB_REGISTRY.get(job_id))
     stdout = _read_docker_job_file(job, "stdout", incremental=True)
@@ -1281,6 +1412,8 @@ def foreground_background_job(job_id: str) -> dict:
     }
 
 
+# Kill a background job and mark it killed. A docker job's process group (or plain pid) gets SIGTERM, then
+# SIGKILL half a second later, and its status file is set to "killed". Return the job result.
 def kill_background_job(job_id: str) -> dict:
     job = JOB_REGISTRY.get(job_id)
     if job.runtime == "docker" and job.container_job_dir:
@@ -1306,6 +1439,9 @@ def kill_background_job(job_id: str) -> dict:
     return job.to_result()
 
 
+# Run a command as a detached background job in the container, with stdout/stderr spooled to files in a
+# per-job directory. Wait up to timeout_s for it: a job that finishes in time returns its result like a
+# foreground run, otherwise a "backgrounded" result carries the job id so the caller can poll it later.
 def _exec_bash_docker_background(
     command: str,
     cwd: str,
@@ -1318,12 +1454,18 @@ def _exec_bash_docker_background(
     job_dir: str | None = None
     candidate_roots = " ".join(shlex.quote(item) for item in _docker_job_root_candidates())
     command_quoted = shlex.quote(command)
+
+    # The wrapper runs the command and records its exit code and "done" status in the job directory.
     wrapper = (
         f"bash -lc {command_quoted}; "
         "code=$?; "
         "echo $code > \"$job_dir/exit_code\"; "
         "echo done > \"$job_dir/status\""
     )
+
+    # Setup script: pick the first writable job root (expanding a leading $HOME, ${HOME} or ~), create the
+    # job directory with its spool files, start the wrapper detached (setsid when available, else nohup),
+    # and print the job directory and the child pid.
     setup_script = (
         f"job_root=''; "
         f"for candidate in {candidate_roots}; do "
@@ -1359,6 +1501,8 @@ def _exec_bash_docker_background(
         f"echo \"$child_pid\" > \"$job_dir/pid\"; "
         f"cat \"$job_dir/pid\""
     )
+
+    # Run the setup as the command user; a failure to start the job is reported as an error result.
     setup = _docker_exec_shell(
         setup_script,
         container_cwd=container_cwd,
@@ -1376,6 +1520,7 @@ def _exec_bash_docker_background(
             "cwd": normalize_model_relative_path(cwd),
         }
 
+    # Read the job directory (first output line) and pid (last line) back from the setup output.
     setup_lines = [line.strip() for line in setup.stdout.splitlines() if line.strip()]
     if setup_lines:
         maybe_job_dir = setup_lines[0]
@@ -1395,6 +1540,8 @@ def _exec_bash_docker_background(
         job_id=job_id,
     )
 
+    # Poll the job until it finishes (return its full output) or timeout_s passes (return the
+    # backgrounded result with the output so far), reporting progress in between.
     while True:
         job = _refresh_docker_job(job)
         if job.status != "running":
@@ -1439,7 +1586,11 @@ def _exec_bash_docker_background(
         time.sleep(0.2)
 
 
-# Execute a bash command inside the sandbox container via docker exec.
+# Execute a bash command inside the sandbox container via docker exec. The cwd must exist inside the
+# workspace (ValueError, FileNotFoundError or NotADirectoryError otherwise). Commands without stdin that
+# should_use_background selects (per the background mode) become background jobs. A command that exceeds
+# timeout_s is killed and the container restarted to free its resources. Return a dict with exit_code,
+# stdout, stderr, error, elapsed_ms, truncated and cwd.
 def _exec_bash_docker(
     command: str,
     cwd: str = ".",
@@ -1454,6 +1605,7 @@ def _exec_bash_docker(
 
     command = _rewrite_legacy_upload_paths(command)
 
+    # Validate the arguments and the working directory on the host side.
     if timeout_s <= 0:
         raise ValueError("timeout_s must be greater than 0.")
 
@@ -1465,6 +1617,7 @@ def _exec_bash_docker(
             f"cwd is not a directory: {normalize_model_relative_path(cwd)}"
         )
 
+    # The container must be running before anything is executed in it.
     container_ok, container_message = _ensure_container_running()
     if not container_ok:
         return {
@@ -1477,6 +1630,7 @@ def _exec_bash_docker(
             "truncated": False,
         }
 
+    # Map the host cwd to the matching directory inside the mounted workspace.
     relative_cwd = (
         target_dir.relative_to(task_root()).as_posix()
         if target_dir != task_root()
@@ -1486,6 +1640,7 @@ def _exec_bash_docker(
     if relative_cwd:
         container_cwd = f"{MODEL_WORKSPACE_CONTAINER}/{relative_cwd}"
 
+    # Commands that need backgrounding are handed to the job runner (it cannot forward stdin).
     if stdin is None and should_use_background(command, timeout_s, background):
         return _exec_bash_docker_background(
             command=command,
@@ -1495,6 +1650,7 @@ def _exec_bash_docker(
             on_progress=on_progress,
         )
 
+    # Build the docker exec command: working directory, UTF-8 environment and the unprivileged user.
     start_time = time.time()
     exec_cmd = ["docker", "exec", "-i"]
     if COMMAND_USER and COMMAND_USER != "root":
@@ -1507,6 +1663,7 @@ def _exec_bash_docker(
         CONTAINER_NAME, "bash", "-lc", command,
     ])
 
+    # Start the process; a failure to launch docker is returned as an error result.
     try:
         process = subprocess.Popen(
             exec_cmd,
@@ -1528,6 +1685,7 @@ def _exec_bash_docker(
             "cwd": normalize_model_relative_path(cwd),
         }
 
+    # Collect stdout and stderr in reader threads (bounded buffers, optional live callbacks).
     stdout_chunks = BoundedOutputCollector()
     stderr_chunks = BoundedOutputCollector()
     stdout_thread = threading.Thread(
@@ -1543,14 +1701,17 @@ def _exec_bash_docker(
     stdout_thread.start()
     stderr_thread.start()
 
+    # Send the stdin text once and close the pipe so the command sees end of input.
     if stdin is not None and process.stdin is not None:
         try:
             process.stdin.write(stdin)
         except BrokenPipeError:
+            # The command exited without reading its input; its exit code is reported below.
             pass
         finally:
             process.stdin.close()
 
+    # Wait for the process, reporting progress; kill it and raise TimeoutExpired once timeout_s passes.
     try:
         while process.poll() is None:
             elapsed_s = time.time() - start_time
@@ -1567,6 +1728,7 @@ def _exec_bash_docker(
         stdout_thread.join(timeout=2)
         stderr_thread.join(timeout=2)
     except subprocess.TimeoutExpired:
+        # Return the partial output and restart the container so the runaway command cannot linger in it.
         process.kill()
         stdout_thread.join(timeout=2)
         stderr_thread.join(timeout=2)
@@ -1586,6 +1748,7 @@ def _exec_bash_docker(
             "cwd": normalize_model_relative_path(cwd),
         }
 
+    # Normal completion: report the collected output and the exit code.
     stdout_value, trunc_out = stdout_chunks.value()
     stderr_value, trunc_err = stderr_chunks.value()
 

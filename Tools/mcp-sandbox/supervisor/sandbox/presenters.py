@@ -8,6 +8,8 @@ import re
 from sandbox.config import MAX_FILE_MAP_SYMBOLS
 
 
+# Matches a declaration line (class, def, fn, struct, ...) with up to four leading spaces and optional
+# pub/export/async/static/abstract modifiers. Groups: indentation, declaration keyword, name.
 _STRUCTURE_RE = re.compile(
     r"^(\s{0,4})"
     r"(?:(?:pub(?:\(crate\))?\s+)?)"
@@ -19,12 +21,17 @@ _STRUCTURE_RE = re.compile(
     r"interface|module|type|namespace|mod)"
     r"\s+(\w+)"
 )
+
+# Matches a markdown heading. Groups: the hashes (heading level) and the heading text.
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$")
 
+# File extensions previewed as source code.
 _CODE_EXTENSIONS = frozenset({
     ".c", ".cc", ".cpp", ".cs", ".go", ".java", ".js", ".jsx", ".kt",
     ".mjs", ".php", ".py", ".rs", ".scala", ".swift", ".ts", ".tsx",
 })
+
+# File extensions previewed as prose or configuration, even if their head looks like code.
 _TEXT_EXTENSIONS = frozenset({
     ".cfg", ".conf", ".csv", ".css", ".html", ".ini", ".json", ".less",
     ".log", ".markdown", ".md", ".rst", ".scss", ".sql", ".toml", ".tsv",
@@ -41,7 +48,10 @@ def _human_size(size_bytes: int) -> str:
     return f"{size_bytes / (1024 * 1024):.1f} MB"
 
 
-# Scan head lines for top-level symbols (class, def, fn, etc.).
+# Landmark extraction
+
+# Scan head lines for symbols (class, def, fn, etc.) indented at most four spaces; at most
+# MAX_FILE_MAP_SYMBOLS are returned, each with its 1-based line, indentation, kind and name.
 def _extract_code_structure(lines: list[str]) -> list[dict[str, object]]:
     symbols: list[dict[str, object]] = []
     for index, line in enumerate(lines, 1):
@@ -77,7 +87,8 @@ def _extract_markdown_headings(lines: list[str]) -> list[dict[str, object]]:
     return headings
 
 
-# Sample evenly spaced non-empty lines as landmarks for plain text files.
+# Sample evenly spaced non-empty lines as landmarks for plain text files: always the first and last
+# line, and up to max_landmarks entries in total, with each text cut to 80 characters.
 def _extract_text_landmarks(lines: list[str], max_landmarks: int = 12) -> list[dict[str, object]]:
     if not lines:
         return []
@@ -95,6 +106,8 @@ def _extract_text_landmarks(lines: list[str], max_landmarks: int = 12) -> list[d
     return landmarks
 
 
+# Previews
+
 # Structured preview for source files: symbol map, head/tail slices, next-step hints.
 def _present_code_preview(
     path: str,
@@ -104,6 +117,7 @@ def _present_code_preview(
     tail_lines: list[str] | None,
     tail_start_line: int,
 ) -> str:
+    # Header line, then the symbol map found in the head lines.
     parts = [f"-- {path} ({total_lines} lines, {_human_size(size_bytes)}) --"]
     symbols = _extract_code_structure(head_lines)
     if symbols:
@@ -112,6 +126,7 @@ def _present_code_preview(
             pad = " " * (int(symbol["indent"]) // 2)
             parts.append(f"  L{symbol['line']:<6} {pad}{symbol['kind']} {symbol['name']}")
 
+    # The first 30 lines, and the tail when one was read.
     head_end = min(30, len(head_lines), total_lines)
     if head_end:
         parts.append(f"\n[head: 1-{head_end}]")
@@ -121,6 +136,7 @@ def _present_code_preview(
         parts.append(f"\n[tail: {tail_start_line}-{total_lines}]")
         parts.append("\n".join(tail_lines))
 
+    # Suggest follow-up reads: the first three symbols, or the middle of the file when there are none.
     parts.append("\n[next]")
     if symbols:
         for symbol in symbols[:3]:
@@ -141,6 +157,7 @@ def _present_text_preview(
     tail_lines: list[str] | None,
     tail_start_line: int,
 ) -> str:
+    # Header line, then landmarks: headings for markup files, sampled lines for other text.
     parts = [f"-- {path} ({total_lines} lines, {_human_size(size_bytes)}) --"]
     ext = os.path.splitext(path)[1].lower()
     landmarks = (
@@ -154,6 +171,7 @@ def _present_text_preview(
             text = str(landmark.get("text", ""))
             parts.append(f"  L{landmark['line']:<6} {text}")
 
+    # The first 30 lines, and the tail when one was read.
     head_end = min(30, len(head_lines), total_lines)
     if head_end:
         parts.append(f"\n[head: 1-{head_end}]")
@@ -163,13 +181,15 @@ def _present_text_preview(
         parts.append(f"\n[tail: {tail_start_line}-{total_lines}]")
         parts.append("\n".join(tail_lines))
 
+    # Suggest a follow-up read around the middle of the file.
     parts.append("\n[next]")
     mid = max(1, total_lines // 2)
     parts.append(f"  cat {path} | sed -n '{mid},{min(mid + 80, total_lines)}p'")
     return "\n".join(parts)
 
 
-# Pick code vs text preview based on extension and detected structure in head lines.
+# Pick code vs text preview based on extension and detected structure in head lines. Non-text kinds and
+# empty files get a one-line description instead.
 def present_auto_preview(
     path: str,
     head_lines: list[str],
@@ -195,6 +215,8 @@ def present_auto_preview(
     )
 
 
+# Controller responses
+
 # Format a bounded read slice for legacy controller OPEN responses.
 def present_read_slice(
     *,
@@ -212,7 +234,8 @@ def present_read_slice(
     return f"{header}\n{body}" if body else header
 
 
-# Format grep matches for legacy controller LOCATE responses.
+# Format grep matches for legacy controller LOCATE responses, listing at most the first 50 matches
+# as path:line:text and counting the rest.
 def present_grep_results(
     *,
     matches: list[dict[str, object]],

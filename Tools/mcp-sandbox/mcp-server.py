@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+# Make the supervisor and src packages importable when this entry module is loaded by path.
 _ROOT = Path(__file__).resolve().parent
 for _p in (_ROOT / "supervisor", _ROOT / "src"):
     if str(_p) not in sys.path:

@@ -11,6 +11,7 @@ from pydantic import Field
 
 from sandbox.api import TOOLS, handle_tool
 
+# Metadata attached to every registered MCP tool: server identity, runtime and workspace root.
 TOOL_META = {
     "x-aslm-server": "aslm-chat-sandbox",
     "x-aslm-runtime": "fastmcp-stdio",
@@ -26,6 +27,7 @@ async def _report_progress(ctx: Context | None, progress: float, message: str) -
     try:
         await ctx.report_progress(progress, 100, message)
     except Exception:
+        # Progress is optional; a client that cannot take it must not fail the tool call.
         pass
 
 
@@ -43,12 +45,15 @@ def _parameter_annotation(schema: dict[str, Any]) -> Any:
     return Annotated[Any, Field(**field_options)]
 
 
-# Register sandbox tools on a FastMCP instance.
+# Register sandbox tools on a FastMCP instance. For every entry of TOOLS a handler is built whose
+# signature, annotations and docstring are generated from the tool definition, so FastMCP publishes
+# the tool's parameter schema; the handler runs the blocking tool code in a worker thread.
 def register_tools(mcp) -> None:
     for tool_definition in TOOLS:
         tool_id = tool_definition["id"]
         parameters = tool_definition.get("parameters", {}).get("properties", {})
 
+        # Handler of one tool: bash gets live progress callbacks, other tools a start notification.
         async def _tool_impl(
             _tool_id: str = tool_id,
             ctx: Context | None = None,
@@ -56,6 +61,7 @@ def register_tools(mcp) -> None:
         ) -> dict[str, Any]:
             loop = asyncio.get_running_loop()
 
+            # Forward progress reported from the worker thread back to the event loop.
             def _progress(progress: float, message: str) -> None:
                 asyncio.run_coroutine_threadsafe(
                     _report_progress(ctx, progress, message),
@@ -72,10 +78,13 @@ def register_tools(mcp) -> None:
                     progress_callback=_progress,
                 )
 
+            # Other tools: announce the target (path, source, pattern or the tool name) and run.
             label = kwargs.get("path") or kwargs.get("src") or kwargs.get("pattern") or _tool_id
             await _report_progress(ctx, 10, f"Running {_tool_id}: {label}")
             return await asyncio.to_thread(handle_tool, _tool_id, kwargs, {})
 
+        # Give the handler the tool's name, description, annotations and an explicit keyword-only
+        # signature (required parameters without default) so FastMCP derives the input schema from them.
         _tool_impl.__name__ = f"sandbox_{tool_id}"
         _tool_impl.__doc__ = tool_definition["description"]
         parameter_annotations = {key: _parameter_annotation(schema) for key, schema in parameters.items()}
@@ -107,4 +116,5 @@ def register_tools(mcp) -> None:
             return_annotation=dict[str, Any],
         )
 
+        # Register the handler as an MCP tool.
         mcp.tool(name=tool_id, meta=TOOL_META)(_tool_impl)

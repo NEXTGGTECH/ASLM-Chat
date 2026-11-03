@@ -1,11 +1,5 @@
 # Copyright NEXTGGTECH. Elastic License 2.0.
 
-# Standalone sandbox image setup — run before first use or when refreshing the image.
-# Requires Docker only (independent of ASLM / MCP).
-#
-# Usage: python setup-sandbox.py [--source local|registry|auto] [--force]
-# Exit 0 when the image is ready; exit 1 on failure (details on stderr).
-
 from __future__ import annotations
 
 import argparse
@@ -14,8 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-# ── Resolve image name from sandbox.env if present ──────────────────
-
+# Locations of this script, its sandbox.env and the supervisor package (importable below for the env sync).
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _ENV_FILE = _SCRIPT_DIR / "sandbox.env"
 _SUPERVISOR_DIR = _SCRIPT_DIR / "supervisor"
@@ -24,12 +17,13 @@ if str(_SUPERVISOR_DIR) not in sys.path:
 
 from sandbox.config_bridge import sync_sandbox_env
 
+# Default image name, and the image label and value that mark an image with the current supervisor runtime.
 _DEFAULT_IMAGE = "nggtlightkeeper/aslm-chat-sandbox:latest"
 _REQUIRED_LABEL = "org.aslm.sandbox.supervisor-runtime"
 _REQUIRED_LABEL_VALUE = "container-v2"
 
 
-# Parse key=value lines from a sandbox.env file.
+# Parse key=value lines from a sandbox.env file; a missing or unreadable file yields an empty dict.
 def _load_env_file(path: Path) -> dict[str, str]:
     result: dict[str, str] = {}
     try:
@@ -40,10 +34,12 @@ def _load_env_file(path: Path) -> dict[str, str]:
             key, _, value = line.partition("=")
             result[key.strip()] = value.strip()
     except OSError:
+        # A missing or unreadable sandbox.env is fine: every setting then falls back to its default.
         pass
     return result
 
 
+# Regenerate sandbox.env from sandbox.json at import time so the overrides read below are current.
 sync_sandbox_env(env_path=_ENV_FILE)
 _env_overrides = _load_env_file(_ENV_FILE)
 
@@ -53,10 +49,11 @@ def _cfg(key: str, default: str) -> str:
     return os.environ.get(key) or _env_overrides.get(key) or default
 
 
+# Image to pull or build: SANDBOX_IMAGE from the environment or sandbox.env, else the default.
 SANDBOX_IMAGE = _cfg("SANDBOX_IMAGE", _DEFAULT_IMAGE)
 
 
-# ── Helpers ──────────────────────────────────────────────────────────
+# Helpers
 
 # Run a subprocess and capture stdout/stderr as text.
 def _run(args: list[str], timeout: int = 30) -> subprocess.CompletedProcess:
@@ -90,7 +87,7 @@ def _fail(msg: str) -> None:
     print(f"  [!!] {msg}", file=sys.stderr, flush=True)
 
 
-# ── Docker checks ────────────────────────────────────────────────────
+# Docker checks
 
 # Verify the Docker CLI is installed and responsive.
 def _check_docker() -> bool:
@@ -123,7 +120,7 @@ def _check_daemon() -> bool:
         return False
 
 
-# ── Image checks ─────────────────────────────────────────────────────
+# Image checks
 
 # Return True when the local image has the required runtime label.
 def _image_exists_and_valid() -> bool:
@@ -136,10 +133,11 @@ def _image_exists_and_valid() -> bool:
         labels = (data[0].get("Config", {}).get("Labels") or {}) if data else {}
         return labels.get(_REQUIRED_LABEL) == _REQUIRED_LABEL_VALUE
     except Exception:
+        # Unparseable inspect output means the image cannot be trusted; treat it as invalid.
         return False
 
 
-# ── Pull / build ─────────────────────────────────────────────────────
+# Pull and build
 
 # Pull the sandbox image from the registry.
 def _pull() -> bool:
@@ -173,9 +171,10 @@ def _build() -> bool:
     return False
 
 
-# ── Main ─────────────────────────────────────────────────────────────
-
 # Entry point: pull or build the sandbox image according to --source.
+# Standalone setup, run before first use or to refresh the image; it needs only Docker (independent of ASLM
+# and MCP). Usage: python setup-sandbox.py [--source local|registry|auto] [--force]. Return 0 when the
+# image is ready and 1 on failure (details on stderr).
 def main() -> int:
     parser = argparse.ArgumentParser(description="Set up the mcp-sandbox Docker image.")
     parser.add_argument(
@@ -191,6 +190,7 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    # Resolve the image source: command line, then SANDBOX_IMAGE_SOURCE, falling back to the registry.
     source = args.source or _cfg("SANDBOX_IMAGE_SOURCE", "registry")
     if source not in {"local", "registry", "auto"}:
         source = "registry"
@@ -223,7 +223,8 @@ def main() -> int:
         success = _build() or _pull()
     elif source == "registry":
         success = _pull() or _build()
-    else:  # auto
+    else:
+        # Source "auto" pulls first, like "registry".
         success = _pull() or _build()
 
     print(flush=True)
@@ -235,5 +236,6 @@ def main() -> int:
         return 1
 
 
+# Run the setup and use its result as the process exit code.
 if __name__ == "__main__":
     raise SystemExit(main())

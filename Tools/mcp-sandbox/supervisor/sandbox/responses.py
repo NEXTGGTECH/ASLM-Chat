@@ -6,7 +6,8 @@ from dataclasses import dataclass
 from typing import Any
 
 
-# Structured error raised by sandbox helpers.
+# Structured error raised by sandbox helpers. error_type is the machine-readable code reported in the
+# error envelope; result, warnings and truncated carry optional partial output through to the response.
 @dataclass
 class SandboxToolError(Exception):
     error_type: str
@@ -15,6 +16,7 @@ class SandboxToolError(Exception):
     warnings: list[str] | None = None
     truncated: bool = False
 
+    # Use the message as the string form of the exception.
     def __str__(self) -> str:
         return self.message
 
@@ -60,7 +62,8 @@ def error_response(
     }
 
 
-# Map Python exceptions into typed sandbox v2 errors.
+# Map Python exceptions into typed sandbox v2 errors: SandboxToolError keeps its own type and payload;
+# common filesystem and value errors get specific codes; anything else is an internal_error.
 def exception_response(tool: str, exc: Exception) -> dict[str, Any]:
     if isinstance(exc, SandboxToolError):
         return error_response(
