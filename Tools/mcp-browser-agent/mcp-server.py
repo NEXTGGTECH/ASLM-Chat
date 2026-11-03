@@ -12,6 +12,8 @@ from typing import Any
 
 from mcp.types import CallToolResult, TextContent, Tool
 
+# This server's folder and the project root; the folder is put on sys.path so the sibling modules below
+# can be imported even though this file is loaded under a different module name.
 SERVER_ROOT = Path(__file__).resolve().parent
 PROJECT_ROOT = SERVER_ROOT.parent.parent
 if str(SERVER_ROOT) not in sys.path:
@@ -28,12 +30,14 @@ from browser_text import handle_browser_text
 
 log = logging.getLogger("browser-agent")
 
+# Identity of this tool server as shown to ASLM.
 MCP_SERVER = {
     "id": "browser_agent",
     "name": "Browser Agent",
     "description": "Browser automation with snapshots, clicks, typing, and screenshots.",
 }
 
+# Tool definitions exposed to the model: id, display name, description and JSON-schema parameters.
 TOOLS = [
     {
         "id": "browser_navigate",
@@ -247,12 +251,19 @@ TOOLS = [
 ]
 
 
-# Expose this tool server for engines that support tool-calling.
+# Tool server API
+
+# Return whether this tool server can be offered for the given engine; only the listed engines support
+# tool-calling. The model name does not affect the answer.
 def supports(engine: str | None = None, model_name: str | None = None) -> bool:
     return engine in ("ollama-service", "lms", "openai", "google-genai")
 
 
-# Convert MCP-style content payloads into plain text for local tool execution.
+# Result and keepalive helpers
+
+# Convert MCP-style content payloads into plain text for local tool execution. Strings pass through, lists
+# of content items are joined with blank lines (using each item's text attribute when it has one), and
+# any other object is converted through its text attribute or str().
 def _flatten_content(content: Any) -> str:
     if isinstance(content, str):
         return content
@@ -276,20 +287,25 @@ def _flatten_content(content: Any) -> str:
     return str(content)
 
 
-# Run a coroutine while optionally sending keepalive logs to an MCP session.
+# Run a coroutine while optionally sending keepalive logs to an MCP session. Without a session the
+# coroutine is just awaited; with one, a debug log message is sent every interval seconds until the
+# coroutine finishes or a send fails (the work itself continues in that case).
 async def _run_with_keepalive(coro, session=None, interval: float = 3.0, message: str = "working..."):
     if session is None:
         return await coro
 
+    # The result of the coroutine and the event that tells the keepalive loop to stop.
     result = None
     done = asyncio.Event()
 
     # Periodically send debug log messages until the main coroutine finishes.
     async def _keepalive_loop() -> None:
         while not done.is_set():
+            # Sleep for one interval, or wake up early when the work is done.
             try:
                 await asyncio.wait_for(asyncio.shield(done.wait()), timeout=interval)
             except asyncio.TimeoutError:
+                # A timeout is the normal case: the interval elapsed without the work finishing.
                 pass
 
             if done.is_set():
@@ -300,6 +316,7 @@ async def _run_with_keepalive(coro, session=None, interval: float = 3.0, message
                 if send_log_message is not None:
                     await send_log_message(level="debug", data=message, logger="browser-agent")
             except BaseException:
+                # A failing session stops the keepalives; the main coroutine is not affected.
                 break
 
     # Run the tool coroutine and signal completion to the keepalive loop.
@@ -312,7 +329,8 @@ async def _run_with_keepalive(coro, session=None, interval: float = 3.0, message
     return result
 
 
-# Pick keepalive interval and status message for a given browser tool name.
+# Pick keepalive interval and status message for a given browser tool name: navigation names its target
+# URL (https:// is assumed when missing), waiting for the user polls less often, others use the default.
 def _browser_keepalive_settings(name: str, arguments: dict[str, Any] | None) -> tuple[float, str]:
     args = arguments or {}
     if name == "browser_navigate":
@@ -325,12 +343,17 @@ def _browser_keepalive_settings(name: str, arguments: dict[str, Any] | None) -> 
     return 3.0, "working..."
 
 
-# Execute one browser action in-process and return plain text or structured output.
+# Tool execution
+
+# Execute one browser action in-process and return plain text or structured output. The action runs on the
+# dedicated browser event loop with keepalive logs to the MCP session. A browser that died is relaunched
+# and the action retried once; other failures come back as "Error: ..." text.
 async def _execute_browser_tool_local(
     name: str,
     arguments: dict[str, Any] | None,
     context: dict[str, Any] | None = None,
 ) -> Any:
+    # Imported lazily so that loading this server does not start importing Camoufox and Playwright.
     from browser import (
         _click_by_role_and_name,
         run_in_browser_loop,
@@ -344,6 +367,8 @@ async def _execute_browser_tool_local(
     )
     import browser as browser_module
 
+    # Normalize the call: the context always names the project folders, and the MCP session (if any) is
+    # used for keepalive messages while the action runs.
     args = arguments or {}
     safe_context = {
         "module_dir": str(PROJECT_ROOT),
@@ -356,6 +381,8 @@ async def _execute_browser_tool_local(
     # Run the requested browser tool against the shared Playwright page.
     async def _run_action() -> Any:
         state.tool_context = safe_context
+
+        # While the user is completing a manual step, only another wait call may use the browser.
         if browser_module._waiting_for_user and name != "browser_wait_for_user":
             return (
                 "BLOCKED: browser is waiting for user action.\n"
@@ -363,6 +390,9 @@ async def _execute_browser_tool_local(
                 "Call browser_wait_for_user again to wait longer or re-check progress."
             )
 
+        # Make sure a browser is running. Every tool except navigate needs a page: after a relaunch the
+        # last known URL is reopened (click and text then get a fresh snapshot, since their refs are
+        # stale); without any page the model is told to navigate first.
         launched_browser = await state.ensure_open()
 
         if name not in {"browser_navigate"}:
@@ -390,7 +420,9 @@ async def _execute_browser_tool_local(
             if not current_url or current_url in {"about:blank", ""}:
                 return f"No page is open yet. Call browser_navigate(url) first, then retry {name}."
 
+        # Dispatch by tool name; each branch returns text for the model (or a structured screenshot).
         try:
+            # Open the URL (https:// is assumed when missing) and report redirects in the snapshot.
             if name == "browser_navigate":
                 target_url = str(args.get("url", "")).strip()
                 if not target_url:
@@ -409,6 +441,7 @@ async def _execute_browser_tool_local(
 
                 return _flatten_content(await _take_snapshot(action_context=action_context, run_dismiss=True))
 
+            # Refresh the snapshot, optionally with full page text and the accessibility tree.
             if name == "browser_snapshot":
                 full = bool(args.get("full", False))
                 return _flatten_content(
@@ -417,6 +450,8 @@ async def _execute_browser_tool_local(
                     )
                 )
 
+            # Click an element by ref; a click that changes the URL returns a detailed snapshot of the new
+            # page, otherwise a compact one.
             if name == "browser_click":
                 ref = args.get("ref")
 
@@ -438,6 +473,7 @@ async def _execute_browser_tool_local(
 
                 return _flatten_content(await _take_compact_snapshot(action_context=f"Clicked [{ref_value}]"))
 
+            # Press one key or shortcut on the page.
             if name == "browser_key":
                 key_name = str(args.get("key", "")).strip()
                 if not key_name:
@@ -447,6 +483,7 @@ async def _execute_browser_tool_local(
                 await state.page.wait_for_timeout(800)
                 return _flatten_content(await _take_compact_snapshot(action_context=f"Pressed {key_name}"))
 
+            # Scroll the viewport with the mouse wheel.
             if name == "browser_scroll":
                 direction = str(args.get("direction", "")).strip().lower()
                 if direction not in {"up", "down"}:
@@ -459,6 +496,7 @@ async def _execute_browser_tool_local(
                     await _take_compact_snapshot(action_context=f"Scrolled {direction} {amount}px")
                 )
 
+            # Read or edit text in an editor through the browser_text handler.
             if name == "browser_text":
                 return await handle_browser_text(
                     args,
@@ -468,6 +506,9 @@ async def _execute_browser_tool_local(
                     flatten_content=_flatten_content,
                 )
 
+            # Pause for a manual step (CAPTCHA, login, ...): announce it on stderr, mark the browser as
+            # waiting, and for up to timeout_seconds mirror the page to the portal and apply the user's
+            # portal events, ending early on a finish event.
             if name == "browser_wait_for_user":
                 message = str(args.get("message", "Please interact with the browser."))
                 timeout_seconds = int(args.get("timeout_seconds", 45))
@@ -480,6 +521,7 @@ async def _execute_browser_tool_local(
                 print(f"{'=' * 60}\n", file=sys.stderr)
                 sys.stderr.flush()
 
+                # Start a new portal session and publish the first waiting frame.
                 browser_module._waiting_for_user = True
                 wait_started = asyncio.get_running_loop().time()
                 portal_session_id = reset_browser_portal_state(
@@ -495,6 +537,8 @@ async def _execute_browser_tool_local(
                     timeout_seconds=timeout_seconds,
                     session_id=portal_session_id,
                 )
+
+                # Poll: apply portal events, publish a fresh frame, and probe that the page is still alive.
                 wait_exit_reason = "timeout"
                 try:
                     while asyncio.get_running_loop().time() - wait_started < timeout_seconds:
@@ -520,13 +564,17 @@ async def _execute_browser_tool_local(
                             if is_browser_closed_error(exc):
                                 wait_exit_reason = "browser_closed"
                                 raise
+
+                            # Other probe errors are transient; keep serving the portal.
                             pass
                         await asyncio.sleep(0.1)
                     else:
+                        # The loop ended without a break: the wait timed out.
                         wait_exit_reason = "timeout"
                 except Exception:
                     raise
                 finally:
+                    # Always clear the waiting flag and publish a final "done" frame, even on errors.
                     browser_module._waiting_for_user = False
                     await publish_browser_portal_frame(
                         state.page,
@@ -544,12 +592,15 @@ async def _execute_browser_tool_local(
                     )
                 )
 
+            # Save a PNG screenshot and return its structured description.
             if name == "browser_screenshot":
                 full_page = bool(args.get("full_page", False))
                 return await capture_browser_screenshot(full_page, safe_context)
 
             return f"Unknown tool: {name}"
         except Exception as exc:
+            # A timeout or a dead browser closes the session and propagates so the caller can retry on a
+            # fresh one; any other failure is reported to the model as text.
             if isinstance(exc, asyncio.TimeoutError) or is_browser_closed_error(exc):
                 await state.close()
                 raise
@@ -577,6 +628,7 @@ async def _execute_browser_tool_local(
                     continue
                 return f"Error: {type(exc).__name__}: {exc}"
 
+    # Run the whole action on the browser loop, sending keepalives to the MCP session meanwhile.
     return await run_in_browser_loop(
         _perform(),
         session=session,
@@ -585,13 +637,16 @@ async def _execute_browser_tool_local(
     )
 
 
-# Execute one browser action through the worker subprocess or inline when configured.
+# Execute one browser action through the worker subprocess or inline when configured. Inside the worker
+# itself (ASLM_BROWSER_AGENT_WORKER=1) or with ASLM_BROWSER_AGENT_INLINE=1 the action runs in this process;
+# otherwise it is forwarded to the shared browser process manager.
 async def _execute_browser_tool(name: str, arguments: dict[str, Any] | None, context: dict[str, Any] | None = None) -> Any:
     if os.getenv("ASLM_BROWSER_AGENT_WORKER") == "1" or os.getenv("ASLM_BROWSER_AGENT_INLINE") == "1":
         return await _execute_browser_tool_local(name, arguments or {}, context or {})
 
     from browser_process import browser_process_manager
 
+    # Forward the call to the worker subprocess with the same context and keepalive settings.
     safe_context = {
         "module_dir": str(PROJECT_ROOT),
         "project_dir": str(PROJECT_ROOT),
@@ -609,9 +664,10 @@ async def _execute_browser_tool(name: str, arguments: dict[str, Any] | None, con
     )
 
 
+# Tool registration
+
 # Build an ASLM-compatible per-tool wrapper that delegates to _execute_browser_tool.
 def _make_tool_handler(tool_id: str):
-
     # Delegate one ASLM tool id to the shared browser execution pipeline.
     async def _handler(arguments: dict[str, Any] | None, context: dict[str, Any] | None = None) -> Any:
         return await _execute_browser_tool(tool_id, arguments or {}, context or {})
@@ -619,6 +675,7 @@ def _make_tool_handler(tool_id: str):
     return _handler
 
 
+# Per-tool handlers keyed by tool id, in the form ASLM expects.
 TOOL_HANDLERS = {
     tool["id"]: _make_tool_handler(tool["id"])
     for tool in TOOLS
@@ -632,9 +689,8 @@ async def call_tool(tool_id: str, arguments: dict[str, Any] | None, context: dic
 
 # Attach Browser Agent tools to the provided MCP server instance.
 def register_tools(server) -> None:
-
-    @server.list_tools()
     # Describe the Browser Agent tool surface for MCP list_tools.
+    @server.list_tools()
     async def list_tools() -> list[Tool]:
         return [
             Tool(
@@ -645,14 +701,16 @@ def register_tools(server) -> None:
             for tool in TOOLS
         ]
 
+    # Execute the requested Browser Agent tool and return MCP CallToolResult. The MCP session of the
+    # current request is passed along for keepalive messages; structured results are returned as JSON text.
     @server.call_tool()
-    # Execute the requested Browser Agent tool and return MCP CallToolResult.
     async def server_call_tool(name: str, arguments: dict[str, Any] | None) -> CallToolResult:
         log.info("server_call_tool: %s", name)
         session = None
         try:
             session = server.request_context.session
         except Exception:
+            # Outside a request context there is no session; run without keepalive messages.
             session = None
 
         result = await _execute_browser_tool(
