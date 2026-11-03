@@ -21,7 +21,8 @@ _RTL_PRIMARY_SUBTAGS: Final[frozenset[str]] = frozenset(
 )
 
 
-# Return whether the UI should use right-to-left layout.
+# Return whether the UI should use right-to-left layout for the given language code. A code matches
+# when it equals a known RTL code (case-insensitively) or its primary subtag is an RTL language.
 def is_rtl_language(language_code: str | None) -> bool:
     code = (language_code or "en").strip()
     if not code:
@@ -35,7 +36,8 @@ def is_rtl_language(language_code: str | None) -> bool:
     return primary in _RTL_PRIMARY_SUBTAGS
 
 
-# Convert BCP-47 to a value suitable for the HTML ``lang`` attribute.
+# Convert a BCP-47 tag to a value suitable for the HTML ``lang`` attribute: lower-case language, and a
+# lower-case region only when it is a four-letter script subtag.
 def language_to_html_lang(language_code: str) -> str:
     parts = language_code.split("-", 1)
     if len(parts) == 1:
@@ -46,16 +48,19 @@ def language_to_html_lang(language_code: str) -> str:
     return f"{primary.lower()}-{region}"
 
 
-# Return keys for ``base.html`` and the client locale bootstrap.
+# Return the template context keys for ``base.html`` and the client locale bootstrap.
 def build_host_locale_template_context() -> dict[str, Any]:
+    # Read the host locale snapshot and resolve the locale the catalog actually uses.
     raw = load_host_locale()
     host_language_raw = get_language()
     effective = resolve_effective_locale_from_snapshot()
     display_name = get_display_name()
+
     # Layout direction follows the host language even when Chat falls back to English strings.
     rtl = is_rtl_language(host_language_raw)
     messages = catalog_for_js(effective)
 
+    # Locale metadata and messages that the browser reads from an inline JSON script tag.
     meta = {
         "available": raw is not None,
         "language": host_language_raw,
@@ -67,6 +72,7 @@ def build_host_locale_template_context() -> dict[str, Any]:
         "messages": messages,
     }
 
+    # Flat values for the Django templates, plus the serialized client metadata.
     return {
         "host_locale_available": raw is not None,
         "host_language_raw": host_language_raw,

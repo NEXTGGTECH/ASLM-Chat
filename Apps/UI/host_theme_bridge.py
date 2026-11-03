@@ -42,17 +42,21 @@ _ASLM_COLOR_KEY_TO_CSS_VAR: Final[dict[str, str]] = {
     "OverlayBackground": "--c-overlay-scrim",
 }
 
+# Accepted hex color forms: #rgb, #rrggbb and #aarrggbb (MAUI ToHex output).
 _HEX_RE = re.compile(r"^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$")
+# An ``rgba(r, g, b, a)`` color as produced by :func:`normalize_color_to_css`.
 _RGBA_FN_RE = re.compile(
     r"^rgba\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*([01]|0?\.\d+)\s*\)$",
     re.IGNORECASE,
 )
 
-# sRGB relative luminance (WCAG). Used to pick activity/tool card contrast from the host canvas.
+# Relative luminance (WCAG) at or above which the host canvas counts as light. Used to pick the
+# activity/tool card contrast.
 _LIGHT_SURFACE_LUMINANCE_THRESHOLD: Final[float] = 0.45
 
 
-# Convert MAUI / ASLM hex strings to a CSS color (``#rrggbb`` or ``rgba(...)``).
+# Convert MAUI / ASLM hex strings to a CSS color (``#rrggbb`` or ``rgba(...)``). Return None when the
+# value is empty or not a valid hex color.
 def normalize_color_to_css(raw: str | None) -> str | None:
     if raw is None:
         return None
@@ -69,7 +73,8 @@ def normalize_color_to_css(raw: str | None) -> str | None:
         return f"#{r:02x}{g:02x}{b:02x}"
     if len(body) == 6:
         return f"#{body.lower()}"
-    # #AARRGGBB (MAUI ToHex)
+
+    # #AARRGGBB (MAUI ToHex): drop the alpha when opaque, otherwise emit an rgba() color.
     aa = int(body[0:2], 16)
     rr = int(body[2:4], 16)
     gg = int(body[4:6], 16)
@@ -80,7 +85,8 @@ def normalize_color_to_css(raw: str | None) -> str | None:
     return f"rgba({rr}, {gg}, {bb}, {alpha})"
 
 
-# Effective theme.
+# Return "light" or "dark" for a host theme payload: the explicit theme when valid, otherwise the
+# appearance, defaulting to dark.
 def _effective_theme(payload: dict[str, Any]) -> str:
     theme = str(payload.get("theme") or "").strip().lower()
     if theme in {"light", "dark"}:
@@ -91,7 +97,7 @@ def _effective_theme(payload: dict[str, Any]) -> str:
     return "dark"
 
 
-# Srgb channel to linear.
+# Convert one sRGB channel (0..1) to its linear-light value (WCAG relative luminance step).
 def _srgb_channel_to_linear(c: float) -> float:
     return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
 
@@ -127,7 +133,8 @@ def css_color_to_srgb_channels(css: str) -> tuple[float, float, float] | None:
     return (r_i / 255.0, g_i / 255.0, b_i / 255.0)
 
 
-# Choose light vs dark activity surfaces from the resolved host canvas (not only ``theme``).
+# Choose light vs dark activity surfaces from the luminance of the resolved host canvas (not only
+# ``theme``); fall back to the theme name when the canvas color is missing or unparsable.
 def infer_prefer_light_activity_surfaces(resolved: dict[str, str], fallback_theme: str) -> bool:
     bg = resolved.get("--c-bg")
     ch = css_color_to_srgb_channels(bg) if bg else None
@@ -136,8 +143,10 @@ def infer_prefer_light_activity_surfaces(resolved: dict[str, str], fallback_them
     return str(fallback_theme or "").strip().lower() == "light"
 
 
-# Return keys for ``base.html``: CSS variable block, color-scheme, optional JSON.
+# Return the template context keys for ``base.html``: the CSS variable block, the effective color
+# scheme and the theme metadata as JSON. An empty context is returned when no host theme is usable.
 def build_host_theme_template_context() -> dict[str, Any]:
+    # Without a usable host snapshot or palette the page keeps its built-in theme.
     raw = load_host_theme()
     if not isinstance(raw, dict):
         return _empty_context()
@@ -148,6 +157,7 @@ def build_host_theme_template_context() -> dict[str, Any]:
 
     prefer_light_activity = infer_prefer_light_activity_surfaces(resolved, theme)
 
+    # Build a ":root" block from the resolved palette plus the derived semantic variables.
     declarations = [f"  {var}: {value};" for var, value in resolved.items()]
 
     declarations.extend(_derived_theme_declarations(prefer_light_activity))
@@ -155,6 +165,7 @@ def build_host_theme_template_context() -> dict[str, Any]:
     inner = "\n".join(declarations)
     host_theme_css_variables = f":root {{\n{inner}\n}}"
 
+    # Theme identity for the client script, serialized safely for an inline script tag.
     meta = {
         "theme": theme,
         "appearance": str(raw.get("appearance") or ""),
@@ -171,7 +182,7 @@ def build_host_theme_template_context() -> dict[str, Any]:
     }
 
 
-# Empty context.
+# Return the template context used when no usable host theme exists: dark theme and no CSS variables.
 def _empty_context() -> dict[str, Any]:
     return {
         "host_theme_available": False,
@@ -181,8 +192,11 @@ def _empty_context() -> dict[str, Any]:
     }
 
 
-# Return semantic UI variables that should follow the resolved host palette.
+# Return CSS declaration lines for semantic UI variables that should follow the resolved host palette.
+# They are built from color-mix() of the host variables, with the activity card values depending on
+# whether the host canvas is light.
 def _derived_theme_declarations(prefer_light_surfaces: bool) -> list[str]:
+    # Activity card surfaces: a light canvas gets solid surfaces, a dark canvas translucent overlays.
     if prefer_light_surfaces:
         activity_card_bg = "var(--surface-secondary)"
         activity_card_bg_hover = "color-mix(in srgb, var(--surface-secondary) 94%, var(--c-primary) 6%)"
@@ -204,6 +218,7 @@ def _derived_theme_declarations(prefer_light_surfaces: bool) -> list[str]:
         activity_card_border_hover = "color-mix(in srgb, var(--c-text) 16%, transparent)"
         activity_monochrome_svg_filter = "none"
 
+    # Declarations in output order; the activity values chosen above are interpolated.
     return [
         "  --surface-hover: color-mix(in srgb, var(--c-text) 6%, transparent);",
         "  --surface-hover-strong: color-mix(in srgb, var(--c-text) 10%, transparent);",
@@ -270,10 +285,10 @@ _PREVIEW_DOCUMENT_DEFAULTS: Final[dict[str, str]] = {
 }
 
 
-# Resolve host palette colors into CSS variables used by the chat UI.
+# Resolve host palette colors into CSS variables used by the chat UI. Return a tuple of the
+# ``css_var -> color`` map and the effective theme, both taken from the host theme snapshot; the map is
+# empty when the snapshot or its colors are missing.
 def resolve_host_css_variables() -> tuple[dict[str, str], str]:
-    """Return ``(css_var -> color, effective_theme)`` from the host theme snapshot."""
-
     raw = load_host_theme()
     if not isinstance(raw, dict):
         return {}, "dark"
@@ -282,6 +297,7 @@ def resolve_host_css_variables() -> tuple[dict[str, str], str]:
     if not isinstance(colors, dict):
         return {}, _effective_theme(raw)
 
+    # Map every known ASLM palette key that holds a valid color to its CSS variable.
     resolved: dict[str, str] = {}
     for aslm_key, css_var in _ASLM_COLOR_KEY_TO_CSS_VAR.items():
         val = colors.get(aslm_key)
@@ -292,25 +308,24 @@ def resolve_host_css_variables() -> tuple[dict[str, str], str]:
             continue
         resolved[css_var] = css_color
 
+    # Cyan has no host palette key of its own and reuses teal.
     if "--c-system-teal" in resolved:
         resolved["--c-system-cyan"] = resolved["--c-system-teal"]
 
     return resolved, _effective_theme(raw)
 
 
-# Build CSS tokens for standalone HTML documents (downloads bridge previews, etc.).
+# Build themed CSS tokens for standalone HTML documents (downloads bridge previews, offline HTML shells
+# consumed by ASLM). Keys: ``color_scheme``, ``bg``, ``surface``, ``surface_strong``, ``border``,
+# ``text``, ``muted``, ``link`` and ``fingerprint``. Falls back to the dark ASLM-Chat defaults when no
+# host theme is present.
 def resolve_preview_document_theme() -> dict[str, str]:
-    """Return themed CSS tokens for offline HTML shells consumed by ASLM.
-
-    Keys: ``color_scheme``, ``bg``, ``surface``, ``surface_strong``, ``border``,
-    ``text``, ``muted``, ``link``, ``fingerprint``.
-    Falls back to the dark ASLM-Chat defaults when no host theme is present.
-    """
-
+    # Start from the dark defaults and take the color scheme from the host theme.
     resolved, theme = resolve_host_css_variables()
     tokens = dict(_PREVIEW_DOCUMENT_DEFAULTS)
     tokens["color_scheme"] = theme if theme in {"light", "dark"} else "dark"
 
+    # Override each token with the host palette color, using the first available candidate.
     if resolved:
         tokens["bg"] = (
             resolved.get("--c-bg-surface")
@@ -347,7 +362,8 @@ def resolve_preview_document_theme() -> dict[str, str]:
         ensure_ascii=True,
         sort_keys=True,
     )
-    # Local import avoided: hashlib is stdlib and keeps this module free of Services deps.
+
+    # hashlib is stdlib, so importing it here adds no dependency on the Services package.
     import hashlib
 
     tokens["fingerprint"] = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12]

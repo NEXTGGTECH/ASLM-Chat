@@ -13,8 +13,11 @@ from Settings.host_locale import get_language, normalize_host_language
 
 logger = logging.getLogger(__name__)
 
+# Folder with the per-locale JSON catalogs, and the locale used as the base layer and fallback.
 LOCALES_DIR = Path(__file__).resolve().parent / "locales"
 BASE_LOCALE = "en"
+
+# Matches a ``{name}`` interpolation placeholder in a catalog string.
 _PLACEHOLDER_RE = re.compile(r"\{(\w+)\}")
 
 
@@ -23,7 +26,8 @@ def _locale_file_path(locale: str) -> Path:
     return LOCALES_DIR / f"{locale}.json"
 
 
-# Return locale codes that have a catalog file on disk.
+# Return the sorted locale codes that have a catalog file on disk (unfinished ``.tmp`` files are
+# ignored); only the base locale when the folder is missing or empty.
 def list_available_chat_locales() -> list[str]:
     if not LOCALES_DIR.is_dir():
         return [BASE_LOCALE]
@@ -43,12 +47,13 @@ def resolve_effective_locale(host_language: str | None) -> str:
     return BASE_LOCALE
 
 
-# Resolve effective locale from snapshot.
+# Resolve the effective Chat locale from the language of the current host locale snapshot.
 def resolve_effective_locale_from_snapshot() -> str:
     return resolve_effective_locale(get_language())
 
 
-# Load one locale JSON catalog from disk with caching.
+# Load one locale JSON catalog from disk with caching. Return an empty dict when the file is missing,
+# unreadable, not valid JSON or not a JSON object.
 @lru_cache(maxsize=32)
 def _load_raw_catalog(locale: str) -> dict[str, Any]:
     path = _locale_file_path(locale)
@@ -76,7 +81,7 @@ def load_catalog(locale: str) -> dict[str, Any]:
     return _deep_merge(base, overlay)
 
 
-# Deep merge.
+# Return a new dict where overlay values replace base values and nested dicts are merged recursively.
 def _deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
     merged: dict[str, Any] = dict(base)
     for key, value in overlay.items():
@@ -87,7 +92,7 @@ def _deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]
     return merged
 
 
-# Lookup nested.
+# Return the value at a dot-separated key path inside a nested catalog, or None when any part is missing.
 def _lookup_nested(catalog: dict[str, Any], key: str) -> Any | None:
     current: Any = catalog
     for part in key.split("."):
@@ -97,7 +102,7 @@ def _lookup_nested(catalog: dict[str, Any], key: str) -> Any | None:
     return current
 
 
-# Interpolate.
+# Replace ``{name}`` placeholders in a template with the matching params; unknown placeholders stay as is.
 def _interpolate(template: str, params: dict[str, Any]) -> str:
     # Replace one `{name}` placeholder during interpolation.
     def repl(match: re.Match[str]) -> str:
@@ -109,7 +114,8 @@ def _interpolate(template: str, params: dict[str, Any]) -> str:
     return _PLACEHOLDER_RE.sub(repl, template)
 
 
-# Resolve a dot-path key with optional ``{name}`` placeholders.
+# Resolve a dot-path key with optional ``{name}`` placeholders. The lookup falls back from the effective
+# locale to English, then to ``fallback`` (interpolated), and finally to the key itself.
 def translate(key: str, *, locale: str | None = None, fallback: str | None = None, **params: Any) -> str:
     effective = resolve_effective_locale(locale) if locale else resolve_effective_locale_from_snapshot()
     catalog = load_catalog(effective)
@@ -127,12 +133,16 @@ def translate(key: str, *, locale: str | None = None, fallback: str | None = Non
     return value
 
 
-# CLDR cardinal categories for whole-number counts in the host's supported languages.
-# https://www.unicode.org/cldr/charts/latest/supplemental/language_plural_rules.html
+# Return the CLDR cardinal plural category for a whole-number count in the host's supported languages.
+# See https://www.unicode.org/cldr/charts/latest/supplemental/language_plural_rules.html for the rules.
 def _plural_category(count: int, locale: str) -> str:
     n = abs(count)
+
+    # Languages without grammatical plural.
     if locale in {"id", "ja", "ko", "vi", "zh-Hans", "zh-Hant"}:
         return "other"
+
+    # Arabic has six categories.
     if locale == "ar":
         if n == 0:
             return "zero"
@@ -145,22 +155,30 @@ def _plural_category(count: int, locale: str) -> str:
         if 11 <= n % 100 <= 99:
             return "many"
         return "other"
+
+    # Slavic languages (Polish treats only exactly 1 as singular).
     if locale in {"ru", "uk", "pl"}:
         if (n == 1 if locale == "pl" else n % 10 == 1 and n % 100 != 11):
             return "one"
         if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
             return "few"
         return "many"
+
+    # Romance languages use "many" for exact multiples of a million.
     if locale in {"es", "fr", "it", "pt", "pt-BR"} and n != 0 and n % 1_000_000 == 0:
         return "many"
+
     # The pt catalog uses European Portuguese; only pt-BR treats zero as singular.
     if locale in {"fr", "hi", "pt-BR"}:
         return "one" if n in {0, 1} else "other"
+
+    # Default one/other rule.
     return "one" if n == 1 else "other"
 
 
 # Translate a count without forcing languages into English singular/plural grammar.
-# display_count preserves provider abbreviations such as 42.9K independently of agreement.
+# display_count preserves provider abbreviations such as 42.9K independently of agreement. Fall back to
+# the ``other`` form of the key when the category form is missing, and to the key itself when neither exists.
 def translate_plural(
     key: str,
     count: int,
@@ -179,7 +197,8 @@ def translate_plural(
     return _interpolate(value, {"count": count if display_count is None else display_count})
 
 
-# Return the merged catalog tree embedded in pages for client-side ``t()``.
+# Return the merged catalog tree embedded in pages for client-side ``t()``; the locale defaults to the
+# one resolved from the host snapshot.
 def catalog_for_js(locale: str | None = None) -> dict[str, Any]:
     effective = resolve_effective_locale(locale) if locale else resolve_effective_locale_from_snapshot()
     return load_catalog(effective)
