@@ -1,15 +1,5 @@
 # Copyright NEXTGGTECH. Elastic License 2.0.
 
-"""Loader for the academic domain registry seed (`profiles/seeds/academic_registry.json`).
-
-The seed is the source of truth for *which* scholarly aggregators exist and *how* to
-reach each (method = json_api / http / browser, rps/burst pacing, the open REST endpoint
-in `json_api_hint`, and field notes). The engine builds its provider set from the
-`json_api` entries — open, keyless REST APIs that return rich structured JSON without
-scraping. `http`/`browser` tiers (arxiv html, pubmed, semanticscholar) are described here
-but reached through their own clients or deferred to the browser path.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -18,15 +8,20 @@ import json
 from pathlib import Path
 from typing import Any
 
+# Registry seed (`profiles/seeds/academic_registry.json`): the source of truth for which
+# scholarly aggregators exist and how to reach each.
 _SEED_PATH = Path(__file__).resolve().parents[2] / "profiles" / "seeds" / "academic_registry.json"
 
 
-# One registry row: a scholarly domain plus how to reach it.
+# One registry row: a scholarly domain plus how to reach it (method = json_api / http / browser,
+# rps/burst pacing, the open REST endpoint in `json_api_hint`, and field notes).
 @dataclass(frozen=True, slots=True)
 class AcademicDomain:
     pattern: str
-    tier: str                 # friendly / moderate / hardened
-    method: str               # json_api / http / browser
+    # Politeness tier: friendly / moderate / hardened.
+    tier: str
+    # How the domain is reached: json_api / http / browser.
+    method: str
     rps: float
     burst: int
     json_api_hint: str
@@ -40,6 +35,7 @@ class AcademicDomain:
         return self.pattern
 
 
+# Build an AcademicDomain from a raw seed entry, normalizing text and applying defaults.
 def _coerce(entry: dict[str, Any]) -> AcademicDomain:
     return AcademicDomain(
         pattern=str(entry.get("pattern") or "").strip().lower(),
@@ -54,11 +50,16 @@ def _coerce(entry: dict[str, Any]) -> AcademicDomain:
     )
 
 
+# Load and cache every registry row from the seed; an unreadable or invalid seed gives an
+# empty registry. The engine builds its provider set from the `json_api` rows (open, keyless
+# REST APIs); `http`/`browser` tiers (arxiv html, pubmed, semanticscholar) are described in the
+# seed but reached through their own clients or deferred to the browser path.
 @lru_cache(maxsize=1)
 def load_registry() -> tuple[AcademicDomain, ...]:
     try:
         raw = json.loads(_SEED_PATH.read_text(encoding="utf-8"))
     except (OSError, ValueError):
+        # A missing or malformed seed leaves the registry empty rather than failing import.
         return ()
     return tuple(_coerce(e) for e in raw.get("domains", []) if isinstance(e, dict) and e.get("pattern"))
 
@@ -71,7 +72,8 @@ def json_api_domains() -> tuple[AcademicDomain, ...]:
     )
 
 
-# Look up a registry row by host (or alias), walking nothing — exact match on pattern/alias.
+# Look up a registry row by host (or alias) with an exact match on pattern/alias, ignoring a
+# leading "www.".
 def domain_for(host: str) -> AcademicDomain | None:
     h = (host or "").strip().lower().removeprefix("www.")
     for d in load_registry():

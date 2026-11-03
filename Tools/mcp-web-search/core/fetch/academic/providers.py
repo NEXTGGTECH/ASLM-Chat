@@ -1,15 +1,5 @@
 # Copyright NEXTGGTECH. Elastic License 2.0.
 
-"""Open, keyless scholarly REST providers driven by the academic registry seed.
-
-Each provider maps to one `json_api` (or arxiv `atom`) row in academic_registry.json.
-The registry supplies pacing/host/tier; the URL shape and response format differ per API,
-so those are pinned here. v1 covers the no-auth, free-text-search providers:
-OpenAlex, Crossref, Europe PMC, DOAJ (JSON) and arXiv (Atom XML). Hardened SPA/browser
-tiers (pubmed, semanticscholar, scholar.google) and DOI-only lookups (unpaywall) are
-described in the registry but not wired here.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -20,30 +10,40 @@ from .registry import AcademicDomain, domain_for
 
 
 # A wired scholarly provider: how to build the request URL and how to read the reply.
+# Each provider maps to one `json_api` (or arxiv `atom`) row in academic_registry.json: the
+# registry supplies pacing/host/tier, while the URL shape and response format differ per API
+# and are pinned here.
 @dataclass(frozen=True, slots=True)
 class AcademicProvider:
     name: str
-    host: str                              # registry pattern this maps to
-    fmt: str                               # "json" | "atom" | "html"
-    url_builder: Callable[[str, int], str]  # (query, limit) -> request URL
+    # Registry pattern this provider maps to.
+    host: str
+    # Response format: "json", "atom", "html" or "serpapi".
+    fmt: str
+    # Build the request URL from (query, limit).
+    url_builder: Callable[[str, int], str]
+    # Base ranking weight, also the starting point of the paper confidence score.
     weight: float = 1.0
     # Per-request header overrides (e.g. a browser UA for HTML-scrape providers that reject
     # the polite scholarly UA). Merged over the client defaults for this provider only.
     extra_headers: tuple[tuple[str, str], ...] = ()
 
+    # Return the per-request header overrides, or None when the provider has none.
     def headers(self) -> dict[str, str] | None:
         return dict(self.extra_headers) or None
 
-    # Pacing/tier from the registry row, or conservative defaults if absent.
+    # Return the registry row (pacing/tier) for this provider's host, or None when it is absent.
     @property
     def domain(self) -> AcademicDomain | None:
         return domain_for(self.host)
 
 
+# URL-encode a query for a query-string value (spaces become "+").
 def _q(query: str) -> str:
     return quote_plus(query.strip())
 
 
+# URL-encode a query for a path segment (everything escaped, including "/").
 def _path_q(query: str) -> str:
     return quote(query.strip(), safe="")
 
@@ -53,6 +53,10 @@ def _path_q(query: str) -> str:
 MAILTO = "aslm-chat@users.noreply.github.com"
 
 
+# Every wired provider. Covers the no-auth, free-text-search APIs: OpenAlex, Crossref, Europe PMC,
+# DOAJ (JSON) and arXiv (Atom XML), plus Google Scholar (HTML scrape or SerpApi). Hardened
+# SPA/browser tiers (pubmed, semanticscholar) and DOI-only lookups (unpaywall) are described in
+# the registry but not wired here.
 PROVIDERS: tuple[AcademicProvider, ...] = (
     AcademicProvider(
         name="openalex",
@@ -138,7 +142,7 @@ PROVIDERS: tuple[AcademicProvider, ...] = (
 )
 
 
-# True when a SerpApi key is configured (the block-free Scholar path is available).
+# Return True when a SerpApi key is configured (the block-free Scholar path is available).
 def _has_serpapi_key() -> bool:
     try:
         from core.config.api_keys import load_api_keys
@@ -148,7 +152,7 @@ def _has_serpapi_key() -> bool:
         return False
 
 
-# Active provider set: exactly one Scholar path is used. With a SerpApi key, the block-free
+# Return the active provider set: exactly one Scholar path is used. With a SerpApi key, the block-free
 # `scholar_serpapi` replaces the antibot-prone direct `scholar` scrape; without it, the
 # direct scrape stands (and leans on pacing + cooldown).
 def active_providers() -> tuple[AcademicProvider, ...]:
@@ -156,6 +160,6 @@ def active_providers() -> tuple[AcademicProvider, ...]:
     return tuple(p for p in PROVIDERS if p.name != drop)
 
 
-# Active providers ranked by static weight (registry pacing could refine this later).
+# Return the active providers ranked by static weight (registry pacing could refine this later).
 def ranked_providers() -> list[AcademicProvider]:
     return sorted(active_providers(), key=lambda p: p.weight, reverse=True)
