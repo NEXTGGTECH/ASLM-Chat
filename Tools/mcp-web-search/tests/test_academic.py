@@ -1,8 +1,5 @@
 # Copyright NEXTGGTECH. Elastic License 2.0.
 
-"""Offline tests for the academic vertical: registry load, per-provider parsers, the
-cross-provider dedup/scoring, and the search-layer source adapter. No network."""
-
 from __future__ import annotations
 
 from core.fetch.academic.engine import AcademicSearchEngine
@@ -23,24 +20,32 @@ from core.fetch.academic.providers import PROVIDERS, ranked_providers
 from core.fetch.academic.registry import json_api_domains, load_registry
 
 
+# Verify that the registry seed loads the friendly JSON APIs and that json_api_domains keeps only
+# keyless, text-search-capable REST endpoints.
 def test_registry_loads_friendly_json_apis():
     domains = load_registry()
     assert domains, "registry seed should load non-empty"
     patterns = {d.pattern for d in domains}
     assert {"openalex.org", "crossref.org", "arxiv.org"} <= patterns
-    # json_api_domains keeps only keyless, text-search-capable REST endpoints.
     api_patterns = {d.pattern for d in json_api_domains()}
     assert "openalex.org" in api_patterns
-    assert "unpaywall.org" not in api_patterns  # DOI-only (text_search_capable=False)
+
+    # Unpaywall is DOI-only (text_search_capable=False), so it is excluded.
+    assert "unpaywall.org" not in api_patterns
 
 
+# Verify that every wired provider has a registry row and that OpenAlex, the highest-weight
+# provider, is ranked first.
 def test_every_wired_provider_maps_to_a_registry_row():
     for provider in PROVIDERS:
         assert provider.domain is not None, f"{provider.name} has no registry row"
-    assert [p.name for p in ranked_providers()][0] == "openalex"  # highest weight
+    assert [p.name for p in ranked_providers()][0] == "openalex"
 
 
+# Verify that the OpenAlex parser rebuilds the abstract from the inverted index and maps the
+# title, DOI, year, PDF link, venue and citation count.
 def test_parse_openalex_deinverts_abstract():
+    # An OpenAlex response with one work whose abstract is stored as an inverted index.
     body = {
         "results": [
             {
@@ -59,6 +64,8 @@ def test_parse_openalex_deinverts_abstract():
             }
         ]
     }
+
+    # The parser returns the work with the de-inverted abstract and the mapped metadata.
     papers = parse_openalex(body)
     assert len(papers) == 1
     p = papers[0]
@@ -71,6 +78,8 @@ def test_parse_openalex_deinverts_abstract():
     assert p.citations == 99000
 
 
+# Verify that the Crossref parser strips JATS markup from the abstract and maps the authors,
+# year, venue and citation count.
 def test_parse_crossref_strips_jats_abstract():
     body = {
         "message": {
@@ -96,6 +105,7 @@ def test_parse_crossref_strips_jats_abstract():
     assert p.citations == 12
 
 
+# Verify that the Europe PMC and DOAJ parsers map the URL, open-access flag, authors and DOI.
 def test_parse_europepmc_and_doaj():
     epmc = parse_europepmc({
         "resultList": {"result": [{
@@ -123,6 +133,7 @@ def test_parse_europepmc_and_doaj():
     assert doaj.url == "https://j/oa"
 
 
+# Verify that the arXiv parser reads an Atom feed entry into title, year, PDF link and authors.
 def test_parse_arxiv_atom():
     xml = """<?xml version="1.0"?>
     <feed xmlns="http://www.w3.org/2005/Atom">
@@ -144,6 +155,7 @@ def test_parse_arxiv_atom():
     assert p.open_access is True
 
 
+# Google Scholar results page with two result blocks, the first one carrying a PDF side link.
 _SCHOLAR_HTML = """
 <div class="gs_r gs_or gs_scl">
   <div class="gs_ggs gs_fl"><div class="gs_or_ggsm">
@@ -166,11 +178,15 @@ _SCHOLAR_HTML = """
 """
 
 
+# Verify that the Scholar HTML parser returns both results, strips the [PDF] tag from the title and
+# extracts the links, year, citation counts, authors and snippet.
 def test_parse_scholar_html():
     papers = parse_scholar(_SCHOLAR_HTML)
     assert len(papers) == 2
     p = papers[0]
-    assert p.title == "Attention is all you need"  # [PDF] tag stripped
+
+    # The "[PDF]" tag is stripped from the title.
+    assert p.title == "Attention is all you need"
     assert p.url == "https://x.org/abs"
     assert p.pdf_url == "https://x.org/paper.pdf"
     assert p.year == 2017
@@ -180,6 +196,8 @@ def test_parse_scholar_html():
     assert papers[1].citations == 80000
 
 
+# Verify that the SerpAPI Scholar parser maps a result to a scholar paper marked as coming via
+# serpapi, with year, citations, PDF link and authors.
 def test_parse_serpapi_scholar():
     body = {
         "organic_results": [
@@ -207,6 +225,8 @@ def test_parse_serpapi_scholar():
     assert p.authors == ["A Vaswani", "N Shazeer"]
 
 
+# Verify that the ranked providers contain either the SerpAPI Scholar path (key present) or the
+# direct Scholar path (no key), never both.
 def test_scholar_path_is_mutually_exclusive(monkeypatch):
     names = lambda: {p.name for p in ranked_providers()}
     monkeypatch.setattr(providers_mod, "_has_serpapi_key", lambda: True)
@@ -217,13 +237,18 @@ def test_scholar_path_is_mutually_exclusive(monkeypatch):
     assert "scholar" in without_key and "scholar_serpapi" not in without_key
 
 
+# Verify that captcha and "sorry" pages are detected as Scholar blocks, while real results pages
+# and an empty body are not.
 def test_scholar_block_detection():
     assert is_scholar_block('<html><body><div id="gs_captcha">...</div></body></html>')
     assert is_scholar_block('<form action="/sorry/index">please solve the captcha</form>' + "x" * 2100)
     assert not is_scholar_block(_SCHOLAR_HTML)
-    assert not is_scholar_block("")  # trivial/empty body is not a block
+
+    # A trivial or empty body is not a block.
+    assert not is_scholar_block("")
 
 
+# Verify that the parsers return an empty list for empty or malformed input instead of raising.
 def test_parsers_never_raise_on_garbage():
     assert parse_openalex({}) == []
     assert parse_crossref({"message": {}}) == []
@@ -231,6 +256,8 @@ def test_parsers_never_raise_on_garbage():
     assert parse_arxiv("not xml <<<") == []
 
 
+# Verify that papers with the same DOI merge into the higher-confidence one, which is backfilled
+# with the missing abstract and PDF link of the loser and records the loser in also_in.
 def test_dedupe_merges_by_doi_and_backfills():
     engine = AcademicSearchEngine()
     rich = AcademicPaper(id="a", title="Same Paper", url="u1", source="crossref",
@@ -238,18 +265,25 @@ def test_dedupe_merges_by_doi_and_backfills():
     poor = AcademicPaper(id="b", title="Same Paper", url="u2", source="openalex",
                          source_domain="openalex.org", doi="10.1/same",
                          abstract="filled in", pdf_url="p.pdf", confidence=0.9)
-    poor.confidence, rich.confidence = 0.9, 1.5  # rich wins
+
+    # The richer paper gets the higher confidence, so it wins the merge.
+    poor.confidence, rich.confidence = 0.9, 1.5
     out = engine._rank_and_dedupe([rich, poor], cap=10)
     assert len(out) == 1
     assert out[0].source == "crossref"
-    assert out[0].abstract == "filled in"   # backfilled from the loser
+
+    # The abstract is backfilled from the loser.
+    assert out[0].abstract == "filled in"
     assert out[0].pdf_url == "p.pdf"
     assert "openalex" in out[0].meta.get("also_in", [])
 
 
+# Verify that a paper with a DOI and the same paper known only by its title (different case)
+# collapse into one result.
 def test_dual_key_dedup_collapses_doi_and_title():
     engine = AcademicSearchEngine()
-    # OpenAlex carries a DOI; Scholar carries only a title — same paper, must merge to one.
+
+    # OpenAlex carries a DOI; Scholar carries only a title, so the pair is the same paper.
     oa = AcademicPaper(id="o", title="Attention Is All You Need", url="u1",
                        source="openalex", source_domain="openalex.org",
                        doi="10.5555/aaaa", confidence=1.6)
@@ -261,6 +295,8 @@ def test_dual_key_dedup_collapses_doi_and_title():
     assert "scholar" in out[0].meta.get("also_in", [])
 
 
+# Verify that source saturation keeps one index from monopolizing the capped results even when
+# all of its papers score higher.
 def test_source_saturation_prevents_monopoly():
     engine = AcademicSearchEngine()
     papers = [AcademicPaper(id=f"o{i}", title=f"Open access study number {i}", url=f"o{i}",
@@ -270,10 +306,13 @@ def test_source_saturation_prevents_monopoly():
                              source="europepmc", source_domain="europepmc.org",
                              confidence=1.3) for i in range(2)]
     out = engine._rank_and_dedupe(papers, cap=6)
+
     # Despite every openalex paper scoring higher, saturation must surface the other index.
     assert "europepmc" in {p.source for p in out}
 
 
+# Verify that a paper found by two indexes is merged, lists the other index in also_in and ends up
+# with a confidence above its solo base score.
 def test_consensus_bonus_rewards_cross_index_agreement():
     engine = AcademicSearchEngine()
     solo = AcademicPaper(id="a", title="A unique solo paper title", url="a",
@@ -285,9 +324,13 @@ def test_consensus_bonus_rewards_cross_index_agreement():
     out = engine._rank_and_dedupe([solo, p1, p2], cap=10)
     merged = next(p for p in out if p.source == "openalex")
     assert merged.meta.get("also_in") == ["crossref"]
-    assert merged.confidence > 1.2  # agreement lifted it above its solo base score
+
+    # Agreement lifted it above its solo base score.
+    assert merged.confidence > 1.2
 
 
+# Verify that papers without a DOI are merged by their normalized title (case, punctuation and
+# spacing ignored).
 def test_title_dedupe_when_no_doi():
     engine = AcademicSearchEngine()
     a = AcademicPaper(id="a", title="Deep Learning!", url="u1", source="arxiv",
@@ -298,36 +341,54 @@ def test_title_dedupe_when_no_doi():
     assert len(out) == 1
 
 
+# Verify that a provider stays available after one anti-bot response, enters a cooldown after the
+# second and becomes available again after a clean 200.
 def test_provider_health_cools_down_on_repeated_antibot():
     h = ProviderHealth()
     assert h.available("doaj")
-    h.record("doaj", ok=False, status_code=403)  # first antibot: still available
+
+    # The first anti-bot response leaves the provider available.
+    h.record("doaj", ok=False, status_code=403)
     assert h.available("doaj")
-    h.record("doaj", ok=False, status_code=403)  # second: trips the cooldown
+
+    # The second one trips the cooldown.
+    h.record("doaj", ok=False, status_code=403)
     assert not h.available("doaj")
     assert h.cooldown_remaining("doaj") > 0
     assert "doaj" in h.snapshot()
+
     # A clean 200 clears the streak and the cooldown.
     h.record("doaj", ok=True, status_code=200)
     assert h.available("doaj")
 
 
+# Verify that repeated HTTP 200 responses with zero papers never put a provider into a cooldown.
 def test_provider_health_empty_200_is_not_a_failure():
     h = ProviderHealth()
     for _ in range(5):
-        h.record("crossref", ok=False, status_code=200)  # 200, zero papers
+        # A 200 response that yielded zero papers.
+        h.record("crossref", ok=False, status_code=200)
     assert h.available("crossref")
 
 
+# Verify that min_interval paces a provider right after it fired, that an interval of zero disables
+# the pacing and that other providers are unaffected.
 def test_provider_health_min_interval_paces_fires():
     h = ProviderHealth()
     assert h.available("scholar", min_interval=4.0)
     h.note_fired("scholar")
-    assert not h.available("scholar", min_interval=4.0)  # just fired, paced out
-    assert h.available("scholar", min_interval=0.0)       # no pacing → always ok
-    assert h.available("openalex", min_interval=4.0)       # different provider unaffected
+
+    # The provider just fired, so it is paced out.
+    assert not h.available("scholar", min_interval=4.0)
+
+    # Without pacing it is always available.
+    assert h.available("scholar", min_interval=0.0)
+
+    # A different provider is unaffected.
+    assert h.available("openalex", min_interval=4.0)
 
 
+# Verify that each further failure widens the cooldown of a provider.
 def test_provider_health_backoff_is_exponential():
     h = ProviderHealth()
     for _ in range(2):
@@ -335,9 +396,11 @@ def test_provider_health_backoff_is_exponential():
     first = h.cooldown_remaining("arxiv")
     h.record("arxiv", ok=False, error="ReadTimeout")
     second = h.cooldown_remaining("arxiv")
-    assert second > first  # each further failure widens the cooldown
+    assert second > first
 
 
+# Verify that the search-layer adapter turns a paper into a citable academic source dict with the
+# citation id, engine name, shortened author list ("et al."), DOI and PDF link.
 def test_search_layer_adapter_shapes_citable_source():
     from core.search.web_search import _academic_paper_dict
 

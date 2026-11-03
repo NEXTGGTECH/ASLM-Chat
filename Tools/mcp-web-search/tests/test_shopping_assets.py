@@ -7,6 +7,8 @@ import pytest
 from core.fetch.shopping.assets import ShoppingAssetCache
 
 
+# Verify that the asset cache exposes only the favicon proxy URL: the favicon and product image
+# download helpers do not exist.
 @pytest.mark.unit
 def test_asset_cache_only_exposes_favicon_proxy_url() -> None:
     cache = ShoppingAssetCache()
@@ -16,6 +18,7 @@ def test_asset_cache_only_exposes_favicon_proxy_url() -> None:
     assert not hasattr(cache, "ensure_product_image")
 
 
+# Verify that the favicon proxy URL is stable: the host is lower-cased and the www prefix removed.
 @pytest.mark.unit
 def test_favicon_proxy_url_is_stable() -> None:
     cache = ShoppingAssetCache()
@@ -23,6 +26,7 @@ def test_favicon_proxy_url_is_stable() -> None:
     assert cache.favicon_proxy_url("www.Example.COM") == "/api/favicon/?domain=example.com"
 
 
+# Verify that domain text with a path or a port yields an empty proxy URL.
 @pytest.mark.unit
 def test_favicon_proxy_url_rejects_unsafe_domain_text() -> None:
     cache = ShoppingAssetCache()

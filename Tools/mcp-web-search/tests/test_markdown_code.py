@@ -7,12 +7,16 @@ from core.extract.markdown_code import restore_pre_markers
 from core.extract.page_normalizer import normalize_page
 
 
+# Paragraph long enough to keep the synthetic articles on the primary formatted extraction path,
+# so code preservation is tested independently of the fallbacks.
 _PROSE = (
     "This substantial explanatory paragraph keeps the synthetic article on the primary "
     "formatted extraction path while code preservation is verified independently."
 )
 
 
+# Verify that a pre/code block with a language class is rendered as a fenced block that keeps its
+# indentation and language, with no internal marker left behind.
 def test_normalizer_preserves_pre_indentation_and_language():
     html = f"""<html><head><title>Code fixture</title></head><body><article>
     <p>{_PROSE}</p><p>{_PROSE}</p>
@@ -28,6 +32,8 @@ def test_normalizer_preserves_pre_indentation_and_language():
     assert "ASLMCODE" not in markdown
 
 
+# Verify that a code block rendered as one div per line (React sandbox markup) becomes a fenced
+# block with the language from the class and one source line per div.
 def test_normalizer_handles_react_div_line_markup():
     html = f"""<html><head><title>React code fixture</title></head><body><article>
     <p>{_PROSE}</p><p>{_PROSE}</p>
@@ -44,6 +50,8 @@ def test_normalizer_handles_react_div_line_markup():
     assert "```javascript\nfunction App() {\n  return value;\n}\n```" in markdown
 
 
+# Verify that code containing a ``` line gets a longer (four-backtick) fence, keeps its blank
+# lines and that table-shaped lines inside it are not turned into a table.
 def test_dynamic_fence_and_blank_lines_survive_postprocessing():
     html = f"""<html><head><title>Fence fixture</title></head><body><article>
     <p>{_PROSE}</p><p>{_PROSE}</p>
@@ -63,6 +71,8 @@ omega</code></pre>
     assert "| left | right |" not in markdown
 
 
+# Verify that the full-body fallback keeps a pre/code block as a fenced block with its language,
+# between the surrounding header and footer text.
 def test_full_body_fallback_restores_pre_in_place():
     html = """<html><body><header>Download</header>
     <pre><code class="language-shell">if ready; then
@@ -77,6 +87,8 @@ fi</code></pre>
     assert "Checksums" in text
 
 
+# Verify that restore_pre_markers replaces everything between the start and stop markers, even a
+# code block the extractor generated itself, with the stored fenced code.
 def test_marker_boundaries_replace_extractor_generated_code_range():
     start = "ASLMCODESTARTFIXTURE0000END"
     stop = "ASLMCODESTOPFIXTURE0000END"
@@ -89,6 +101,8 @@ def test_marker_boundaries_replace_extractor_generated_code_range():
     assert restored.count("```") == 2
 
 
+# Verify that the DOM block fallback extraction also keeps a pre/code block as a fenced block with
+# its language and indentation, with no internal marker left behind.
 def test_dom_fallback_preserves_preformatted_code():
     from core.extract.page_normalizer import _extract_with_dom_blocks
 

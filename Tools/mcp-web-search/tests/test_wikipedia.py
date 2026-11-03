@@ -9,6 +9,8 @@ import custom_domains
 import custom_domains.wikipedia as wikipedia
 
 
+# Verify that an article URL maps to the API endpoint of its language wiki, with the page name (without
+# the fragment) and redirects enabled.
 def test_wikipedia_article_urls_map_to_their_language_api():
     endpoint, params = wikipedia._api_request(
         "https://ru.wikipedia.org/wiki/Python_(язык_программирования)#История"
@@ -19,6 +21,8 @@ def test_wikipedia_article_urls_map_to_their_language_api():
     assert params["redirects"] == "1"
 
 
+# Verify that a mobile host with a revision URL maps to the desktop API endpoint and passes the oldid
+# instead of a page name.
 def test_mobile_and_revision_urls_are_supported():
     endpoint, params = wikipedia._api_request(
         "https://en.m.wikipedia.org/w/index.php?title=Python&oldid=12345"
@@ -29,12 +33,16 @@ def test_mobile_and_revision_urls_are_supported():
     assert "page" not in params
 
 
+# Verify that the portal root, a wiki main page without an article and a lookalike host have no API
+# request.
 def test_non_article_and_lookalike_urls_do_not_match():
     assert wikipedia._api_request("https://www.wikipedia.org/") is None
     assert wikipedia._api_request("https://en.wikipedia.org/") is None
     assert wikipedia._api_request("https://en.wikipedia.org.evil.test/wiki/Python") is None
 
 
+# Verify that the API payload is converted to markdown with the title heading, the lead paragraph, the
+# section heading and an absolute link.
 def test_payload_normalization_keeps_lead_headings_and_links():
     payload = {
         "parse": {
@@ -60,6 +68,8 @@ def test_payload_normalization_keeps_lead_headings_and_links():
     assert "[a useful link](https://en.wikipedia.org/wiki/Useful)" in markdown
 
 
+# Verify that the title from the API is used as the document title even when the HTML starts with a
+# section heading.
 def test_api_title_overrides_an_html_section_selected_as_document_title():
     payload = {
         "parse": {
@@ -75,7 +85,10 @@ def test_api_title_overrides_an_html_section_selected_as_document_title():
     assert markdown.startswith("# Canonical API title\n")
 
 
+# Verify that the handler reads an article through the API fetch with the request's timeout and returns
+# an ok result with method "wikipedia_api" that asks for the shared budget.
 def test_handler_uses_api_result_and_requests_budget(monkeypatch):
+    # Check the timeout the handler passes and return canned markdown.
     async def fake_fetch(url: str, timeout: float = 20.0) -> str:
         assert timeout == 7.0
         return "# Article\n\nAPI content"
@@ -91,6 +104,7 @@ def test_handler_uses_api_result_and_requests_budget(monkeypatch):
     assert result.apply_budget
 
 
+# Verify that the Wikipedia handler is registered for article URLs of any language wiki.
 def test_wikipedia_handler_is_registered():
     handler = custom_domains.match("https://de.wikipedia.org/wiki/Python")
 

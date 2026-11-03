@@ -1,12 +1,5 @@
 # Copyright NEXTGGTECH. Elastic License 2.0.
 
-"""Onion layer — SOCKS resolution (reuse-only) + transport, all offline.
-
-No tor and no network: sockets/curl are faked so we lock in the rules that must hold —
-disabled is a no-op, an explicit socks_url and a running tor are reused, no running tor
-disables the feature (we never spawn), and fetch degrades gracefully without a SOCKS.
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -21,17 +14,23 @@ from core.config.settings import SearchConfig, TorSection
 from core.fetch.onion import transport
 
 
+# SOCKS resolution
+
+# Patch the config loader to return a search config with the given Tor settings and drop the cached
+# SOCKS resolution. These tests are offline: sockets and curl are faked, no Tor and no network are used.
 def _use_cfg(monkeypatch, **tor_kw):
     cfg = SearchConfig(tor=TorSection(**tor_kw))
     monkeypatch.setattr(cfgmod, "load_search_config", lambda *a, **k: cfg)
-    tp.reset()  # drop resolver cache
+    tp.reset()
 
 
+# Verify that SOCKS resolution is a no-op returning None when the Tor feature is disabled.
 def test_disabled_is_noop(monkeypatch):
     _use_cfg(monkeypatch, enabled=False)
     assert tp.resolve_socks() is None
 
 
+# Verify that a running Tor daemon answering on port 9050 is reused.
 def test_reuses_running_tor(monkeypatch):
     _use_cfg(monkeypatch, enabled=True)
     monkeypatch.setattr(
@@ -42,6 +41,7 @@ def test_reuses_running_tor(monkeypatch):
     assert tp.resolve_socks() == "socks5h://127.0.0.1:9050"
 
 
+# Verify that the Tor Browser port 9150 is used when it is the only port answering.
 def test_prefers_tor_browser_when_only_9150(monkeypatch):
     _use_cfg(monkeypatch, enabled=True)
     monkeypatch.setattr(
@@ -52,6 +52,7 @@ def test_prefers_tor_browser_when_only_9150(monkeypatch):
     assert tp.resolve_socks() == "socks5h://127.0.0.1:9150"
 
 
+# Verify that an explicitly configured socks_url is used when it answers.
 def test_explicit_socks_url_used_when_answering(monkeypatch):
     _use_cfg(monkeypatch, enabled=True, socks_url="socks5h://127.0.0.1:9999")
     monkeypatch.setattr(
@@ -62,16 +63,20 @@ def test_explicit_socks_url_used_when_answering(monkeypatch):
     assert tp.resolve_socks() == "socks5h://127.0.0.1:9999"
 
 
+# Verify that no running Tor leaves the feature disabled (None): Tor is never spawned.
 def test_no_running_tor_keeps_feature_disabled(monkeypatch):
     _use_cfg(monkeypatch, enabled=True)
     monkeypatch.setattr(tp, "_socks5_open", lambda url, timeout=1.0: False)
-    assert tp.resolve_socks() is None  # we never spawn — no running tor → no-op
+    assert tp.resolve_socks() is None
 
 
+# Verify that a resolved SOCKS URL is served from the cache without probing again, and that force=True
+# probes again.
 def test_resolution_is_cached_until_reset(monkeypatch):
     _use_cfg(monkeypatch, enabled=True)
     calls = {"n": 0}
 
+    # Count the probes and accept only port 9050.
     def probe(url, timeout=1.0):
         calls["n"] += 1
         return urlparse(url).port == 9050
@@ -79,14 +84,20 @@ def test_resolution_is_cached_until_reset(monkeypatch):
     monkeypatch.setattr(tp, "_socks5_open", probe)
     assert tp.resolve_socks() == "socks5h://127.0.0.1:9050"
     n_after_first = calls["n"]
-    assert tp.resolve_socks() == "socks5h://127.0.0.1:9050"  # served from cache
-    assert calls["n"] == n_after_first                       # no re-probe
+
+    # The second call is served from the cache without a new probe.
+    assert tp.resolve_socks() == "socks5h://127.0.0.1:9050"
+    assert calls["n"] == n_after_first
+
+    # force=True probes again.
     assert tp.resolve_socks(force=True) == "socks5h://127.0.0.1:9050"
-    assert calls["n"] > n_after_first                        # force re-probes
+    assert calls["n"] > n_after_first
 
 
-# Accept a listener only after it completes SOCKS5 method negotiation.
+# Verify that the probe accepts a listener only after it completes SOCKS5 method negotiation: the
+# greeting is sent and the no-auth reply is accepted.
 def test_socks5_probe_negotiates_protocol(monkeypatch):
+    # Fake socket that answers the SOCKS5 greeting with a no-auth response.
     class FakeSocket:
         # Prepare a valid SOCKS5 no-auth response.
         def __init__(self):
@@ -122,8 +133,9 @@ def test_socks5_probe_negotiates_protocol(monkeypatch):
     assert connection.sent == [b"\x05\x01\x00"]
 
 
-# Reject a TCP listener that does not negotiate SOCKS5.
+# Verify that the probe rejects a TCP listener that does not negotiate SOCKS5.
 def test_socks5_probe_rejects_plain_listener(monkeypatch):
+    # Fake socket that answers the greeting with a non-SOCKS reply.
     class FakeSocket:
         # Enter the fake socket context.
         def __enter__(self):
@@ -150,21 +162,28 @@ def test_socks5_probe_rejects_plain_listener(monkeypatch):
     assert tp._socks5_open("socks5h://127.0.0.1:9050") is False
 
 
+# Transport
+
+# Verify that fetching degrades to an "unavailable" result when no SOCKS proxy can be resolved.
 def test_fetch_unavailable_when_no_socks(monkeypatch):
     monkeypatch.setattr(transport, "resolve_socks", lambda force=False: None)
     r = asyncio.run(transport.onion_fetch("http://x.onion/", timeout=5))
     assert r.status == "unavailable" and r.ok is False
 
 
+# Verify that a fetch over a resolved SOCKS proxy returns the body and HTTP status of the faked response.
 def test_fetch_ok_over_fake_tor(monkeypatch):
     monkeypatch.setattr(transport, "resolve_socks",
                         lambda force=False: "socks5h://127.0.0.1:9150")
 
+    # Fake HTTP response with status 200 and a small body.
     class _Resp:
         status_code = 200
         text = "<html>onion body</html>"
 
+    # Fake curl_cffi.requests module that always returns the canned response.
     class _Fake:
+        # Return the canned response for any URL.
         def get(self, url, **kw):
             return _Resp()
 
@@ -174,10 +193,10 @@ def test_fetch_ok_over_fake_tor(monkeypatch):
     assert "onion body" in r.text
 
 
+# Verify that a freshly reloaded tor_proxy module initializes _resolved to the _UNSET sentinel. If it
+# were None, the very first resolve_socks() would return that cached None and never probe, and the
+# onion layer would always report "unavailable" (regression guard).
 def test_resolved_default_is_unset_not_none():
-    # regression guard: the module must initialize _resolved to the _UNSET sentinel. If it
-    # were None, the very first resolve_socks() returns that cached None and never probes —
-    # the onion layer would always report "unavailable".
     import importlib
     importlib.reload(tp)
     assert tp._resolved is tp._UNSET

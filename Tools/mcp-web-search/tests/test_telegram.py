@@ -9,6 +9,7 @@ import custom_domains
 import custom_domains.telegram as telegram
 
 
+# Embed document of one public post: author, channel, text with emoji and links, and a date link.
 _POST_HTML = """
 <!doctype html>
 <html><body>
@@ -30,6 +31,7 @@ _POST_HTML = """
 </body></html>
 """
 
+# Server-rendered channel feed with two posts, listed oldest first.
 _FEED_HTML = """
 <!doctype html>
 <html><head><meta property="og:title" content="Example Channel"/></head><body>
@@ -45,6 +47,8 @@ _FEED_HTML = """
 """
 
 
+# Verify that public post URLs (plain, /s/ preview and forum topic) map to the embed document URL, and a
+# forum topic maps to the message id.
 def test_public_post_and_forum_topic_urls_map_to_embed_document():
     assert telegram.telegram_embed_url("https://t.me/example_channel/42") == (
         "https://t.me/example_channel/42?embed=1&mode=tme"
@@ -57,6 +61,8 @@ def test_public_post_and_forum_topic_urls_map_to_embed_document():
     )
 
 
+# Verify that private invites, /c/ links, bare channels, nested topic paths and lookalike hosts have no
+# embed URL, and that is_telegram_url accepts the invite but rejects the lookalike host.
 def test_private_invite_channel_only_and_lookalike_urls_do_not_match():
     assert telegram.telegram_embed_url("https://t.me/+private-invite") is None
     assert telegram.telegram_embed_url("https://t.me/c/123456/42") is None
@@ -67,6 +73,8 @@ def test_private_invite_channel_only_and_lookalike_urls_do_not_match():
     assert not telegram.is_telegram_url("https://t.me.evil.test/example_channel/42")
 
 
+# Verify that a public channel root (plain or /s/) maps to the server-rendered feed URL, while a post
+# URL or a private invite has no feed URL.
 def test_public_channel_root_maps_to_server_rendered_feed():
     assert telegram.telegram_feed_url("https://t.me/example_channel") == (
         "https://t.me/s/example_channel"
@@ -78,6 +86,8 @@ def test_public_channel_root_maps_to_server_rendered_feed():
     assert telegram.telegram_feed_url("https://t.me/+private-invite") is None
 
 
+# Verify that the embed document is converted to markdown with a title from author and channel, the
+# date, the author, the emoji, the body text and absolute links, without the human-readable date text.
 def test_embed_html_normalizes_body_author_date_emoji_and_links():
     markdown = telegram._embed_to_markdown(
         "https://t.me/example_channel/82432/42",
@@ -94,6 +104,8 @@ def test_embed_html_normalizes_body_author_date_emoji_and_links():
     assert "Apr 16 at 09:03" not in markdown
 
 
+# Verify that the pre-budget guard bounds a very long markdown to the minimum pre-budget size and keeps
+# its heading, so the BM25 input stays small.
 def test_pre_budget_guard_keeps_bm25_input_bounded():
     markdown = "# Telegram post\n\n" + ("Useful sentence for ranking. " * 2_000)
     bounded = telegram._pre_budget_limit(markdown, max_chars=2_000)
@@ -102,6 +114,8 @@ def test_pre_budget_guard_keeps_bm25_input_bounded():
     assert bounded.startswith("# Telegram post")
 
 
+# Verify that the channel feed markdown lists the newest post first, has the channel title and date, and
+# does not contain the "view and join" card text.
 def test_channel_feed_is_newest_first_and_excludes_join_card_chrome():
     markdown = telegram._feed_to_markdown(
         "https://t.me/example_channel",
@@ -116,7 +130,10 @@ def test_channel_feed_is_newest_first_and_excludes_join_card_chrome():
     assert "view and join" not in markdown.lower()
 
 
+# Verify that the handler reads a post through the light HTTP fetch with the request's timeout and
+# character limit, and returns an ok result with method "telegram_embed" that asks for the shared budget.
 def test_handler_uses_light_http_result_and_requests_shared_budget(monkeypatch):
+    # Check the arguments the handler passes and return a canned markdown post.
     async def fake_fetch(url: str, *, timeout: float, max_chars: int) -> str:
         assert url == "https://t.me/example_channel/42"
         assert timeout == 6.0
@@ -139,7 +156,10 @@ def test_handler_uses_light_http_result_and_requests_shared_budget(monkeypatch):
     assert result.apply_budget
 
 
+# Verify that a group without a public HTTP feed gives a failed result (ok is false) that carries the
+# fetch error message.
 def test_group_without_public_http_feed_is_parsed_false(monkeypatch):
+    # Return the error text for a group that has no public message feed.
     async def no_public_feed(*args, **kwargs):
         return "Error: Telegram does not expose a public message feed for: https://t.me/group"
 
@@ -159,6 +179,8 @@ def test_group_without_public_http_feed_is_parsed_false(monkeypatch):
     assert "does not expose a public message feed" in result.error
 
 
+# Verify that the Telegram handler is registered for post, channel and private invite URLs, and that
+# it is not read_page-only (it can be used for inline prefetch).
 def test_telegram_handler_is_registered_for_inline_prefetch():
     handler = custom_domains.match("https://t.me/example_channel/42")
 
