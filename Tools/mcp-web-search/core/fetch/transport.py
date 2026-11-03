@@ -22,7 +22,6 @@ logger = logging.getLogger("core.fetch.transport")
 _CHROMIUM_FAMILIES = frozenset({"chrome", "edge"})
 _WARM_FAMILY = "chromium"
 
-
 # Imported-cookie jars, one per browser family. Chrome/Edge/Brave land in "chromium"; Firefox
 # in "firefox". Replay prefers the engine's own family then falls back across the rest.
 _IMPORTED_FAMILIES = ("chromium", "firefox")
@@ -56,6 +55,8 @@ def _replay_identity_cookies(request: EngineRequest, host: str) -> EngineRequest
     try:
         from core.fetch.browser.identity_store import get_identity_store
 
+        # Base layer: cookies this engine earned over HTTP, plus the warm browser's cookies for
+        # chromium engines.
         store = get_identity_store()
         stored = store.http_cookies_map(owner, host)
         if request.primp_target in _CHROMIUM_FAMILIES:
@@ -63,6 +64,7 @@ def _replay_identity_cookies(request: EngineRequest, host: str) -> EngineRequest
                 name = cookie.get("name")
                 if name:
                     stored[str(name)] = str(cookie.get("value", ""))
+
         # Imported real-browser cookies (opt-in) are the BASE layer: a session the engine can't
         # earn itself (a logged-in SID) fills in, but any cookie the engine has since earned
         # (consent/region) overrides the imported one. The engine's own family jar is preferred,
@@ -80,6 +82,8 @@ def _replay_identity_cookies(request: EngineRequest, host: str) -> EngineRequest
     except Exception as exc:  # noqa: BLE001 — cookie replay must never break a fetch
         logger.debug("identity cookie replay skipped for %s: %s", owner, exc)
         return request
+
+    # The request's own seed cookies win over everything replayed from the stores.
     if not stored:
         return request
     return replace(request, cookies={**stored, **request.cookies})
@@ -98,6 +102,9 @@ def _capture_identity_cookies(request: EngineRequest, host: str, response: Trans
     except Exception as exc:  # noqa: BLE001 — capture is opportunistic
         logger.debug("identity cookie capture skipped for %s: %s", owner, exc)
 
+
+# Baseline desktop-Chrome headers installed on the pooled aiohttp session; per-request headers
+# override them.
 DEFAULT_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -111,7 +118,6 @@ DEFAULT_HEADERS = {
 
 # One pooled aiohttp session shared by all engine requests.
 class AiohttpTransport:
-
     # Initialize timeout and connection pool settings without opening a session yet.
     def __init__(self, *, timeout_seconds: float = 8.0, connection_limit: int = 12) -> None:
         self.timeout_seconds = max(0.1, float(timeout_seconds))
@@ -122,6 +128,8 @@ class AiohttpTransport:
     async def start(self) -> None:
         if self._session is not None and not self._session.closed:
             return
+
+        # Pooled connector (capped overall and per host) plus tight connect/read timeouts.
         connector = aiohttp.TCPConnector(
             limit=self.connection_limit,
             limit_per_host=4,
@@ -135,6 +143,8 @@ class AiohttpTransport:
             sock_connect=min(3.0, self.timeout_seconds),
             sock_read=self.timeout_seconds,
         )
+
+        # raise_for_status stays off so error responses (e.g. captchas) reach the caller.
         self._session = aiohttp.ClientSession(
             connector=connector,
             timeout=timeout,
@@ -183,7 +193,6 @@ def _primp_set_cookie(response: object) -> list[str]:
 
 # Bounded browser-impersonating transport for engines that reject generic TLS clients.
 class PrimpTransport:
-
     # Initialize timeout and a thread-pool executor for blocking primp calls.
     def __init__(self, *, timeout_seconds: float = 8.0, max_workers: int = 4) -> None:
         self.timeout_seconds = max(0.1, float(timeout_seconds))
@@ -192,6 +201,7 @@ class PrimpTransport:
             thread_name_prefix="serp-primp",
         )
         self._clients: dict[str, primp.Client] = {}
+
         # Populate the imported-browser cookie layer once per process (config-gated; a no-op
         # unless profile_import.enabled). Best-effort — never let it break transport setup.
         try:
@@ -215,9 +225,9 @@ class PrimpTransport:
             self._clients[key] = client
         return client
 
-    # Drop every cached client for a host. A primp client keeps its own cookie jar,
-    # and captcha-sensitive engines (ya.ru) burn that jar fast — a retry needs a
-    # fresh connection, not the same sticky session.
+    # Drop every cached client for a host and return how many were dropped. A primp client
+    # keeps its own cookie jar, and captcha-sensitive engines (ya.ru) burn that jar fast — a
+    # retry needs a fresh connection, not the same sticky session.
     def drop_clients(self, host: str) -> int:
         prefix = f"{host}:"
         doomed = [key for key in self._clients if key.startswith(prefix)]
@@ -259,12 +269,12 @@ class PrimpTransport:
 
 # Route each engine to one known transport without retry chains.
 class AdaptiveTransport:
-
     # Initialize all transports: specialized httpx for Google, primp for hosts that
     # reject generic TLS (Brave, Yandex, Startpage SERPs and the Qwant API),
     # fast aiohttp for DuckDuckGo.
     def __init__(self, *, timeout_seconds: float = 8.0) -> None:
         self._fast = AiohttpTransport(timeout_seconds=timeout_seconds)
+
         # One impersonated worker per impersonated host so all engines can run
         # concurrently without starving each other on the thread pool.
         self._impersonated = PrimpTransport(
@@ -292,6 +302,9 @@ class AdaptiveTransport:
     async def fetch(self, request: EngineRequest) -> TransportResponse:
         host = request.url.split("/", 3)[2]
         request = _replay_identity_cookies(request, host)
+
+        # Google gets the legacy-mobile httpx client, impersonated hosts go through primp and
+        # everything else uses the fast aiohttp session.
         if host == "www.google.com":
             response = await self._httpx.fetch(request)
         elif host in self._IMPERSONATED_HOSTS:
@@ -302,7 +315,7 @@ class AdaptiveTransport:
         return response
 
     # Captcha-burn recovery: drop the host's impersonated client (its internal cookie
-    # jar is the sticky identity that captcha branches pin to).
+    # jar is the sticky identity that captcha branches pin to) and return how many were dropped.
     def drop_identity_clients(self, host: str) -> int:
         return self._impersonated.drop_clients(host)
 

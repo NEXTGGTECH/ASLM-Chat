@@ -62,6 +62,7 @@ def _make_ssl_context() -> ssl.SSLContext:
         random.shuffle(tail)
         ctx.set_ciphers(":".join(head + tail))
     except ssl.SSLError:
+        # A build that rejects the shuffled cipher list keeps the default context.
         pass
     return ctx
 
@@ -72,8 +73,7 @@ def _make_ssl_context() -> ssl.SSLContext:
 # ConnectError that occurs when Google closes a keepalive connection and httpx
 # tries to reuse it for the next request.
 class HttpxTransport:
-
-    # Build the transport.
+    # Store the request timeout in seconds, floored at 0.1.
     def __init__(self, *, timeout_seconds: float = 8.0) -> None:
         self.timeout_seconds = max(0.1, float(timeout_seconds))
 
@@ -81,10 +81,13 @@ class HttpxTransport:
     # no desktop-only client hints. A new SSL context (new cipher order) is created
     # per call, so every TLS handshake looks different to fingerprint-based systems.
     async def fetch(self, request: EngineRequest) -> TransportResponse:
+        # Adapt the engine headers to a legacy mobile client.
         headers = {k: v for k, v in request.headers.items() if k not in _DESKTOP_ONLY_HEADERS}
         headers["User-Agent"] = _gsa_user_agent()
         headers["Accept"] = "*/*"
         headers["Accept-Encoding"] = "gzip, deflate"
+
+        # One short-lived client per request, so each connection has its own TLS fingerprint.
         async with httpx.AsyncClient(
             verify=_make_ssl_context(),
             timeout=httpx.Timeout(self.timeout_seconds, connect=min(4.0, self.timeout_seconds)),
@@ -98,11 +101,13 @@ class HttpxTransport:
                 headers=headers,
                 cookies=request.cookies or None,
             )
+
+        # Surface the raw Set-Cookie lines so the identity store can accumulate them.
         return TransportResponse(
             status=response.status_code, body=response.content,
             transport="httpx", set_cookie=list(response.headers.get_list("set-cookie")),
         )
 
-    # No persistent client to close.
+    # Do nothing: every request opens and closes its own client, so there is nothing to release.
     async def close(self) -> None:
         pass

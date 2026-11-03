@@ -19,6 +19,7 @@ ALLOWED_EXTENSIONS: dict[str, list[str]] = {
     ],
 }
 
+# Executable and native-library extensions that are never reported as downloadable files.
 BLOCKED_EXTENSIONS: list[str] = [
     ".exe",
     ".dll",
@@ -45,12 +46,14 @@ def _extract_extension(filename: str) -> str:
 
 # Return (extension, category) if url points to a known downloadable file.
 def get_download_info(url: str) -> tuple[str, str] | None:
+    # Take the file name from the decoded URL path; an unparsable URL is not a download.
     try:
         path = unquote(urlparse(url).path)
         filename = PurePosixPath(path).name or ""
     except Exception:
         return None
 
+    # Blocked or unknown extensions are not reported; otherwise look up the category.
     ext = _extract_extension(filename)
     if not ext or ext in BLOCKED_EXTENSIONS:
         return None

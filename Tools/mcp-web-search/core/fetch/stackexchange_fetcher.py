@@ -11,6 +11,8 @@ from urllib.parse import urlparse
 
 from core.fetch.thread_pool import io_pool as _io_pool
 
+# Pattern capturing the numeric question id from a /questions/{id} path, and the Stack Exchange
+# API site parameter of the stand-alone domains (network sites are derived from the subdomain).
 _QUESTION_RE = re.compile(r"/questions/(\d+)(?:/|$)")
 _HOST_TO_SITE = {
     "stackoverflow.com": "stackoverflow",
@@ -20,12 +22,12 @@ _HOST_TO_SITE = {
 }
 
 
-# Normalize host: lowercase, strip www.
+# Return the normalized host of a URL: lowercase, without a leading www.
 def _host(url: str) -> str:
     return urlparse(url).netloc.lower().removeprefix("www.")
 
 
-# Map Stack Exchange hostname to API site parameter.
+# Map a Stack Exchange hostname to its API site parameter, or None for other hosts.
 def _site_from_host(host: str) -> str | None:
     if host in _HOST_TO_SITE:
         return _HOST_TO_SITE[host]
@@ -34,19 +36,20 @@ def _site_from_host(host: str) -> str | None:
     return None
 
 
-# Extract numeric question id from a /questions/{id}/ URL path.
+# Extract the numeric question id from a /questions/{id}/ URL path, or None.
 def stackexchange_question_id(url: str) -> str | None:
     m = _QUESTION_RE.search(urlparse(url).path)
     return m.group(1) if m else None
 
 
-# True when url is a supported Stack Exchange question page.
+# Return True when url is a supported Stack Exchange question page.
 def is_stackexchange_question_url(url: str) -> bool:
     return _site_from_host(_host(url)) is not None and stackexchange_question_id(url) is not None
 
 
-# Convert API HTML fragment to plain text (code blocks preserved as fenced).
+# Convert an API HTML fragment to plain text (code blocks preserved as fenced).
 def _strip_html_fragment(fragment: str) -> str:
+    # Preferred path: parse with BeautifulSoup, dropping scripts and styles.
     try:
         from bs4 import BeautifulSoup
 
@@ -59,13 +62,14 @@ def _strip_html_fragment(fragment: str) -> str:
         text = soup.get_text("\n", strip=True)
         return html.unescape(text).strip()
     except Exception:
+        # Fallback when BeautifulSoup is unavailable or fails: crude regex tag stripping.
         text = re.sub(r"<br\s*/?>", "\n", fragment or "", flags=re.IGNORECASE)
         text = re.sub(r"</p\s*>", "\n\n", text, flags=re.IGNORECASE)
         text = re.sub(r"<[^>]+>", "", text)
         return html.unescape(text).strip()
 
 
-# Format Unix epoch as ISO-8601 UTC with Z suffix.
+# Format a Unix epoch as ISO-8601 UTC with a Z suffix; an invalid value gives "".
 def _format_timestamp(value: object) -> str:
     try:
         return datetime.fromtimestamp(float(value), tz=timezone.utc).isoformat().replace("+00:00", "Z")
@@ -73,7 +77,7 @@ def _format_timestamp(value: object) -> str:
         return ""
 
 
-# GET Stack Exchange API URL and return parsed JSON.
+# Fetch a Stack Exchange API URL (blocking) and return the parsed JSON; HTTP errors raise.
 def _stackexchange_api_get(url: str, timeout: int) -> dict[str, Any]:
     from curl_cffi import requests as _r
 
@@ -91,7 +95,7 @@ def _stackexchange_api_get(url: str, timeout: int) -> dict[str, Any]:
     return resp.json()
 
 
-# Display name from API owner object.
+# Return the display name from the API owner object, or "".
 def _owner_name(item: dict[str, Any]) -> str:
     owner = item.get("owner") if isinstance(item.get("owner"), dict) else {}
     return str(owner.get("display_name") or "").strip()
@@ -123,13 +127,15 @@ def _normalize_answer(item: dict[str, Any], comments: list[dict[str, Any]]) -> d
     }
 
 
-# Group comment items by post_id or parent id field.
+# Group comment items by their post_id (or other parent id field), normalizing each comment;
+# items without a valid parent id are skipped.
 def _comments_by_post_id(items: list[dict[str, Any]], id_field: str) -> dict[int, list[dict[str, Any]]]:
     grouped: dict[int, list[dict[str, Any]]] = {}
     for item in items:
         try:
             key = int(item.get(id_field) or 0)
         except Exception:
+            # A malformed id is treated as missing and skipped below.
             key = 0
         if not key:
             continue
@@ -137,13 +143,16 @@ def _comments_by_post_id(items: list[dict[str, Any]], id_field: str) -> dict[int
     return grouped
 
 
-# Fetch question + top answers via Stack Exchange API (sync).
+# Fetch the question, its top answers and their comments via the Stack Exchange API (blocking)
+# and return them as a dict with "ok": True, or "ok": False plus an "error" message when the URL
+# is unsupported or the API returns no question. HTTP failures of the API calls raise.
 def fetch_stackexchange_question_data_sync(
     url: str,
     timeout: float = 20.0,
     answer_limit: int = 3,
     comment_limit: int = 5,
 ) -> dict[str, Any]:
+    # Identify the site and question id from the URL.
     host = _host(url)
     site = _site_from_host(host)
     qid = stackexchange_question_id(url)
@@ -154,6 +163,7 @@ def fetch_stackexchange_question_data_sync(
             "url": url,
         }
 
+    # API endpoints for the question, its answers (by votes) and its comments, with bodies.
     timeout_int = max(10, int(timeout))
     question_url = f"https://api.stackexchange.com/2.3/questions/{qid}?site={site}&filter=withbody"
     answers_url = (
@@ -165,6 +175,7 @@ def fetch_stackexchange_question_data_sync(
         f"?site={site}&filter=withbody&sort=votes"
     )
 
+    # Fetch the question itself; without it there is nothing to return.
     question_payload = _stackexchange_api_get(question_url, timeout_int)
     question_items = question_payload.get("items") if isinstance(question_payload, dict) else []
     if not isinstance(question_items, list) or not question_items:
@@ -176,18 +187,21 @@ def fetch_stackexchange_question_data_sync(
 
     question_item = question_items[0]
 
+    # Fetch the answers and keep only the top answer_limit by votes.
     answers_payload = _stackexchange_api_get(answers_url, timeout_int)
     answer_items = answers_payload.get("items") if isinstance(answers_payload, dict) else []
     if not isinstance(answer_items, list):
         answer_items = []
     answer_items = answer_items[: max(0, int(answer_limit))]
 
+    # Fetch the question's own comments, limited to comment_limit.
     question_comments_payload = _stackexchange_api_get(question_comments_url, timeout_int)
     question_comment_items = question_comments_payload.get("items") if isinstance(question_comments_payload, dict) else []
     if not isinstance(question_comment_items, list):
         question_comment_items = []
     question_comments = [_normalize_comment(item) for item in question_comment_items[: max(0, int(comment_limit))]]
 
+    # Fetch the comments of all kept answers in one batched call, then cap them per answer.
     answer_comments_by_id: dict[int, list[dict[str, Any]]] = {}
     answer_ids = [int(item.get("answer_id") or 0) for item in answer_items if int(item.get("answer_id") or 0)]
     if answer_ids:
@@ -206,6 +220,7 @@ def fetch_stackexchange_question_data_sync(
             try:
                 post_id = int(item.get("post_id") or 0)
             except Exception:
+                # A malformed post id is treated as missing and skipped below.
                 post_id = 0
             if not post_id:
                 continue
@@ -215,6 +230,7 @@ def fetch_stackexchange_question_data_sync(
             per_answer_counts[post_id] = per_answer_counts.get(post_id, 0) + 1
         answer_comments_by_id = _comments_by_post_id(limited_comments, "post_id")
 
+    # Assemble the normalized answers and question.
     answers = [
         _normalize_answer(item, answer_comments_by_id.get(int(item.get("answer_id") or 0), []))
         for item in answer_items
@@ -237,6 +253,7 @@ def fetch_stackexchange_question_data_sync(
         "comments": question_comments,
     }
 
+    # Success payload; quota_remaining reports the API's remaining daily request quota.
     return {
         "ok": True,
         "source": "stackexchange_api",
@@ -249,17 +266,21 @@ def fetch_stackexchange_question_data_sync(
     }
 
 
-# Render API payload as markdown for read_page / preview.
+# Render the API payload as markdown for read_page / preview: a metadata header, the question
+# body, its comments and the top answers with their comments. A failed payload becomes an
+# "Error: ..." string.
 def render_stackexchange_question_markdown(data: dict[str, Any]) -> str:
     if not data.get("ok"):
         return f"Error: {data.get('error') or 'unknown Stack Exchange fetch failure'}"
 
+    # Read the question and answers defensively; missing parts default to empty values.
     question = data.get("question") if isinstance(data.get("question"), dict) else {}
     answers = data.get("answers") if isinstance(data.get("answers"), list) else []
 
     title = str(question.get("title") or "").strip() or "Stack Exchange Question"
     body = str(question.get("body_markdown") or "").strip()
 
+    # Metadata header; optional fields appear only when present.
     lines = [f"# {title}", "", f"**Site:** {data.get('host') or data.get('site') or ''}", f"**URL:** {data.get('url') or ''}"]
     if question.get("author"):
         lines.append(f"**Author:** {question['author']}")
@@ -277,6 +298,8 @@ def render_stackexchange_question_markdown(data: dict[str, Any]) -> str:
     if tags:
         lines.append(f"**Tags:** {', '.join(str(tag) for tag in tags if str(tag).strip())}")
     lines.extend(["", "---", ""])
+
+    # Question body, then its comments.
     if body:
         lines.append(body)
 
@@ -295,6 +318,7 @@ def render_stackexchange_question_markdown(data: dict[str, Any]) -> str:
                 lines.append(str(comment["body_text"]))
             lines.append("")
 
+    # Top answers, each with a header (marking the accepted one), metadata, body and comments.
     if answers:
         lines.extend(["", "## Top Answers", ""])
         for idx, answer in enumerate(answers, 1):
@@ -332,13 +356,13 @@ def render_stackexchange_question_markdown(data: dict[str, Any]) -> str:
     return "\n".join(lines).strip()
 
 
-# Sync fetch: API payload rendered as markdown.
+# Fetch a question (blocking) and return it rendered as markdown.
 def fetch_stackexchange_question_sync(url: str, timeout: float = 20.0, answer_limit: int = 3) -> str:
     data = fetch_stackexchange_question_data_sync(url, timeout=timeout, answer_limit=answer_limit)
     return render_stackexchange_question_markdown(data)
 
 
-# Async wrapper around fetch_stackexchange_question_data_sync.
+# Run fetch_stackexchange_question_data_sync in the shared I/O pool.
 async def fetch_stackexchange_question_data(
     url: str,
     timeout: float = 20.0,
@@ -357,7 +381,7 @@ async def fetch_stackexchange_question_data(
     )
 
 
-# Async fetch: markdown for read_page / preview.
+# Fetch a question without blocking the event loop and return it as markdown for read_page / preview.
 async def fetch_stackexchange_question(url: str, timeout: float = 20.0, answer_limit: int = 3) -> str:
     data = await fetch_stackexchange_question_data(url, timeout=timeout, answer_limit=answer_limit)
     return render_stackexchange_question_markdown(data)
