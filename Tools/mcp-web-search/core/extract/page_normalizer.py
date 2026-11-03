@@ -31,8 +31,9 @@ from core.extract.content_processor import (
     _get_boilerplate_filter,
 )
 
-# Cap on the length of the final markdown, and the placeholder used when nothing was extracted.
-_MAX_OUTPUT_CHARS = 50_000
+# Cap on the length of the final markdown - a guard against pathological pages only. Size decisions
+# belong to the read_page compression layer and to `find`, which needs the full text.
+_MAX_OUTPUT_CHARS = 2_000_000
 _NO_CONTENT_MARKER = "*No content extracted.*"
 
 # Runs of horizontal whitespace (newlines excluded), and an HTML tag.

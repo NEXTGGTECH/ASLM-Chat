@@ -50,6 +50,7 @@
                 "curl_cffi==0.7.0",
                 "httpx[http2,socks,brotli]==0.28.1",
                 "lxml==5.4.0",
+                "nltk==3.10.3",
                 "orjson==3.11.7",
                 "playwright==1.50.0",
                 "primp==1.2.3",

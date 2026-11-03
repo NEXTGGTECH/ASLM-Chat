@@ -87,7 +87,14 @@ Use it when you need:
 
 It works best as the second step after search, once discovery is done and you want to
 read the sources. PDFs, YouTube transcripts, Reddit threads, GitHub pages, StackExchange
-questions, and X/Twitter posts are handled automatically from their URL."""
+questions, and X/Twitter posts are handled automatically from their URL.
+
+Very long pages are compressed in proportion to their size: weaker prose is shortened or
+omitted (gaps marked "[… omitted …]") while code, tables, formulas and headings stay
+verbatim. To pull specific passages from anywhere in the full page — a code example, a
+number, a definition — pass `find` with the words to look for (any inflection matches);
+it searches the complete page and returns whole passages around each hit with their
+section path. Without `find` you get the page text."""
 
 
 # Input schema of the web_search tool in the legacy schema mode: query plus effort and the shopping

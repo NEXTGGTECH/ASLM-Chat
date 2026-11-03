@@ -69,6 +69,13 @@ def _evict_caches_once() -> None:
         get_page_cache().evict_stale()
     except Exception as exc:  # noqa: BLE001 — housekeeping must never block a search
         logger.debug("cache eviction skipped: %s", exc)
+    try:
+        # Punkt models, stopwords and language names download in the background.
+        from core.search.nltk_resources import prefetch_resources
+
+        prefetch_resources()
+    except Exception as exc:  # noqa: BLE001 — NLTK data is optional at runtime
+        logger.debug("nltk prefetch skipped: %s", exc)
 
 
 # Tool definitions
@@ -135,6 +142,18 @@ TOOLS = [
                         },
                     ],
                 },
+                "find": {
+                    "description": (
+                        "Optional. Words or a phrase to locate in the FULL page text, including "
+                        "parts a long page's compression omitted. Every inflection matches "
+                        "(index/indexes, индекс/индексами). Returns whole passages around each "
+                        "hit - the paragraph, list, table rows or code block with its lead-in, "
+                        "plus the section path. Separate alternatives with ' | '; /regex/ for a "
+                        "regular expression. Omit or leave empty to get the page text itself."
+                    ),
+                    "type": "string",
+                    "maxLength": 300,
+                },
             },
             "required": ["url"],
         },
@@ -153,46 +172,113 @@ def supports(engine: str | None = None, model_name: str | None = None) -> bool:
 
 # Web search
 
-# Attach rich cards (wikipedia/discussions) to a finished web_search result. Return the result
-# unchanged when the feature is disabled or building the cards fails.
-async def _attach_rich_cards(result: dict[str, Any], queries: list[str]) -> dict[str, Any]:
+# Start the product card (shopping preview) next to the web search when a query reads as a product
+# search. Return the running task, or None when the card is disabled, the search is a shopping vertical
+# or onion search, or no query has commerce intent. Fail-open: never raises.
+def _start_products_preview(
+    queries: list[str], *, shopping: bool, onion: bool
+) -> "asyncio.Task[dict[str, Any]] | None":
+    import asyncio
+
+    try:
+        from core.config import load_search_config
+
+        config = load_search_config().rich_cards
+        if not (config.enabled and config.products) or shopping or onion:
+            return None
+        from core.cards.products import shopping_preview
+        from core.search.nltk_languages import shopping_intent
+        from core.search.query_locales import analyze_query
+
+        # The first query with commerce intent starts the preview, in that query's own language.
+        for query in queries:
+            text = str(query or "").strip()
+            if not text:
+                continue
+            language = analyze_query(text).language
+            if shopping_intent(text, language=language):
+                return asyncio.create_task(
+                    shopping_preview(
+                        text,
+                        language=language,
+                        limit=max(1, int(config.products_limit)),
+                        timeout_seconds=max(0.5, float(config.products_timeout_seconds)),
+                    ),
+                    name="web_search.products",
+                )
+    except Exception as exc:  # noqa: BLE001 — the product card is optional
+        logger.warning("product card not started: %s", exc)
+    return None
+
+
+# Attach rich cards (wikipedia/discussions/products) to a finished web_search result. The product card
+# comes from `products_task`, started together with the search. Return the result unchanged when the
+# feature is disabled or building the cards fails.
+async def _attach_rich_cards(
+    result: dict[str, Any],
+    queries: list[str],
+    *,
+    products_task: "asyncio.Task[dict[str, Any]] | None" = None,
+) -> dict[str, Any]:
+    cards: list[dict[str, Any]] = []
+    cards_text = ""
     try:
         from core.config import load_search_config
         config = load_search_config().rich_cards
-        if not config.enabled:
-            return result
-        from core.cards import RichCardService, insert_cards_context
+        if config.enabled:
+            from core.cards import RichCardService
 
-        # Detect the language from the first non-empty query so the cards match it.
-        sources = result.get("sources") or []
-        language = ""
-        for query in queries:
-            if isinstance(query, str) and query.strip():
-                from core.search.query_locales import analyze_query
-                language = analyze_query(query).language
-                break
+            # Detect the language from the first non-empty query so the cards match it.
+            sources = result.get("sources") or []
+            language = ""
+            for query in queries:
+                if isinstance(query, str) and query.strip():
+                    from core.search.query_locales import analyze_query
+                    language = analyze_query(query).language
+                    break
 
-        # Build the cards from the result sources and render them as text.
-        service = RichCardService()
-        started = time.perf_counter()
-        cards = await service.build(sources, config, language=language or "en")
-        cards_text = service.render(cards)
-        if cards_text:
-            # Model-facing only: the cards join the text the model reads, right
-            # before the source list, and cite the handles of those sources.
-            result["model_context"] = insert_cards_context(
-                str(result.get("model_context") or ""), cards_text
+            # Build the cards from the result sources and render them as text.
+            service = RichCardService()
+            started = time.perf_counter()
+            cards = await service.build(sources, config, language=language or "en")
+            cards_text = service.render(cards)
+
+            # Log how many cards were produced, of which kinds, and how long it took.
+            logger.info(
+                "mcp.web_search.answer_cards cards=%d kinds=%s took=%.0fms",
+                len(cards), ",".join(str(card.get("kind")) for card in cards) or "-",
+                (time.perf_counter() - started) * 1000,
             )
-            result["answer_cards"] = cards
-
-        # Log how many cards were produced, of which kinds, and how long it took.
-        logger.info(
-            "mcp.web_search.answer_cards cards=%d kinds=%s took=%.0fms",
-            len(cards), ",".join(str(card.get("kind")) for card in cards) or "-",
-            (time.perf_counter() - started) * 1000,
-        )
     except Exception as exc:  # noqa: BLE001 — enrichment must never fail a search
         logger.warning("rich cards skipped: %s", exc)
+
+    # Add the product card; the task carries its own timeout.
+    if products_task is not None:
+        try:
+            preview = await products_task
+            result["shopping_preview"] = preview
+            if preview.get("eligible"):
+                from core.cards.products import products_card, render_products
+
+                cards.append(products_card(preview))
+                products_text = render_products(preview)
+                cards_text = f"{cards_text}\n\n{products_text}" if cards_text else products_text
+            logger.info(
+                "mcp.web_search.products eligible=%s products=%d reason=%s took=%.0fms",
+                preview.get("eligible"), len(preview.get("products") or []),
+                preview.get("partial_reason") or "-", float(preview.get("elapsed_ms") or 0),
+            )
+        except Exception as exc:  # noqa: BLE001 — the product card is optional
+            logger.warning("product card skipped: %s", exc)
+
+    # Model-facing only: the cards join the text the model reads, right before the source list,
+    # and cite the handles of those sources.
+    if cards_text:
+        from core.cards import insert_cards_context
+
+        result["model_context"] = insert_cards_context(str(result.get("model_context") or ""), cards_text)
+    if cards:
+        result["answer_cards"] = cards
     return result
 
 
@@ -310,6 +396,10 @@ async def _call_web_search(
 
     # Run the pipeline matching the request: the compiled plan, a batch of queries or a single query.
     started = time.perf_counter()
+    # Product card runs in parallel with the web search (instant mode stays lean).
+    products_task = None if instant_mode else _start_products_preview(
+        list(queries), shopping=shopping, onion=onion
+    )
     try:
         if search_request.get("schema_mode") in {"advanced", "instant"}:
             result = await run_web_search_plan(search_request)
@@ -328,8 +418,11 @@ async def _call_web_search(
             result["search_request"] = search_request
             result.setdefault("ui", {})["search_request"] = search_request
             result["ui"]["query_count"] = len(queries)
-    except Exception:
-        logger.exception("mcp.web_search.failed query_preview=%r", query_preview)
+    except BaseException as exc:
+        if products_task is not None:
+            products_task.cancel()
+        if isinstance(exc, Exception):
+            logger.exception("mcp.web_search.failed query_preview=%r", query_preview)
         raise
 
     # Merge the warnings from argument preparation with the caller's preflight warnings (without
@@ -364,9 +457,9 @@ async def _call_web_search(
         effort, len(queries), len(result.get("sources", [])), elapsed,
     )
 
-    # Rich cards (config-gated, default OFF): wikipedia summary card + forum
-    # discussion block for the top results. Fail-open on any error.
-    result = await _attach_rich_cards(result, queries)
+    # Rich cards (config-gated): structured cards for the top results plus the product card for
+    # product-like queries. Fail-open on any error.
+    result = await _attach_rich_cards(result, queries, products_task=products_task)
 
     # Record the final result in the model IO log.
     write_search_io_event(
@@ -687,22 +780,30 @@ async def _call_read_page(args: dict[str, Any]) -> dict[str, Any]:
     # Parse the url argument (string, list or stringified list) and log the request.
     batch_limit = max(1, int(load_search_config().search.batch_query_limit))
     url = _maybe_parse_list(args.get("url", ""))
+    find = args.get("find")
+    find = find.strip() if isinstance(find, str) else ""
     write_search_io_event(
-        {"layer": "mcp_adapter", "phase": "read_page.request", "tool_id": "read_page", "url": url}
+        {"layer": "mcp_adapter", "phase": "read_page.request", "tool_id": "read_page", "url": url,
+         "find": find}
     )
 
     # Read the page(s): a batch runs concurrently, a single URL runs directly.
     if isinstance(url, list):
         urls = [u.strip() for u in url if isinstance(u, str) and u.strip()][:batch_limit]
-        logger.info("mcp.read_page.start batch=True urls=%d", len(urls))
-        results = await asyncio.gather(*[run_read_page(u) for u in urls], return_exceptions=True)
+        logger.info("mcp.read_page.start batch=True urls=%d find=%r", len(urls), find[:120])
+        results = await asyncio.gather(
+            *[run_read_page(u, find=find) for u in urls], return_exceptions=True
+        )
         texts = [r if isinstance(r, str) else f"Error: {r}" for r in results]
         payload = _read_page_payload(urls, texts)
     else:
         url_text = str(url).strip()
-        logger.info("mcp.read_page.start batch=False url=%r", url_text[:220])
-        text = await run_read_page(url_text)
+        logger.info("mcp.read_page.start batch=False url=%r find=%r", url_text[:220], find[:120])
+        text = await run_read_page(url_text, find=find)
         payload = _read_page_payload([url_text], [text])
+    if find:
+        payload["find"] = find
+        payload["ui"]["find"] = find
 
     # Record the result in the model IO log and the server log.
     write_search_io_event(

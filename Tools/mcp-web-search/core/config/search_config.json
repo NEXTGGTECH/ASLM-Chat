@@ -11,7 +11,14 @@
         "min_content_length": 800,
         "enable_read_page_compress": true,
         "read_page_compress_threshold_chars": 40000,
-        "read_page_compress_target_chars": 35000
+        "read_page_compress_target_chars": 35000,
+        "read_page_soft_limit_chars": 60000,
+        "read_page_ratio_at_double": 0.3,
+        "read_page_max_ratio": 0.85,
+        "read_page_max_output_chars": 150000,
+        "read_page_find_scan_chars": 2000000,
+        "read_page_find_max_hits": 20,
+        "read_page_find_max_chars": 20000
     },
     "cache": {
         "search_ttl_seconds": 21600,
@@ -98,7 +105,10 @@
         "scan_results": 8,
         "timeout_seconds": 2.0,
         "ttl_seconds": 86400.0,
-        "negative_ttl_seconds": 900.0
+        "negative_ttl_seconds": 900.0,
+        "products": true,
+        "products_limit": 6,
+        "products_timeout_seconds": 5.0
     },
     "localization": {
         "enabled": true,

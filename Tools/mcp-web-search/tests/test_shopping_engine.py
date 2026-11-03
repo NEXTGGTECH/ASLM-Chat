@@ -226,6 +226,52 @@ def test_shopping_engine_returns_partial_buffer_on_hard_timeout(monkeypatch) -> 
     assert {product.lane for product in result.products} == {"secondary"}
 
 
+# Verify that the products a fast secondary provider (Bing) already returned survive when the hard timeout
+# cancels the lane, whether the slow provider is the first-wave backup or a later one.
+@pytest.mark.unit
+@pytest.mark.parametrize("slow", ["first_wave_backup", "later_backups"])
+def test_shopping_engine_keeps_secondary_products_when_lane_is_cut_off(monkeypatch, slow) -> None:
+    # Bing (secondary main for en) answers fast with a few products; everything else hangs
+    # past the hard timeout. Bing's products must survive the lane being cancelled.
+    engine = ShoppingSearchEngine(asset_cache=ShoppingAssetCache())
+    secondary = [provider.name for provider in providers_for_lane("secondary", language="en")]
+    assert secondary[0] == "bing_shopping"
+
+    async def fake_fetch(url, provider, method):
+        if provider.name == "bing_shopping":
+            await asyncio.sleep(0.01)
+            html = _html(provider.name, 2)
+        elif slow == "first_wave_backup" and provider.name == secondary[1]:
+            await asyncio.sleep(1.0)
+            html = _html(provider.name, 20)
+        elif provider.lane == "primary":
+            await asyncio.sleep(1.0)
+            html = ""
+        else:
+            await asyncio.sleep(0.01 if slow == "later_backups" and provider.name == secondary[1] else 1.0)
+            html = ""
+        return html, ShoppingProviderAttempt(
+            provider=provider.name,
+            lane=provider.lane,
+            method=method,
+            url=url,
+            ok=bool(html),
+            elapsed_ms=10,
+            status_code=200,
+            bytes=len(html),
+        )
+
+    monkeypatch.setattr(engine, "_fetch", fake_fetch)
+
+    started = time.perf_counter()
+    result = asyncio_run(engine.search("iphone price", effort="low", limit=10, hard_timeout_ms=150))
+
+    assert time.perf_counter() - started < 0.9
+    assert result.partial is True and result.partial_reason == "hard_timeout"
+    assert [product.source for product in result.products] == ["bing_shopping", "bing_shopping"]
+    assert "bing_shopping" in {attempt.provider for attempt in result.attempts}
+
+
 # Verify that when only the primary lane answers before the hard timeout, its partial buffer is not cut
 # down to the primary quota: all 10 products come from the primary lane.
 @pytest.mark.unit
