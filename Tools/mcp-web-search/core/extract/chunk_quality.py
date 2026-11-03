@@ -6,19 +6,25 @@ import re
 from collections import Counter
 from typing import Iterable
 
+# SEO penalty (0..1) at or above which a chunk is rejected outright.
 SEO_HARD_REJECT_THRESHOLD: float = 0.88
 
+# Text ending in sentence-final punctuation (including the closing guillemet and semicolon).
 _SENTENCE_END_RE = re.compile(r"[.!?;»]\s*$")
+
+# A run of word characters between word boundaries; unicode aware, so non-Latin words count too.
+# The same pattern also splits text into words for the bigram check.
 _TOKEN_RE = re.compile(r"\b\w+\b", re.UNICODE)
 _BIGRAM_WORD_RE = _TOKEN_RE
 
 
-# Lowercase word tokens with length > 1.
+# Return lowercase word tokens longer than one character.
 def _tokenize(text: str) -> list[str]:
     return [t.lower() for t in _TOKEN_RE.findall(text or "") if len(t) > 1]
 
 
-# Fraction of text that looks like complete sentences (by ending punctuation).
+# Return a 0..1 estimate of how sentence-like the text is: sentence-ending marks counted against
+# roughly one sentence per 180 characters. Texts shorter than 40 characters score 0.
 def _sentence_like_ratio(text: str) -> float:
     compact = (text or "").strip()
     if len(compact) < 40:
@@ -27,7 +33,8 @@ def _sentence_like_ratio(text: str) -> float:
     return min(1.0, endings / max(1, len(compact) / 180))
 
 
-# Penalty for repeated trigrams (keyword-stuffing signal).
+# Return a 0..1 penalty for repeated trigrams (keyword-stuffing signal). Token lists shorter than
+# 12 are not judged; the penalty grows with how often the most common trigram exceeds twice.
 def _repeated_trigram_penalty(tokens: list[str]) -> float:
     if len(tokens) < 12:
         return 0.0
@@ -38,7 +45,8 @@ def _repeated_trigram_penalty(tokens: list[str]) -> float:
     return min(1.0, max(0.0, (top - 2) / max(4, len(tokens) / 20)))
 
 
-# Return 0..1 penalty for SEO keyword piles (1 = reject-worthy spam).
+# Return a 0..1 penalty for SEO keyword piles (1 = reject-worthy spam). Texts under 12 tokens
+# are never penalized.
 def seo_keyword_stuffing_penalty(
     text: str,
     query_terms: Iterable[str] | None = None,
@@ -47,6 +55,8 @@ def seo_keyword_stuffing_penalty(
     if len(tokens) < 12:
         return 0.0
 
+    # Measure the stuffing signals: low vocabulary variety, one dominant word, a high share of
+    # query terms, one dominant word pair, and repeated trigrams.
     unique_ratio = len(set(tokens)) / len(tokens)
     counts = Counter(tokens)
     top_share = counts.most_common(1)[0][1] / len(tokens)
@@ -63,6 +73,8 @@ def seo_keyword_stuffing_penalty(
 
     trigram_p = _repeated_trigram_penalty(tokens)
 
+    # Each signal adds a capped amount once it passes its threshold; long text with few
+    # sentences and a small vocabulary adds a flat extra penalty.
     penalty = 0.0
     if unique_ratio < 0.52:
         penalty += min(0.40, (0.52 - unique_ratio) * 1.2)
@@ -80,11 +92,11 @@ def seo_keyword_stuffing_penalty(
     return min(1.0, round(penalty, 4))
 
 
-# Alias used in profile_chunk_selector.
+# Short alias of seo_keyword_stuffing_penalty.
 seo_penalty = seo_keyword_stuffing_penalty
 
 
-# True when SEO stuffing penalty meets or exceeds the hard-reject threshold.
+# Return True when the SEO stuffing penalty meets or exceeds the hard-reject threshold.
 def is_seo_hard_reject(
     chunk_text: str,
     query_tokens: Iterable[str] | None = None,

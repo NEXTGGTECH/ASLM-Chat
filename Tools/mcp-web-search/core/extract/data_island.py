@@ -1,20 +1,5 @@
 # Copyright NEXTGGTECH. Elastic License 2.0.
 
-"""Recover text from JSON data islands embedded in ``<script type="application/json">``.
-
-Modern SPAs (React, Next.js, Nuxt, Contentful-backed marketing sites) ship the page's
-real content as JSON inside script tags and hydrate the visible DOM from it client-side.
-A static HTTP fetch then extracts almost nothing — the benchmark's one-search run turned a
-Chrome download page into 257KB of JS/CSS with the useful text gone. This walks those JSON
-blobs and recovers prose as a FALLBACK, only when normal DOM extraction came back sparse.
-
-Ported from the reference ``webclaw-core/src/data_island.rs``; the recognised shapes
-(Contentful rich-text nodes, CMS heading+body entries, quote/testimonial objects, orphan
-content fields, stat-string arrays) and the content-vs-identifier heuristic are kept as-is,
-because they were tuned against real SPA payloads. selectolax + orjson replace scraper +
-serde_json; the walk, the media-key skip, and the dedup-against-DOM contract are unchanged.
-"""
-
 from __future__ import annotations
 
 from typing import Any
@@ -26,11 +11,15 @@ from selectolax.lexbor import LexborHTMLParser
 # enough to cover marketing homepages with partial SSR (Notion SSR-renders ~300 words but
 # carries ~800 in __NEXT_DATA__), matching webclaw's SPARSE_THRESHOLD.
 _SPARSE_THRESHOLD = 500
+
 # Cap total chunks so an adversarial payload can't blow up memory/CPU.
 _MAX_CHUNKS = 1000
+
 # Recursion depth guard for deeply nested JSON.
 _MAX_DEPTH = 15
 
+# JSON field names that carry a heading, and those that carry body text, for objects that are
+# not a full CMS entry.
 _HEADING_KEYS = ("heading", "title", "headline")
 _BODY_KEYS = ("body", "description", "subheading", "eyebrow", "children")
 
@@ -39,20 +28,29 @@ _BODY_KEYS = ("body", "description", "subheading", "eyebrow", "children")
 class _Chunk:
     __slots__ = ("heading", "body")
 
+    # Store the heading (None when absent) and the body text.
     def __init__(self, heading: str | None, body: str) -> None:
         self.heading = heading
         self.body = body
 
 
-# Recover content from JSON data islands when DOM extraction is sparse. Returns markdown of
-# the genuinely-new text (deduped against `existing_markdown`), or None when the DOM already
-# had enough content, no island parsed, or nothing survived dedup.
+# Recover text from JSON data islands embedded in <script type="application/json">. Modern SPAs
+# (React, Next.js, Nuxt, Contentful-backed marketing sites) ship the page's real content as JSON
+# in script tags and hydrate the visible DOM client-side, so a static fetch extracts almost
+# nothing. This walks those JSON blobs as a FALLBACK, only when DOM extraction came back sparse.
+# Return markdown of the genuinely-new text (deduped against `existing_markdown`), or None when
+# the DOM already had enough content, no island parsed, or nothing survived dedup.
+# Ported from webclaw-core's data_island.rs: the recognised shapes (Contentful rich-text nodes,
+# CMS heading+body entries, quotes, orphan content fields, stat-string arrays) and the
+# content-vs-identifier heuristic were tuned against real SPA payloads, so keep them as they are.
 def try_extract_data_islands(
     html: str, dom_word_count: int, existing_markdown: str
 ) -> str | None:
     if dom_word_count >= _SPARSE_THRESHOLD:
         return None
 
+    # Parse every JSON script block of useful size and collect text chunks from it. Invalid
+    # JSON is skipped, and the total chunk count is capped.
     tree = LexborHTMLParser(html or "")
     chunks: list[_Chunk] = []
     for script in tree.css("script[type='application/json']"):
@@ -64,6 +62,7 @@ def try_extract_data_islands(
         try:
             value = orjson.loads(json_text)
         except orjson.JSONDecodeError:
+            # Not every application/json script is valid JSON (templates, partial payloads).
             continue
         _walk_json(value, chunks, 0)
 
@@ -89,6 +88,7 @@ def try_extract_data_islands(
     if not kept:
         return None
 
+    # Render the surviving chunks as markdown: headings as "##", bodies as paragraphs.
     parts: list[str] = []
     for c in kept:
         if c.heading:
@@ -147,8 +147,9 @@ def _walk_json(value: Any, chunks: list[_Chunk], depth: int) -> None:
 
 
 # Extract text from a Contentful rich-text node (document / paragraph / heading-N /
-# blockquote). Returns None for shapes that carry no usable prose.
+# blockquote). Return None for shapes that carry no usable prose.
 def _extract_contentful_node(node: dict, node_type: str) -> _Chunk | None:
+    # A document is rendered by recursing into its children and joining their chunks.
     if node_type == "document":
         content = node.get("content")
         if not isinstance(content, list):
@@ -169,6 +170,7 @@ def _extract_contentful_node(node: dict, node_type: str) -> _Chunk | None:
                 parts.append(chunk.body)
         return _Chunk(None, "\n\n".join(parts)) if parts else None
 
+    # Leaf shapes: paragraphs and quotes must look like prose, headings are kept as they are.
     if node_type in ("paragraph", "text"):
         text = _collect_text_content(node)
         return _Chunk(None, text) if _is_content_text(text) else None
@@ -198,14 +200,15 @@ def _collect_text_content(node: dict) -> str:
     return text.strip()
 
 
-# True when an object looks like a CMS entry: a heading-ish field paired with a body-ish one.
+# Return True when an object looks like a CMS entry: a heading-ish field paired with a body-ish one.
 def _is_cms_entry(node: dict) -> bool:
     has_heading = any(k in node for k in ("heading", "title", "headline"))
     has_body = any(k in node for k in ("description", "subheading", "body", "text"))
     return has_heading and has_body
 
 
-# Extract heading + body from a CMS-style entry, or None when neither side is real content.
+# Extract heading + body from a CMS-style entry, or None when the heading is missing, too short or
+# an internal CMS label, or neither side is real content.
 def _extract_cms_entry(node: dict) -> _Chunk | None:
     heading = (
         _extract_text_field(node, "heading")
@@ -258,7 +261,8 @@ def _extract_orphan_texts(node: dict, chunks: list[_Chunk]) -> None:
             return
 
 
-# Read a text field as either a plain string or a Contentful rich-text object.
+# Read a text field as either a plain string or a Contentful rich-text object. Return the stripped
+# text, or None when the field is missing or empty.
 def _extract_text_field(node: dict, key: str) -> str | None:
     value = node.get(key)
     if isinstance(value, str):
@@ -284,7 +288,7 @@ def _is_media_key(key: str) -> bool:
     )
 
 
-# True for editorial/asset labels ("/home Customer Stories: Logo", "hero poster desktop")
+# Return True for editorial/asset labels ("/home Customer Stories: Logo", "hero poster desktop")
 # that are internal CMS titles, not user-facing text.
 def _is_cms_internal_title(s: str) -> bool:
     if s.startswith("/home ") or s.startswith("/page "):
@@ -297,14 +301,18 @@ def _is_cms_internal_title(s: str) -> bool:
     return False
 
 
-# Heuristic: is this string real prose, not an id/URL/class-name/hash?
+# Heuristic: return True when the string is real prose, not an id/URL/class-name/hash. Prose is at
+# least 15 characters, does not start like a URL, path or JSON, contains a space and is at
+# least 60% alphanumeric.
 def _is_content_text(s: str) -> bool:
     s = (s or "").strip()
     if len(s) < 15:
         return False
     if s.startswith(("http", "/", "{", "[")):
         return False
-    if " " not in s:  # prose has spaces; a lone token is technical
+
+    # Prose has spaces; a lone token is technical.
+    if " " not in s:
         return False
     alnum = sum(1 for c in s if c.isalnum())
     return alnum / len(s) >= 0.6

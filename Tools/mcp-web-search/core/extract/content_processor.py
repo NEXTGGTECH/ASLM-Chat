@@ -21,15 +21,18 @@ try:
 except ImportError:  # pragma: no cover — lxml is normally installed
     _BS_PARSER = "html.parser"
 
-# LaTeX processing: index_text (BM25) and llm_text (model).
 
+# LaTeX processing for BM25 index text and LLM text
+
+# Patterns for a LaTeX command name such as \alpha, and for a LaTeX span: $$...$$, \[...\],
+# \(...\), inline $...$ without a newline, or \cmd{...}.
 _LATEX_CMD_RE = re.compile(r"\\[a-zA-Z]+")
 _LATEX_SPAN_RE = re.compile(
-    r"\$\$.*?\$\$"           # $$...$$
-    r"|\\\[.*?\\\]"           # \[...\]
-    r"|\\\(.*?\\\)"           # \(...\)
-    r"|\$[^$\n]+?\$"          # $...$  (inline, no newline)
-    r"|\\[a-zA-Z]+\{[^}]*\}", # \cmd{...}
+    r"\$\$.*?\$\$"
+    r"|\\\[.*?\\\]"
+    r"|\\\(.*?\\\)"
+    r"|\$[^$\n]+?\$"
+    r"|\\[a-zA-Z]+\{[^}]*\}",
     re.DOTALL,
 )
 
@@ -89,13 +92,14 @@ _KNOWN_MACROS: frozenset[str] = (
 )
 
 
-# Return sorted list of \cmd names in text not in _KNOWN_MACROS.
+# Return the sorted list of \cmd names in text that are not in _KNOWN_MACROS.
 def _unknown_macros(text: str) -> list[str]:
     found = {m[1:] for m in _LATEX_CMD_RE.findall(text)}
     return sorted(found - _KNOWN_MACROS)
 
 
-# Build pylatexenc LatexWalker context with unknown macros as 1-arg pass-through.
+# Build a pylatexenc LatexWalker context with unknown macros as 1-arg pass-through. Return None
+# when there are no unknown macros or pylatexenc cannot build the context.
 def _make_walker_context(unknown: list[str]):
     if not unknown:
         return None
@@ -113,7 +117,8 @@ def _make_walker_context(unknown: list[str]):
         return None
 
 
-# Build pylatexenc latex2text context with unknown macros as 1-arg pass-through.
+# Build a pylatexenc latex2text context with unknown macros as 1-arg pass-through. Return None
+# when there are no unknown macros or pylatexenc cannot build the context.
 def _make_l2t_context(unknown: list[str]):
     if not unknown:
         return None
@@ -130,12 +135,14 @@ def _make_l2t_context(unknown: list[str]):
         return None
 
 
-# True when text likely contains LaTeX markup.
+# Return True when text likely contains LaTeX markup: display or paren math delimiters, inline
+# math with a command, or at least three LaTeX commands.
 def _has_latex(text: str) -> bool:
     if not text:
         return False
     if "$$" in text or "\\[" in text or "\\(" in text:
         return True
+
     # Inline math: $...\cmd...$ — must contain a backslash command inside the
     # dollar signs to avoid false positives on plain dollar amounts like "$5".
     if re.search(r'\$[^$\n]*\\[a-zA-Z]+[^$\n]*\$', text):
@@ -143,7 +150,8 @@ def _has_latex(text: str) -> bool:
     return len(_LATEX_CMD_RE.findall(text)) >= 3
 
 
-# Convert LaTeX markup to plain text suitable for BM25 tokenisation.
+# Convert LaTeX markup to plain text suitable for BM25 tokenisation, using pylatexenc with a
+# regex fallback when it is missing or fails.
 def _clean_latex_for_index(text: str) -> str:
     if not _has_latex(text):
         return text
@@ -155,13 +163,16 @@ def _clean_latex_for_index(text: str) -> str:
     except Exception as exc:
         logger.debug("Latex-to-text conversion failed, using regex fallback: %s", exc)
         pass
+
     # Regex fallback: unwrap \cmd{content} → content, strip bare \cmd
     cleaned = re.sub(r"\\[a-zA-Z]+\{([^}]*)\}", r"\1", text)
     cleaned = re.sub(r"\\[a-zA-Z]+", " ", cleaned)
     return re.sub(r"[\$\{\}]", " ", cleaned)
 
 
-# Recursively transpile a pylatexenc node to readable text for the LLM.
+# Recursively transpile a pylatexenc node to readable text for the LLM: Greek letters and
+# symbols become Unicode, text wrappers keep their content, \frac becomes (a)/(b), \sqrt becomes
+# √, comments and unknown bare commands vanish.
 def _node_to_text(node) -> str:  # noqa: ANN001
     from pylatexenc.latexwalker import (
         LatexCharsNode, LatexMacroNode, LatexGroupNode,
@@ -193,6 +204,7 @@ def _node_to_text(node) -> str:  # noqa: ANN001
             return _GREEK[name]
         if name in _SYMBOLS:
             sym = _SYMBOLS[name]
+
             # Append rendered args if any (e.g. \sqrt{x} → √x)
             return sym + "".join(rendered_args)
 
@@ -208,7 +220,8 @@ def _node_to_text(node) -> str:  # noqa: ANN001
 
         # \sqrt[n]{x} or \sqrt{x}
         if name == "sqrt":
-            if len(rendered_args) == 2:  # optional arg is index
+            # With two arguments the first (optional) one is the root index.
+            if len(rendered_args) == 2:
                 return f"{rendered_args[0]}√{rendered_args[1]}"
             if rendered_args:
                 return f"√{rendered_args[0]}"
@@ -223,6 +236,7 @@ def _node_to_text(node) -> str:  # noqa: ANN001
         # Bare \cmd with args — render args
         if rendered_args:
             return "".join(rendered_args)
+
         # Bare \cmd no args
         return ""
 
@@ -233,7 +247,8 @@ def _node_to_text(node) -> str:  # noqa: ANN001
     return str(getattr(node, "chars", "") or "")
 
 
-# Transpile LaTeX markup to human-readable notation for the LLM.
+# Transpile LaTeX markup to human-readable notation for the LLM. Falls back to the original text
+# when the parse yields nothing, and to the index cleanup when pylatexenc fails.
 def _render_latex_for_llm(text: str) -> str:
     if not _has_latex(text):
         return text
@@ -246,11 +261,14 @@ def _render_latex_for_llm(text: str) -> str:
         result = "".join(_node_to_text(n) for n in (nodes or [])).strip()
         return result if result else text
     except Exception:
+        # pylatexenc is missing or could not parse the markup; fall back to the regex cleanup.
         return _clean_latex_for_index(text)
 
 
-# BM25 helpers (no external deps; used for paragraph compression).
+# BM25 helpers (no external deps; used for paragraph compression)
 
+# A word token; the BM25 term-frequency saturation (k1) and length normalization (b)
+# parameters; and the token length that tokens must exceed to be indexed.
 _TOKEN_RE = re.compile(r"\b\w+\b")
 _BM25_K1 = 1.5
 _BM25_B = 0.75
@@ -262,11 +280,14 @@ def _bm25_tokenize(text: str) -> list[str]:
     return [t.lower() for t in _TOKEN_RE.findall(text or "") if len(t) > _BM25_MIN_TOKEN_LEN]
 
 
-# Return BM25 score of each paragraph against query_terms.
+# Return the BM25 score of each paragraph against query_terms, treating the paragraphs as the
+# document collection (Okapi BM25 with the idf smoothed by +1, so it is never negative).
 def _bm25_score_paragraphs(paragraphs: list[str], query_terms: list[str]) -> list[float]:
     if not paragraphs or not query_terms:
         return [0.0] * len(paragraphs)
 
+    # Collection statistics: average paragraph length in tokens and the number of paragraphs
+    # that contain each distinct query term.
     para_tokens = [_bm25_tokenize(p) for p in paragraphs]
     avg_dl = sum(len(t) for t in para_tokens) / max(1, len(para_tokens))
     N = len(paragraphs)
@@ -275,6 +296,7 @@ def _bm25_score_paragraphs(paragraphs: list[str], query_terms: list[str]) -> lis
     for term in set(query_terms):
         df[term] = sum(1 for tokens in para_tokens if term in tokens)
 
+    # Score each paragraph by summing idf * normalized term frequency over the query terms.
     scores: list[float] = []
     for tokens in para_tokens:
         dl = len(tokens)
@@ -294,15 +316,17 @@ def _bm25_score_paragraphs(paragraphs: list[str], query_terms: list[str]) -> lis
 
 
 # Pin fenced code verbatim, then spend the remaining character budget on BM25 prose.
-# Protected code may make the result exceed max_chars.
+# Protected code may make the result exceed max_chars. Text that already fits is returned as is.
 def compress_to_budget(text: str, query: str, max_chars: int) -> str:
     if not text or len(text) <= max_chars:
         return text
 
+    # Without paragraph structure there is nothing to rank, so fall back to plain truncation.
     paragraphs = _split_blocks(text)
     if not paragraphs:
         return _truncate_markdown_to_budget(text, max_chars, preserve_fenced_code=True)
 
+    # Pin fenced code blocks and reserve their cost (plus the blank-line separator) up front.
     pinned = {idx for idx, paragraph in enumerate(paragraphs) if _is_fenced_code_block(paragraph)}
     pinned_cost = sum(len(paragraphs[idx]) + 2 for idx in pinned)
     prose_budget = max(0, max_chars - pinned_cost)
@@ -328,6 +352,8 @@ def compress_to_budget(text: str, query: str, max_chars: int) -> str:
     else:
         score_paras = paragraphs
 
+    # Fill the remaining budget with the best-scoring paragraphs; one that does not fit is
+    # skipped so smaller ones can still be taken, and filling stops once the budget is used up.
     scores = _bm25_score_paragraphs(score_paras, query_terms)
     ranked = sorted(range(len(paragraphs)), key=lambda i: -scores[i])
 
@@ -343,17 +369,19 @@ def compress_to_budget(text: str, query: str, max_chars: int) -> str:
         if budget <= 0:
             break
 
-    # Reconstruct in original order
+    # Reconstruct in original order; plain truncation when nothing was selected.
     result = [paragraphs[i] for i in sorted(selected)]
     return "\n\n".join(result) if result else _truncate_markdown_to_budget(
         text, max_chars, preserve_fenced_code=True
     )
 
 
-# Fallback BM25 query from URL path segments and page title.
+# Build a fallback BM25 query from the last five meaningful URL path segments (generic words
+# and numbers dropped) and the page title taken from a "# " heading or a "**Title:**" line.
 def derive_read_page_focus(url: str, markdown: str) -> str:
     from urllib.parse import unquote, urlparse
 
+    # Path words: split the decoded path on separators and drop host/route filler.
     parts: list[str] = []
     if url:
         parsed = urlparse(url)
@@ -370,6 +398,7 @@ def derive_read_page_focus(url: str, markdown: str) -> str:
         if segments:
             parts.append(" ".join(segments[-5:]))
 
+    # Title: the first heading-style match wins.
     for pattern in (r"^#\s+(.+)$", r"^\*\*Title:\*\*\s*(.+)$"):
         match = re.search(pattern, markdown or "", re.MULTILINE | re.IGNORECASE)
         if match:
@@ -389,12 +418,15 @@ def _resolve_read_page_compress_query(focus: str, url: str, markdown: str) -> st
     try:
         return derive_read_page_focus(url, markdown)
     except Exception:
+        # Deriving a focus is best-effort; an empty query just disables BM25 ranking.
         logger.debug("derive_read_page_focus failed for url=%r", url, exc_info=True)
         return ""
 
 
 # Shrink long read_page output with BM25 relevance. Fenced code is outside the
 # prose budget, so max_chars becomes a soft ceiling when protected code alone is larger.
+# Compression applies only above compress_threshold and aims at compress_target (or max_chars
+# when that is not positive), and a final hard truncation enforces max_chars.
 def compress_read_page_markdown(
     markdown: str,
     *,
@@ -409,6 +441,8 @@ def compress_read_page_markdown(
     if not text:
         return text
 
+    # Stage 1: reduce long text to the budget. With a focus (search preview) use the chunk
+    # compaction engine; without one (standalone read_page) use the BM25 budget fill.
     if enable_compress and compress_threshold > 0 and len(text) > compress_threshold:
         budget = compress_target if compress_target > 0 else max_chars
         budget = min(budget, max_chars)
@@ -424,12 +458,13 @@ def compress_read_page_markdown(
             # Standalone read_page (no query): gentle BM25 budget fill over a derived focus.
             text = compress_to_budget(text, query, budget)
 
-    # Clause/sentence-level micro-prune: drops SEO-stuffed and off-query micro-chunks
+    # Stage 2: clause/sentence-level micro-prune: drops SEO-stuffed and off-query micro-chunks
     # within otherwise-kept blocks. Only runs with a real search query (focus); a no-op
     # for the standalone read_page tool, which has no query to prune against.
     if enable_compress and focus.strip() and text.strip():
         from core.extract.micro_chunk_worker import prune_micro_chunks
 
+        # Prune block by block; fenced code is kept verbatim and fully pruned blocks vanish.
         protected: list[str] = []
         for block in _split_blocks(text):
             if _is_fenced_code_block(block):
@@ -441,18 +476,22 @@ def compress_read_page_markdown(
         if protected:
             text = "\n\n".join(protected)
 
+    # Stage 3: hard limit, still keeping fenced code intact.
     if len(text) > max_chars:
         text = _truncate_markdown_to_budget(text, max_chars, preserve_fenced_code=True)
     return text
 
 
-# Tag / noise constants.
+# Tag and noise constants
 
+# Tags removed outright from the page because they never hold article text.
 _NOISE_TAGS = {
     "script", "style", "nav", "header", "footer", "aside", "form",
     "iframe", "svg", "picture", "img", "video", "source", "canvas",
     "button", "noscript", "figure", "figcaption",
 }
+
+# Tags treated as text blocks, and the leaf subset that holds the text directly.
 _BLOCK_TAGS = {
     "article", "section", "main", "div", "p", "li", "pre", "code",
     "blockquote", "td", "th", "h1", "h2", "h3", "h4", "h5", "h6",
@@ -461,24 +500,26 @@ _LEAF_BLOCK_TAGS = {
     "p", "li", "pre", "code", "blockquote", "td", "th",
     "h1", "h2", "h3", "h4", "h5", "h6",
 }
+
+# Containers that are never removed as noise, even when their attributes or text look like it.
 _PROTECTED_CONTAINER_TAGS = {"html", "body", "main", "article"}
+
+# Lowercase phrases in attributes or short text that mark a node as cookie, newsletter, ad,
+# social or legal boilerplate.
 _NOISE_MARKERS = (
     "cookie", "consent", "gdpr", "newsletter", "subscribe", "sign up",
     "sign-up", "advert", "sponsored", "promo", "share", "follow us",
     "all rights reserved", "accept all", "privacy policy", "terms of service",
 )
 
+# Runs of horizontal whitespace (newlines excluded), and an HTML tag.
 _WHITESPACE_RE = re.compile(r"[ \t\r\f\v]+")
 _TAG_RE = re.compile(r"<[^>]+>")
 
 
-# Preview settings (defaults merged with SearchConfig and hardware profile).
+# HTML cleaning helpers
 
-
-# HTML cleaning helpers (used by page_normalizer).
-
-
-# Collapse whitespace and unescape HTML entities in text.
+# Collapse whitespace and unescape HTML entities in text; edge spaces, dashes and pipes are trimmed.
 def _normalize_text(text: str) -> str:
     return _WHITESPACE_RE.sub(
         " ", html_lib.unescape(text or "").replace("\u00a0", " ")
@@ -491,19 +532,23 @@ def _single_line(text: str) -> str:
     return " | ".join(block for block in blocks if block)
 
 
+# Whitespace that follows sentence-ending punctuation (. ! ?), i.e. a sentence boundary.
 _SENTENCE_END_RE = re.compile(r"(?<=[.!?])\s+")
 
 
-# Truncate text to max_chars, preferring a sentence boundary when possible.
+# Truncate text to max_chars, preferring a sentence boundary when it falls in the last 40% of
+# the window; otherwise cut at max_chars and strip trailing punctuation.
 def _truncate_at_sentence(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
 
     window = text[:max_chars]
-    # Find all sentence-end positions inside the window.
+
+    # Find the last sentence-end position inside the window; it is the position right after
+    # the closing punctuation.
     best = -1
     for m in _SENTENCE_END_RE.finditer(window):
-        best = m.start()  # position right after the closing punctuation
+        best = m.start()
 
     min_acceptable = int(max_chars * 0.60)
     if best >= min_acceptable:
@@ -512,7 +557,8 @@ def _truncate_at_sentence(text: str, max_chars: int) -> str:
     return window.rstrip(" ,;:|-")
 
 
-# Strip scripts/styles and tags; return normalized plain text.
+# Strip scripts, styles, inline event-handler attributes and tags with regexes; return normalized
+# plain text. Last-resort conversion that needs no HTML parser.
 def _regex_html_to_text(raw_html: str) -> str:
     no_js = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", raw_html or "",
                    flags=re.IGNORECASE | re.DOTALL)
@@ -520,7 +566,8 @@ def _regex_html_to_text(raw_html: str) -> str:
     return _normalize_text(_TAG_RE.sub(" ", no_js))
 
 
-# Remove noise tags and noise-marker nodes from HTML.
+# Remove noise tags and noise-marker nodes from HTML. Return the cleaned HTML, or the input
+# unchanged when BeautifulSoup is unavailable.
 def _preclean_html(raw_html: str) -> str:
     if not raw_html:
         return ""
@@ -532,10 +579,14 @@ def _preclean_html(raw_html: str) -> str:
 
     soup = BeautifulSoup(raw_html, _BS_PARSER)
 
+    # Pass 1: remove every tag that never holds article text.
     for tag_name in _NOISE_TAGS:
         for node in soup.find_all(tag_name):
             node.decompose()
 
+    # Pass 2: remove nodes whose identifying attributes, or short text, contain a noise marker.
+    # Protected containers are never removed, and article/main are removed only when their
+    # text is short.
     for node in soup.find_all(True):
         attrs_map = node.attrs or {}
         attrs = " ".join(
@@ -555,7 +606,8 @@ def _preclean_html(raw_html: str) -> str:
     return str(soup)
 
 
-# Re-split over-merged trafilatura output when possible.
+# Re-split over-merged trafilatura output when possible: text without blank lines is split
+# before each numbered item ("1. ", "2. ", ...) into paragraphs.
 def _split_trafilatura_sections(text: str) -> str:
     if not text or "\n\n" in text:
         return text
@@ -565,7 +617,8 @@ def _split_trafilatura_sections(text: str) -> str:
     return text
 
 
-# Structural flat-text nav heuristic (short lines, separators, low sentence density).
+# Return a structural flat-text nav score in [0, 1] (short lines, separators, low sentence
+# density); higher means the text looks more like flattened navigation.
 def _flat_nav_structural_ratio(text: str) -> float:
     if not text or len(text) < 40:
         return 0.0
@@ -592,18 +645,22 @@ def _flat_nav_structural_ratio(text: str) -> float:
     return max(0.0, min(score, 1.0))
 
 
-# Pick trafilatura or DOM blocks, whichever yields cleaner structure.
+# Pick trafilatura or DOM blocks, whichever yields cleaner structure. Return the chosen text, its
+# source ("trafilatura" or "dom_blocks") and the DOM extraction stats.
 def _choose_extraction(
     cleaned_html: str,
     *,
     url: str = "",
     min_clean_chars: int = 220,
 ) -> tuple[str, str, dict[str, int | str]]:
+    # Run both extractors on the same cleaned HTML.
     dom_stats: dict[str, int | str] = {}
     traf = _extract_text_with_trafilatura(cleaned_html)
     traf = _split_trafilatura_sections(traf)
     dom_text, dom_stats = _extract_text_with_dom_blocks(cleaned_html, url=url)
 
+    # Compare them: text length, paragraph count, table and navigation signals, and how many
+    # DOM candidates were rejected as navigation.
     traf_n = len(_normalize_text(traf))
     dom_n = len(_normalize_text(dom_text))
     traf_paras = len(_split_blocks(traf))
@@ -617,6 +674,9 @@ def _choose_extraction(
         total_dom_cand > 0 and dom_nav_rej / total_dom_cand >= 0.35 and dom_paras >= 1
     )
 
+    # Decide whether the DOM result is preferable: it wins when navigation filtering was heavy,
+    # unless trafilatura already produced a clean table; otherwise it wins when trafilatura is
+    # thin, unstructured or nav-heavy while the DOM output is substantial.
     prefer_dom = False
     if dom_stats.get("extraction_status") == "nav_heavy":
         prefer_dom = dom_n > traf_n
@@ -634,6 +694,7 @@ def _choose_extraction(
         elif traf_nav_heavy:
             prefer_dom = True
 
+    # Pick the result in order of confidence, ending with whichever text is longer.
     structural_min = min(200, min_clean_chars)
 
     if prefer_dom and dom_n >= structural_min:
@@ -651,7 +712,9 @@ def _choose_extraction(
     return dom_text or traf, "dom_blocks" if dom_text else "trafilatura", dom_stats
 
 
-# DOM-aware block extraction (replaces naïve bs4 fallback).
+# DOM-aware block extraction with navigation rejection. Return the blocks joined by blank lines
+# and the extraction stats; the text is empty when nothing was extracted or the page was
+# dominated by navigation.
 def _extract_text_with_dom_blocks(
     cleaned_html: str,
     *,
@@ -667,7 +730,8 @@ def _extract_text_with_dom_blocks(
     return "\n\n".join(blocks), stats
 
 
-# Extract leaf block tags via BeautifulSoup.
+# Extract leaf block tags via BeautifulSoup: block texts of at least 40 characters joined by blank
+# lines, or the whole page text when no block qualifies.
 def _extract_text_with_bs4(cleaned_html: str) -> str:
     if not cleaned_html:
         return ""
@@ -680,6 +744,7 @@ def _extract_text_with_bs4(cleaned_html: str) -> str:
     soup = BeautifulSoup(cleaned_html, _BS_PARSER)
     blocks: list[str] = []
     for node in soup.find_all(_BLOCK_TAGS):
+        # A generic container that holds leaf blocks is skipped; its children are collected.
         if node.name not in _LEAF_BLOCK_TAGS and node.find(_LEAF_BLOCK_TAGS):
             continue
         text = _normalize_text(node.get_text(separator=" ", strip=True))
@@ -692,13 +757,13 @@ def _extract_text_with_bs4(cleaned_html: str) -> str:
 
 # Full-body strip set — ONLY non-content machinery. Deliberately narrower than
 # _NOISE_TAGS: nav/header/footer/form/button are kept, because on landing pages, doc
-# indexes and download pages that "chrome" IS the information (ported from openserp's
-# extractFullBody, whose clean-vs-full fallback beat us on exactly those pages).
+# indexes and download pages that "chrome" IS the information.
 _FULLBODY_STRIP_TAGS = ("script", "style", "noscript", "template", "svg", "iframe")
 
 
-# The whole readable <body> as trimmed text lines, keeping nav/header/footer chrome.
-# The thin-extraction rescue path: never the primary extractor.
+# Return the whole readable <body> as trimmed text lines, keeping nav/header/footer chrome.
+# This is the thin-extraction rescue path, never the primary extractor. Tables are rendered as
+# markdown and <pre> blocks as fenced code. Return "" when bs4 is unavailable.
 def extract_full_body_text(raw_html: str) -> str:
     if not raw_html:
         return ""
@@ -706,6 +771,8 @@ def extract_full_body_text(raw_html: str) -> str:
         from bs4 import BeautifulSoup
     except Exception:  # noqa: BLE001 — rescue path must degrade to a no-op
         return ""
+
+    # Drop the machinery tags and keep the rest of the body.
     soup = BeautifulSoup(raw_html, _BS_PARSER)
     for tag_name in _FULLBODY_STRIP_TAGS:
         for node in soup.find_all(tag_name):
@@ -719,6 +786,9 @@ def extract_full_body_text(raw_html: str) -> str:
 
     code_md = wrap_pre_with_markers(soup)
     table_md = swap_tables_for_markers(soup)
+
+    # Trim every body line (collapsing inner whitespace, except for table marker lines), drop
+    # empty lines, then put the table markdown and the code blocks back.
     lines = (
         line.strip() if line.strip().startswith("\x00TBL") else _WHITESPACE_RE.sub(" ", line).strip()
         for line in body.get_text(separator="\n").splitlines()
@@ -731,8 +801,9 @@ def extract_full_body_text(raw_html: str) -> str:
 
 # Return a callable that returns True for boilerplate text blocks.
 def _get_boilerplate_filter():
-    # A noise word is meaningful only on a short UI-like block. Long prose can use the
-    # same word legitimately, and short headings/version notes are content by default.
+    # Return True when a block is short (up to 120 characters) and contains a noise marker. A
+    # noise word is meaningful only on a short UI-like block. Long prose can use the same word
+    # legitimately, and short headings/version notes are content by default.
     def _fallback(text: str) -> bool:
         compact = _normalize_text(text).lower()
         return len(compact) <= 120 and any(marker in compact for marker in _NOISE_MARKERS)
@@ -765,7 +836,8 @@ def _fence_marker(line: str) -> str:
     return match.group(1) if match else ""
 
 
-# True when a line closes the given fence marker.
+# Return True when a line closes the given fence marker (same character, at least as long, and
+# nothing after it).
 def _closes_fence(line: str, marker: str) -> bool:
     stripped = line.strip()
     if not marker or not stripped.startswith(marker[0] * len(marker)):
@@ -779,6 +851,8 @@ def _repair_unclosed_fence(text: str) -> str:
     lines = (text or "").splitlines()
     marker = ""
     opener_index = -1
+
+    # Track fence state line by line; an opener stays pending until its closing fence.
     for index, line in enumerate(lines):
         if marker:
             if _closes_fence(line, marker):
@@ -789,6 +863,8 @@ def _repair_unclosed_fence(text: str) -> str:
         if opened:
             marker = opened
             opener_index = index
+
+    # A fence is still open at the end: delete the opener line.
     if marker and opener_index >= 0:
         del lines[opener_index]
         return "\n".join(lines)
@@ -797,11 +873,14 @@ def _repair_unclosed_fence(text: str) -> str:
 
 # Split text into paragraph blocks while keeping every fenced code block atomic.
 def _split_blocks(text: str) -> list[str]:
+    # Finished blocks, the pending prose lines, the lines of the fence being read and its marker.
     blocks: list[str] = []
     prose: list[str] = []
     fenced: list[str] = []
     marker = ""
 
+    # Split the pending prose lines into paragraphs and append them to blocks. A paragraph ends
+    # at a blank line or after a period followed by two or more whitespace characters.
     def flush_prose() -> None:
         if not prose:
             return
@@ -812,6 +891,7 @@ def _split_blocks(text: str) -> list[str]:
             if stripped:
                 blocks.append(stripped)
 
+    # Collect fenced lines until the closing fence, and emit prose before each new fence.
     for line in (text or "").splitlines():
         if marker:
             fenced.append(line)
@@ -837,14 +917,15 @@ def _split_blocks(text: str) -> list[str]:
     return blocks
 
 
-# True when one block starts with a Markdown fence.
+# Return True when the block starts with a Markdown fence.
 def _is_fenced_code_block(block: str) -> bool:
     first_line = (block or "").lstrip().split("\n", 1)[0]
     return bool(_fence_marker(first_line))
 
 
-# Truncate Markdown at block boundaries. With preserve_fenced_code, every fenced
-# block is pinned verbatim and the result may exceed max_chars.
+# Truncate Markdown at block boundaries and end it with a "[...truncated]" marker. With
+# preserve_fenced_code, every fenced block is pinned verbatim and the result may exceed max_chars.
+# Text that already fits is returned as is, and a non-positive budget gives "".
 def _truncate_markdown_to_budget(
     text: str,
     max_chars: int,
@@ -859,6 +940,9 @@ def _truncate_markdown_to_budget(
 
     suffix = "[...truncated]"
     blocks = _split_blocks(text)
+
+    # Pinned-code mode: keep all fenced blocks, then fill the rest of the budget with prose
+    # blocks in order, cutting the first block that does not fit at a sentence boundary.
     if preserve_fenced_code:
         pinned = {idx for idx, block in enumerate(blocks) if _is_fenced_code_block(block)}
         pinned_cost = sum(len(blocks[idx]) + 2 for idx in pinned)
@@ -883,6 +967,8 @@ def _truncate_markdown_to_budget(
         prefix = "\n\n".join(selected[idx] for idx in sorted(selected)).rstrip()
         return f"{prefix}\n\n{suffix}" if prefix else suffix
 
+    # Plain mode: take blocks in order within the budget. An oversized code block is skipped
+    # whole, while an oversized prose block is cut at a sentence boundary and ends the loop.
     content_budget = max(0, max_chars - len(suffix) - 2)
     selected: list[str] = []
     used = 0
@@ -910,10 +996,10 @@ def _truncate_markdown_to_budget(
     return f"{prefix}\n\n{suffix}" if prefix else suffix
 
 
-# Quality scoring and trafilatura extraction.
+# Quality scoring and trafilatura extraction
 
-
-# Extract main text via trafilatura (tables on, comments off).
+# Extract main text via trafilatura (tables on, comments off, precision favored). Return "" when
+# trafilatura is missing, fails, or the input is XML.
 def _extract_text_with_trafilatura(cleaned_html: str) -> str:
     if not cleaned_html:
         return ""
@@ -935,6 +1021,7 @@ def _extract_text_with_trafilatura(cleaned_html: str) -> str:
             output_format="txt",
         )
     except Exception:
+        # Extraction is best-effort; the caller falls back to other extractors on empty text.
         return ""
     return text or ""
 
@@ -948,7 +1035,8 @@ def _clean_extracted_text(text: str) -> tuple[str, int]:
     return "\n\n".join(deduped), len(deduped)
 
 
-# Heuristic quality score in [0, 1] from length, blocks, and noise markers.
+# Return a heuristic quality score in [0, 1]: rewards length, block count and alphabetic text,
+# and penalizes digit-heavy text and noise markers.
 def _estimate_quality(text: str, block_count: int) -> float:
     compact = _normalize_text(text)
     if not compact:

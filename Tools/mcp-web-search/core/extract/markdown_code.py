@@ -1,7 +1,5 @@
 # Copyright NEXTGGTECH. Elastic License 2.0.
 
-"""Protect HTML ``<pre>`` blocks while generic extractors process surrounding prose."""
-
 from __future__ import annotations
 
 import hashlib
@@ -9,18 +7,23 @@ import re
 from copy import copy
 
 
+# Language class names such as language-python or lang-c++ (group 1 is the language); a fence
+# info string that contains only safe characters; and a Markdown code fence opener of three or
+# more backticks or tildes, indented by at most three spaces or tabs (group 1 is the marker).
 _LANGUAGE_RE = re.compile(r"^(?:language|lang)-([A-Za-z0-9_.+-]+)$", re.IGNORECASE)
 _SAFE_LANGUAGE_RE = re.compile(r"^[A-Za-z0-9_.+-]+$")
 _FENCE_RE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})")
 
 
-# Return a Markdown fence marker from one line, or an empty string.
+# Return the Markdown fence marker (the run of backticks or tildes) that opens the line, or an
+# empty string when the line is not a fence.
 def markdown_fence_marker(line: str) -> str:
     match = _FENCE_RE.match(line or "")
     return match.group(1) if match else ""
 
 
-# True only for a valid closing fence (no info string after the delimiter).
+# Return True only for a valid closing fence: the same character, at least as long as the
+# opening marker, with no info string after the delimiter.
 def closes_markdown_fence(line: str, marker: str) -> bool:
     stripped = (line or "").strip()
     if not marker or not stripped.startswith(marker[0] * len(marker)):
@@ -28,12 +31,15 @@ def closes_markdown_fence(line: str, marker: str) -> bool:
     return not stripped[len(marker):].strip(marker[0]).strip()
 
 
-# Extract preformatted text without flattening indentation or React-style div.cm-line rows.
+# Extract preformatted text from a <pre> node without flattening indentation or React-style
+# div.cm-line rows. The node is copied first, so the original DOM stays intact.
 def pre_to_text(pre) -> str:
     from bs4 import NavigableString
 
     clone = copy(pre)
 
+    # Turn <br> into newlines and drop whitespace-only text between block divs, so editor markup
+    # that wraps every code line in a div does not produce extra blank lines.
     for br in clone.find_all("br"):
         br.replace_with("\n")
     for container in (clone, *clone.find_all("code")):
@@ -41,10 +47,13 @@ def pre_to_text(pre) -> str:
             for child in list(container.children):
                 if isinstance(child, NavigableString) and not str(child).strip():
                     child.extract()
+
+    # End every div with a newline (innermost first) so each div becomes one line of code.
     for div in reversed(clone.find_all("div")):
         if not div.get_text("", strip=False).endswith("\n"):
             div.append("\n")
 
+    # Normalize line endings and trim blank lines at both ends, keeping inner indentation.
     lines = clone.get_text("", strip=False).replace("\r\n", "\n").replace("\r", "\n").split("\n")
     while lines and not lines[0].strip():
         lines.pop(0)
@@ -53,7 +62,9 @@ def pre_to_text(pre) -> str:
     return "\n".join(lines)
 
 
-# Infer a fence info string from structural attributes only.
+# Infer the fence info string (language) of a <pre> from structural attributes only: data-language,
+# data-lang, language-*/lang-* classes on <code> or <pre>, and the sp-* class of Sandpack. Return an
+# empty string when none is found or the value contains unsafe characters.
 def _language(pre) -> str:
     code = pre.find("code")
     nodes = (code, pre) if code is not None else (pre,)
@@ -82,7 +93,10 @@ def fenced_code(text: str, language: str = "") -> str:
     return f"{fence}{info}\n{text}\n{fence}"
 
 
-# Wrap every <pre> with boundary markers while leaving the original DOM intact.
+# Protect <pre> code blocks while generic extractors process the surrounding prose: put a start
+# and a stop marker paragraph around every non-empty <pre> and return (start, stop, fenced
+# markdown) triples for restore_pre_markers. The <pre> itself stays in the DOM. The markers carry
+# a fingerprint of the whole document, so they cannot collide with page text.
 def wrap_pre_with_markers(soup) -> list[tuple[str, str, str]]:
     source_fingerprint = hashlib.sha256(str(soup).encode("utf-8", errors="replace")).hexdigest()[:24].upper()
     markers: list[tuple[str, str, str]] = []
@@ -91,6 +105,8 @@ def wrap_pre_with_markers(soup) -> list[tuple[str, str, str]]:
         language = _language(pre)
         if not text:
             continue
+
+        # Add the marker paragraphs before and after the <pre> and remember its fenced markdown.
         start = f"ASLMCODESTART{source_fingerprint}{index:04d}END"
         stop = f"ASLMCODESTOP{source_fingerprint}{index:04d}END"
         start_node = soup.new_tag("p")
@@ -103,7 +119,8 @@ def wrap_pre_with_markers(soup) -> list[tuple[str, str, str]]:
     return markers
 
 
-# Replace each extracted START..STOP range with exact fenced Markdown.
+# Replace each extracted START..STOP range (whatever text the extractor made of the code between
+# the markers) with the exact fenced Markdown recorded by wrap_pre_with_markers.
 def restore_pre_markers(text: str, markers: list[tuple[str, str, str]]) -> str:
     restored = text or ""
     for start, stop, markdown in markers:
@@ -124,7 +141,8 @@ def restore_pre_markers(text: str, markers: list[tuple[str, str, str]]) -> str:
     return restored
 
 
-# Collapse excessive prose whitespace without modifying blank lines inside code fences.
+# Collapse excessive prose whitespace (at most two consecutive blank lines) without modifying
+# blank lines inside code fences.
 def collapse_blank_lines_preserving_fences(markdown: str) -> str:
     lines = (markdown or "").split("\n")
     output: list[str] = []
@@ -132,18 +150,23 @@ def collapse_blank_lines_preserving_fences(markdown: str) -> str:
     blank_run = 0
     for line in lines:
         current = markdown_fence_marker(line)
+
+        # Inside a fence: copy the line unchanged; a valid closing fence ends the protected region.
         if marker:
             if closes_markdown_fence(line, marker):
                 marker = ""
             output.append(line)
             blank_run = 0
             continue
+
+        # A fence opener starts a protected region.
         if current:
             marker = current
             output.append(line)
             blank_run = 0
             continue
 
+        # Prose: keep non-blank lines and at most two blank lines in a row.
         if line.strip():
             output.append(line)
             blank_run = 0

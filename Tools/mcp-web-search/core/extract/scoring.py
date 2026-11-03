@@ -8,14 +8,17 @@ from core.cache.query_normalizer import QUERY_STOPWORDS as _QUERY_STOPWORDS, COM
 from core.query.operators import CONTENT_OPERATOR_PREFIXES, NON_CONTENT_OPERATOR_PREFIXES
 
 
+# Punctuation stripped from both ends of a query word.
 _PUNCT_STRIP = "?!.,;:\"'()[]{}<>@#"
 
 
-# Tokenise query into meaningful terms (stopwords removed when possible).
+# Tokenise the query into meaningful lowercase terms longer than two characters, with search
+# operators removed. Stopwords are dropped unless that would leave no terms at all.
 def query_terms(query: str) -> list[str]:
     raw = []
     for t in (query or "").split():
         tl = t.lower()
+
         # Search operators are directives, not content terms: scoring against them only
         # dilutes the score of genuine results (no page contains "site:github.com" verbatim).
         if (
@@ -24,11 +27,13 @@ def query_terms(query: str) -> list[str]:
             or (t.startswith("-") and len(t) > 1)
         ):
             continue
+
         # intitle:/inurl: constrain where a useful content term appears; keep the value for
         # lexical relevance while discarding only the operator prefix.
         if tl.startswith(CONTENT_OPERATOR_PREFIXES):
             t = t.split(":", 1)[1]
             tl = t.lower()
+
         # Composite tokens (e.g. ".NET", "C#") must be substituted before
         # punct-strip so ".NET".strip(…) → "net" false-match doesn't happen.
         if tl in _COMPOSITE_TOKENS:
@@ -42,7 +47,8 @@ def query_terms(query: str) -> list[str]:
     return filtered or raw
 
 
-# BM25-lite relevance score in [0, 1] from title, snippet, and URL path.
+# Return a BM25-lite relevance score in [0, 1]: the share of query terms found in the title
+# (weight 0.6), the snippet (0.3) and the URL path (0.1). Return 0.0 when the query has no terms.
 def lexical_score(query: str, title: str, snippet: str, url: str) -> float:
     terms = query_terms(query)
     if not terms:

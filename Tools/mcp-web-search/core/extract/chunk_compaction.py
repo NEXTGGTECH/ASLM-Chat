@@ -1,14 +1,5 @@
 # Copyright NEXTGGTECH. Elastic License 2.0.
 
-"""Query-relevant chunk compaction for parsed-page content.
-
-One consistent algorithm: score paragraphs by BM25 relevance to the query + a cheap
-factual-density heuristic, reject SEO-stuffed blocks, and pack the best into a character
-budget. No per-type "profiles" or query classification — the previous taxonomy only
-swapped numeric constants and routed to behaviour that never existed; a single policy
-(budget-scalable) is the honest shape. No models, no embeddings.
-"""
-
 from __future__ import annotations
 
 import re
@@ -30,6 +21,9 @@ from core.extract.content_processor import (
 )
 
 
+# Tunables of the single compaction policy: the character budget, the minimum hybrid score for
+# a paragraph to be kept, the chunk cap (and its expanded cap when enough chunks score at least
+# expand_score), and the weight of the SEO-stuffing penalty in the hybrid score.
 @dataclass(frozen=True)
 class _Policy:
     char_budget: int = 1_400
@@ -40,10 +34,12 @@ class _Policy:
     seo_weight: float = 0.45
 
 
+# Policy used when the caller gives no usable character budget.
 _DEFAULT_POLICY = _Policy()
 
 
-# The single compaction policy, optionally rescaled to a caller's char budget.
+# Return the single compaction policy, with the character budget replaced by the caller's one
+# (at least 400) when it is positive; every other tunable stays at its default.
 def _policy_for(char_budget: int | None) -> _Policy:
     if char_budget is None or char_budget <= 0:
         return _DEFAULT_POLICY
@@ -57,7 +53,8 @@ def _policy_for(char_budget: int | None) -> _Policy:
     )
 
 
-# Fraction of text that looks like complete sentences.
+# Return a 0..1 estimate of how sentence-like the text is: sentence-ending marks counted against
+# roughly one sentence per 180 characters. Texts shorter than 40 characters score 0.
 def _sentence_like_ratio(text: str) -> float:
     compact = (text or "").strip()
     if len(compact) < 40:
@@ -66,13 +63,16 @@ def _sentence_like_ratio(text: str) -> float:
     return min(1.0, endings / max(1, len(compact) / 180))
 
 
-# Cheap factual-density proxy without GLiNER (0..1).
+# Return a cheap 0..1 factual-density proxy (no entity model): vocabulary variety, digits,
+# currency and measurement mentions, and sentence-likeness.
 def _entity_heuristic_score(text: str) -> float:
     tokens = _bm25_tokenize(text)
     if not tokens:
         return 0.0
     unique_ratio = len(set(tokens)) / len(tokens)
     digit_hits = sum(1 for ch in text if ch.isdigit())
+
+    # Add up the weighted signals; the cap on the total keeps the score in 0..1.
     score = 0.0
     score += min(0.35, unique_ratio * 0.5)
     score += 0.15 if digit_hits >= 2 else 0.05 if digit_hits else 0.0
@@ -82,7 +82,7 @@ def _entity_heuristic_score(text: str) -> float:
     return min(1.0, score)
 
 
-# Scale scores to [0, 1] by peak value.
+# Scale scores to [0, 1] by dividing by the peak value; all zeros when there is no positive peak.
 def _normalize_scores(values: list[float]) -> list[float]:
     if not values:
         return []
@@ -92,18 +92,21 @@ def _normalize_scores(values: list[float]) -> list[float]:
     return [min(1.0, max(0.0, v / peak)) for v in values]
 
 
-# Return (hybrid_score, seo_penalty) per paragraph.
+# Return (hybrid_score, seo_penalty) per paragraph. The hybrid score blends the normalized BM25
+# relevance, the factual-density heuristic and the inverse SEO-stuffing penalty.
 def _score_paragraphs(
     paragraphs: list[str], query_terms: list[str], policy: _Policy
 ) -> list[tuple[float, float]]:
     if not paragraphs:
         return []
 
+    # Index LaTeX-bearing pages on their cleaned text, so markup commands do not skew BM25.
     if _has_latex("\n\n".join(paragraphs)):
         index_paras = [_clean_latex_for_index(p) for p in paragraphs]
     else:
         index_paras = paragraphs
 
+    # Compute the three per-paragraph signals; fenced code is never penalized as SEO spam.
     bm25_raw = _bm25_score_paragraphs(index_paras, query_terms) if query_terms else [0.0] * len(paragraphs)
     bm25 = _normalize_scores(bm25_raw)
     entity = [_entity_heuristic_score(p) for p in paragraphs]
@@ -112,6 +115,7 @@ def _score_paragraphs(
         for p in paragraphs
     ]
 
+    # Split the weight left after the SEO share between BM25 and the entity heuristic (55:25).
     seo_w = max(0.0, min(1.0, policy.seo_weight))
     remainder = max(0.05, 1.0 - seo_w)
     bm25_w = remainder * (0.55 / 0.80)
@@ -124,22 +128,29 @@ def _score_paragraphs(
     return scored
 
 
-# Cap on paragraph count; expands when many strong chunks exist.
+# Return the cap on selected prose paragraphs: the expanded cap when at least 3 paragraphs (and at
+# least max_chunks) are strong, the normal cap otherwise.
 def _chunk_limit(policy: _Policy, strong_count: int) -> int:
     if strong_count >= policy.max_chunks and strong_count >= 3:
         return policy.max_chunks_expanded
     return policy.max_chunks
 
 
-# Pin fenced code verbatim, then select relevant prose and reject SEO stuffing within
-# the remaining character budget. Protected code may make the result exceed the budget.
+# Compact parsed-page content to the query-relevant part. Paragraphs are scored by BM25 relevance
+# to the query plus a cheap factual-density heuristic, SEO-stuffed blocks are rejected, and the
+# best are packed into a character budget with one policy for every query (no query
+# classification, no models, no embeddings). Fenced code is pinned verbatim first, then relevant
+# prose is selected within the remaining budget; protected code may make the result exceed the
+# budget. Kept paragraphs are returned in document order.
 def compress_chunks(text: str, query: str, *, char_budget: int | None = None) -> str:
     policy = _policy_for(char_budget)
 
+    # Without paragraph structure there is nothing to rank, so fall back to plain truncation.
     paragraphs = _split_blocks(text)
     if not paragraphs:
         return _truncate_markdown_to_budget(text, policy.char_budget, preserve_fenced_code=True)
 
+    # Pin fenced code blocks and reserve their cost (plus the blank-line separator) up front.
     pinned = {idx for idx, paragraph in enumerate(paragraphs) if _is_fenced_code_block(paragraph)}
     pinned_cost = sum(len(paragraphs[idx]) + 2 for idx in pinned)
     prose_budget = max(0, policy.char_budget - pinned_cost)
@@ -147,6 +158,8 @@ def compress_chunks(text: str, query: str, *, char_budget: int | None = None) ->
     query_terms = _bm25_tokenize(query)
     scored = _score_paragraphs(paragraphs, query_terms, policy)
 
+    # Text that already fits the budget is only filtered, not ranked: drop SEO-stuffed and
+    # low-score paragraphs, keep the rest in order.
     if len(text) <= policy.char_budget:
         kept = [
             idx
@@ -157,6 +170,7 @@ def compress_chunks(text: str, query: str, *, char_budget: int | None = None) ->
             return "\n\n".join(paragraphs[i] for i in sorted(kept))
         return ""
 
+    # Candidates: unpinned paragraphs that pass the SEO rejection and the minimum score.
     eligible: list[tuple[int, float, float]] = []
     for idx, ((hybrid, seo), _para) in enumerate(zip(scored, paragraphs)):
         if idx in pinned:
@@ -166,7 +180,8 @@ def compress_chunks(text: str, query: str, *, char_budget: int | None = None) ->
         eligible.append((idx, hybrid, seo))
 
     if not eligible:
-        # Fallback: least-spammy paragraphs by score only.
+        # Fallback when nothing qualifies: take the highest-scoring paragraphs that are not
+        # near-certain spam (penalty below 0.92) until the budget or chunk cap is reached.
         ranked = sorted(range(len(paragraphs)), key=lambda i: (-scored[i][0], scored[i][1]))
         fallback: list[int] = []
         budget = prose_budget
@@ -183,6 +198,8 @@ def compress_chunks(text: str, query: str, *, char_budget: int | None = None) ->
                 break
         selected_idx = sorted(pinned | set(fallback))
     else:
+        # Greedy pick by hybrid score: the cap grows when many strong chunks exist, and a
+        # paragraph that does not fit the remaining budget is skipped in favour of smaller ones.
         strong = [item for item in eligible if item[1] >= policy.expand_score]
         chunk_cap = _chunk_limit(policy, len(strong))
         ranked = sorted(eligible, key=lambda x: -x[1])
@@ -197,6 +214,7 @@ def compress_chunks(text: str, query: str, *, char_budget: int | None = None) ->
                 budget -= cost
         selected_idx = sorted(selected)
 
+    # Nothing selected at all: return a plain truncation instead of an empty result.
     if not selected_idx:
         return _truncate_markdown_to_budget(text, policy.char_budget, preserve_fenced_code=True)
 
