@@ -17,6 +17,8 @@ from API import llm_api, mcp as tool_registry
 from . import control as research_control
 
 
+# Repository root and the sandbox package location. The sandbox folders go on sys.path at import
+# time so the sandbox import below resolves.
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SANDBOX_ROOT = PROJECT_ROOT / "Tools" / "mcp-sandbox"
 for _sandbox_path in (SANDBOX_ROOT / "supervisor", SANDBOX_ROOT / "src"):
@@ -27,6 +29,8 @@ from sandbox.temporal import temporal_sandbox
 from .orchestrator import run_deep_research_v2
 
 
+# Shared model runtime metadata file, directory of the per-session JSONL event logs, and the tool
+# aliases a research session is meant to use (search, page reading and sandbox bash).
 RUNTIME_METADATA_FILE = PROJECT_ROOT / "Tools" / "model_runtime_metadata.json"
 LOGS_DIR = research_control.CONTROL_ROOT / "logs"
 ALLOWED_TOOL_ALIASES = (
@@ -35,6 +39,8 @@ ALLOWED_TOOL_ALIASES = (
     "sandbox__bash",
 )
 
+# System prompt of the planning stage: ask for a research plan and the first search requests
+# without answering the question.
 PLANNER_SYSTEM_PROMPT = """You are the planning stage of an isolated deep-research session.
 Do not answer the user's question yet and do not claim that you searched. Produce a concrete
 research plan and the first one or two search requests. Start from the final deliverables, split
@@ -43,6 +49,7 @@ success condition. Select web, shopping, academic, or onion search deliberately.
 operators only for a stated purpose. The first search requests must be focused and must unlock the
 largest number of later verification steps. Keep the plan compact enough to execute."""
 
+# System prompt of the research agent: tool list, search discipline, citation rules and report format.
 RESEARCH_SYSTEM_PROMPT = """You are an isolated deep-research agent. Execute the supplied plan,
 inspect evidence, and deliver a self-contained report that answers the original request.
 
@@ -82,6 +89,7 @@ Report presentation:
 - Use a valid fenced ```mermaid diagram for processes, architectures, timelines, or relationships
   that are materially clearer visually. Do not add decorative diagrams with no analytical value."""
 
+# System prompt for compressing completed research history into durable Markdown memory.
 RESEARCH_COMPRESSION_SYSTEM_PROMPT = """Compress completed deep-research history into durable
 research memory. Return only these Markdown sections: Research Goal, Plan State, Verified Claims,
 Contradictions, Open Evidence Gaps, Source Index, Sandbox Findings, Next Queries.
@@ -93,11 +101,14 @@ but retain numerical results and assumptions needed to reproduce calculations. D
 original question and do not include hidden chain of thought."""
 
 
-class ResearchEventLogger:
-    """Persist and publish an ordered event stream for one research session."""
+# Event logging
 
+# Ordered event stream of one research session: every event gets a sequence number, is appended
+# as a JSON line to the session's log file and is passed to the optional callback.
+class ResearchEventLogger:
     schema_version = 1
 
+    # Open the session's JSONL log (append mode, line-buffered) and set up the event counters.
     def __init__(
         self,
         session_id: str,
@@ -105,20 +116,27 @@ class ResearchEventLogger:
         callback=None,
         logs_dir: Path = LOGS_DIR,
     ) -> None:
+        # Event sequence number, iteration counter per phase, and the phases whose iteration
+        # advances on the next model output. The reentrant lock serializes concurrent emitters.
         self.session_id = str(session_id)
         self.callback = callback if callable(callback) else None
         self.sequence = 0
         self.phase_iterations: dict[str, int] = {}
         self.advance_on_next_model_chunk: set[str] = set()
         self.lock = threading.RLock()
+
+        # The log file is named after the session id with unsafe characters replaced.
         logs_dir.mkdir(parents=True, exist_ok=True)
         safe_session_id = re.sub(r"[^a-zA-Z0-9_.-]+", "-", self.session_id).strip("-")
         self.path = (logs_dir / f"{safe_session_id}.jsonl").resolve()
         self.handle = self.path.open("a", encoding="utf-8", buffering=1)
 
+    # Return the current iteration number of a phase, starting at 1.
     def current_iteration(self, phase: str) -> int:
         return self.phase_iterations.setdefault(str(phase), 1)
 
+    # Append one event to the log and pass it to the callback. The iteration defaults to the
+    # phase's current one. Return the event record.
     def emit(
         self,
         event_type: str,
@@ -127,6 +145,7 @@ class ResearchEventLogger:
         data: Any = None,
         iteration: int | None = None,
     ) -> dict[str, Any]:
+        # Number and write the record under the lock so the log stays ordered.
         with self.lock:
             self.sequence += 1
             record = {
@@ -141,13 +160,18 @@ class ResearchEventLogger:
             }
             self.handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
             self.handle.flush()
+
+        # Notify the observer outside the lock.
         if self.callback is not None:
             try:
                 self.callback(record)
-            except Exception:  # Observers must never interrupt research.
+            except Exception:
+                # Observers must never interrupt research.
                 pass
         return record
 
+    # Start the next iteration of a phase when a tool result was seen and the model has now
+    # produced new output.
     def _advance_iteration_if_needed(self, phase: str) -> None:
         if phase not in self.advance_on_next_model_chunk:
             return
@@ -155,7 +179,11 @@ class ResearchEventLogger:
         self.advance_on_next_model_chunk.discard(phase)
         self.emit("iteration_started", phase=phase)
 
+    # Translate one raw streamed generation chunk into logged events: reasoning and content deltas,
+    # the completed model turn, tool calls, tool activity and results, and token usage. Model
+    # output after a tool result starts a new iteration of the phase.
     def observe_chunk(self, phase: str, raw_chunk: Any) -> None:
+        # Normalize every part of the chunk to plain dicts.
         chunk = _as_dict(raw_chunk)
         message = _as_dict(chunk.get("message"))
         transcript = _as_dict(chunk.get("transcript_message"))
@@ -164,9 +192,11 @@ class ResearchEventLogger:
         tool_result = _as_dict(chunk.get("tool_result"))
         tool_progress = _as_dict(chunk.get("tool_progress"))
 
+        # Any model output or tool event after a tool result begins the next iteration.
         if message or transcript or tool_events or tool_event:
             self._advance_iteration_if_needed(phase)
 
+        # Model output: reasoning and visible content deltas, then the completed turn.
         thinking = message.get("thinking")
         if isinstance(thinking, str) and thinking:
             self.emit(
@@ -184,6 +214,7 @@ class ResearchEventLogger:
         if transcript:
             self.emit("model_turn_completed", phase=phase, data=transcript)
 
+        # Tool calls arrive as a list, a single event, or both.
         normalized_tool_events = tool_events if isinstance(tool_events, list) else []
         if isinstance(tool_event, dict):
             normalized_tool_events = [*normalized_tool_events, tool_event]
@@ -191,12 +222,14 @@ class ResearchEventLogger:
             if isinstance(event, dict):
                 self.emit("tool_call", phase=phase, data=event)
 
+        # Tool progress and results; a result arms the iteration advance for the next model output.
         if tool_progress:
             self.emit("tool_activity", phase=phase, data=tool_progress)
         if tool_result:
             self.emit("tool_result", phase=phase, data=tool_result)
             self.advance_on_next_model_chunk.add(phase)
 
+        # Token usage: the chunk's usage object, or the provider's loose token count fields.
         usage = chunk.get("usage")
         if not isinstance(usage, dict):
             usage = {
@@ -213,12 +246,17 @@ class ResearchEventLogger:
         if usage:
             self.emit("usage", phase=phase, data=usage)
 
+    # Close the log file; calling it again is harmless.
     def close(self) -> None:
         with self.lock:
             if not self.handle.closed:
                 self.handle.close()
 
 
+# Runtime model
+
+# Read the shared runtime model metadata JSON object. Raise RuntimeError when the file is
+# unreadable, malformed or not a JSON object.
 def _read_runtime_metadata(metadata_path: Path = RUNTIME_METADATA_FILE) -> dict[str, Any]:
     try:
         payload = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -229,13 +267,16 @@ def _read_runtime_metadata(metadata_path: Path = RUNTIME_METADATA_FILE) -> dict[
     return payload
 
 
+# Resolve the caller's current model and enrich it from the shared runtime JSON. The caller's
+# engine and model win over the active ones in the metadata. Return the engine, model,
+# capabilities, limits and where the choice came from. Raise RuntimeError when no model is
+# available or the model does not support tool calling.
 def resolve_runtime_model(
     context: Mapping[str, Any] | None,
     *,
     metadata_path: Path = RUNTIME_METADATA_FILE,
 ) -> dict[str, Any]:
-    """Resolve the caller's current model and enrich it from the shared runtime JSON."""
-
+    # Choose the engine and model: caller context first, then the active runtime model.
     metadata = _read_runtime_metadata(metadata_path)
     active = metadata.get("active") if isinstance(metadata.get("active"), dict) else {}
     caller = context if isinstance(context, Mapping) else {}
@@ -244,6 +285,7 @@ def resolve_runtime_model(
     if not engine or not model:
         raise RuntimeError("No active engine/model is available for deep research.")
 
+    # Find the model record by its engine:model key, else by scanning the records.
     models = metadata.get("models") if isinstance(metadata.get("models"), dict) else {}
     record = models.get(f"{engine}:{model}")
     if not isinstance(record, dict):
@@ -257,6 +299,8 @@ def resolve_runtime_model(
             ),
             {},
         )
+
+    # Refuse a model that is known not to support tool calling.
     capabilities = record.get("capabilities") if isinstance(record.get("capabilities"), dict) else {}
     if capabilities.get("tools") is False:
         raise RuntimeError(f"The selected model '{model}' does not support tool calling.")
@@ -274,6 +318,10 @@ def resolve_runtime_model(
     }
 
 
+# Chunk parsing
+
+# Convert a dict, a mapping or a model object with model_dump into a plain dict. Anything else
+# yields an empty dict.
 def _as_dict(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return value
@@ -286,6 +334,9 @@ def _as_dict(value: Any) -> dict[str, Any]:
     return {}
 
 
+# Normalize a generation result to an iterator of chunks. None yields nothing, a mapping or model
+# object is a single chunk, a string is wrapped as one assistant message chunk and any other
+# iterable is streamed as it is.
 def _iter_generation(result: Any) -> Iterator[Any]:
     if result is None:
         return
@@ -301,11 +352,15 @@ def _iter_generation(result: Any) -> Iterator[Any]:
     yield result
 
 
+# Return the dict stored under key in a chunk, or an empty dict when it is missing.
 def _message_from_chunk(chunk: Any, key: str) -> dict[str, Any]:
     chunk_payload = _as_dict(chunk)
     return _as_dict(chunk_payload.get(key))
 
 
+# Return the structured payload of a chunk's tool result: its structured_content (or
+# structuredContent) dict, else its content when that is a dict or a JSON object string.
+# Return an empty dict when there is none.
 def _structured_tool_result(chunk: Any) -> dict[str, Any]:
     tool_message = _message_from_chunk(chunk, "tool_result")
     structured = tool_message.get("structured_content") or tool_message.get("structuredContent")
@@ -323,12 +378,17 @@ def _structured_tool_result(chunk: Any) -> dict[str, Any]:
     return {}
 
 
+# Report assembly
+
+# Replace bracketed citation handles such as [c0000-1], alone or comma-separated, with Markdown
+# links to the matching source URLs, so internal handles are resolved before the report reaches
+# the parent model. Handles without a known http(s) source stay as plain [handle]; handles that
+# are already followed by a link target are left untouched.
 def replace_citation_handles_with_markdown_links(
     text: str,
     sources: list[dict[str, Any]],
 ) -> str:
-    """Resolve internal citation handles before the report reaches the parent model."""
-
+    # Map each lower-cased source id to its URL, keeping only valid http(s) URLs.
     source_urls: dict[str, str] = {}
     for source in sources:
         if not isinstance(source, dict):
@@ -338,16 +398,19 @@ def replace_citation_handles_with_markdown_links(
         try:
             parsed_url = urlsplit(source_url)
         except ValueError:
+            # A malformed URL cannot be linked, so the handle stays plain.
             continue
         if source_id and parsed_url.scheme in {"http", "https"} and parsed_url.netloc:
             source_urls[source_id] = source_url
 
+    # Match one or more comma-separated handles inside brackets that are not already a link.
     handle = r"c[a-z0-9]{3,}-\d+"
     group_pattern = re.compile(
         rf"\[\s*({handle}(?:\s*,\s*{handle})*)\s*\](?!\()",
         flags=re.I,
     )
 
+    # Turn one bracketed handle group into one link per handle (plain [handle] when unknown).
     def replace_group(match: re.Match[str]) -> str:
         links: list[str] = []
         for raw_id in match.group(1).split(","):
@@ -363,6 +426,9 @@ def replace_citation_handles_with_markdown_links(
     return group_pattern.sub(replace_group, str(text or ""))
 
 
+# Consume a generation result and return the final text with the unique sources found in its tool
+# results. The text is the last transcript message without tool calls, falling back to the
+# concatenated visible content. Every chunk is also reported to the event logger when one is given.
 def _collect_generation(
     result: Any,
     *,
@@ -374,6 +440,7 @@ def _collect_generation(
     sources_by_key: dict[str, dict[str, Any]] = {}
 
     for raw_chunk in _iter_generation(result):
+        # Log the chunk, then collect the visible content fragments.
         if event_logger is not None:
             event_logger.observe_chunk(phase, raw_chunk)
         message = _message_from_chunk(raw_chunk, "message")
@@ -381,6 +448,7 @@ def _collect_generation(
         if isinstance(content, str) and content:
             visible_fragments.append(content)
 
+        # A transcript message without tool calls is a finished answer; the latest one wins.
         transcript = _message_from_chunk(raw_chunk, "transcript_message")
         transcript_content = transcript.get("content")
         if (
@@ -390,6 +458,7 @@ def _collect_generation(
         ):
             final_transcript = transcript_content.strip()
 
+        # Sources from tool results, deduplicated by id (or URL); the first occurrence wins.
         structured = _structured_tool_result(raw_chunk)
         raw_sources = structured.get("sources") if isinstance(structured, dict) else None
         if not isinstance(raw_sources, list):
@@ -408,6 +477,9 @@ def _collect_generation(
     return text, list(sources_by_key.values())
 
 
+# Run settings
+
+# Build the generation options: always streaming, plus high-level thinking when the model supports it.
 def _generation_options(runtime: dict[str, Any]) -> dict[str, Any]:
     options: dict[str, Any] = {"stream": True}
     capabilities = runtime.get("capabilities") if isinstance(runtime.get("capabilities"), dict) else {}
@@ -416,6 +488,7 @@ def _generation_options(runtime: dict[str, Any]) -> dict[str, Any]:
     return options
 
 
+# Coerce the requested round limit to an integer from 4 to 24; a missing or invalid value gives 12.
 def _coerce_max_rounds(value: Any) -> int:
     try:
         return min(24, max(4, int(value or 12)))
@@ -423,6 +496,9 @@ def _coerce_max_rounds(value: Any) -> int:
         return 12
 
 
+# Return the history size in characters at which compression starts: 45% of the model's context
+# window at about 4 characters per token, clamped to 24,000-120,000, or 60,000 when the window is
+# unknown.
 def _compression_trigger_chars(runtime: dict[str, Any]) -> int:
     limits = runtime.get("limits") if isinstance(runtime.get("limits"), dict) else {}
     raw_tokens = limits.get("context_window") or limits.get("model_context_limit") or 0
@@ -435,6 +511,11 @@ def _compression_trigger_chars(runtime: dict[str, Any]) -> int:
     return min(120_000, max(24_000, int(context_tokens * 4 * 0.45)))
 
 
+# History compression
+
+# Build a research memory without the model, used when the model returns no summary: the standard
+# section headings, every citation handle and URL found in the history, and its last 16,000
+# characters verbatim.
 def _fallback_research_memory(raw_history: str) -> str:
     handles = list(dict.fromkeys(re.findall(r"\bc[a-z0-9]{3,}-\d+\b", raw_history, flags=re.I)))
     urls = list(dict.fromkeys(re.findall(r"https?://[^\s\"'<>]+", raw_history)))
@@ -454,6 +535,9 @@ def _fallback_research_memory(raw_history: str) -> str:
     )
 
 
+# Build the compaction callback for the orchestrator. It asks the selected model to summarize
+# completed research turns into durable memory and logs the compression events. When the model
+# returns nothing it falls back to the mechanical memory.
 def _research_compactor(
     runtime: dict[str, Any],
     event_logger: ResearchEventLogger | None = None,
@@ -461,7 +545,10 @@ def _research_compactor(
     engine = str(runtime["engine"])
     model = str(runtime["model"])
 
+    # Summarize the history entries and return the research memory text. The provider format is
+    # only recorded in the logged event.
     def compact(entries: list[dict[str, Any]], *, provider_format: str = "standard") -> str:
+        # Announce the compression, then stream the model's summary of the serialized history.
         if event_logger is not None:
             event_logger.emit(
                 "compression_started",
@@ -486,6 +573,8 @@ def _research_compactor(
             event_logger=event_logger,
             phase="compression",
         )
+
+        # Use the fallback memory when the model produced no summary, and log the outcome.
         fallback_used = not bool(summary)
         compressed = summary or _fallback_research_memory(raw_history)
         if event_logger is not None:
@@ -506,6 +595,11 @@ def _research_compactor(
     return compact
 
 
+# Entry point
+
+# Run the deterministic v2 state machine with the caller's selected model. When the model cannot
+# be resolved, mark the stored session as failed (if the arguments carry a session id) and
+# re-raise the error.
 def run_deep_research(
     arguments: Mapping[str, Any],
     context: Mapping[str, Any] | None = None,
@@ -513,11 +607,10 @@ def run_deep_research(
     metadata_path: Path = RUNTIME_METADATA_FILE,
     logs_dir: Path = LOGS_DIR,
 ) -> dict[str, Any]:
-    """Run the deterministic v2 state machine with the caller's selected model."""
-
     try:
         runtime = resolve_runtime_model(context, metadata_path=metadata_path)
     except Exception as exc:
+        # Record the failure in the session so the UI stops waiting, then re-raise.
         session_id = str(arguments.get("session_id") or "").strip()
         if session_id:
             try:
@@ -532,8 +625,11 @@ def run_deep_research(
                     can_stop=False,
                 )
             except (OSError, ValueError):
+                # Recording the failure is best-effort; the original error is re-raised anyway.
                 pass
         raise
+
+    # Hand over to the orchestrator with the resolved model.
     return run_deep_research_v2(
         arguments,
         context,
