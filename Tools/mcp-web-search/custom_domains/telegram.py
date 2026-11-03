@@ -1,7 +1,5 @@
 # Copyright NEXTGGTECH. Elastic License 2.0.
 
-"""Read public Telegram posts through Telegram's lightweight embed HTML."""
-
 from __future__ import annotations
 
 import re
@@ -11,10 +9,17 @@ from core.extract.content_processor import _truncate_markdown_to_budget
 
 from custom_domains.base import FetchContext, PageResult
 
+# Download size cap, and the ceiling and floor of the markdown kept before the shared read_page
+# budget pass (the floor applies below four times the requested size).
 _MAX_RESPONSE_BYTES = 1 * 1024 * 1024
 _MAX_PRE_BUDGET_CHARS = 32_000
 _MIN_PRE_BUDGET_CHARS = 8_000
+
+# User-Agent sent to Telegram.
 _USER_AGENT = "ASLM-Chat/1.0 (public Telegram post reader)"
+
+# A valid public username (letter first, up to 64 characters) and the first path segments that are
+# Telegram features rather than usernames.
 _USERNAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
 _RESERVED_PATHS = {
     "addlist",
@@ -32,6 +37,9 @@ _RESERVED_PATHS = {
 }
 
 
+# URL parsing
+
+# Return True for http(s) URLs on t.me / telegram.me (with or without www.).
 def is_telegram_url(url: str) -> bool:
     parsed = urlparse(str(url or "").strip())
     host = (parsed.hostname or "").lower().rstrip(".")
@@ -52,12 +60,14 @@ def telegram_embed_url(url: str) -> str | None:
     if parsed.scheme.lower() not in {"http", "https"}:
         return None
 
+    # Path segments: [s/]username[/topic_id]/message_id.
     parts = [unquote(part).strip() for part in parsed.path.split("/") if part.strip()]
     if parts and parts[0].lower() == "s":
         parts = parts[1:]
     if len(parts) not in {2, 3}:
         return None
 
+    # Accept only a real username, a numeric topic (if any) and a positive numeric message id.
     username = parts[0]
     message_id = parts[-1]
     if (
@@ -83,6 +93,7 @@ def telegram_feed_url(url: str) -> str | None:
     if parsed.scheme.lower() not in {"http", "https"}:
         return None
 
+    # Path segments: [s/]username, nothing more.
     parts = [unquote(part).strip() for part in parsed.path.split("/") if part.strip()]
     if len(parts) == 2 and parts[0].lower() == "s":
         parts = parts[1:]
@@ -94,6 +105,8 @@ def telegram_feed_url(url: str) -> str | None:
         return None
     return f"https://t.me/s/{username}"
 
+
+# Fetching
 
 # Fetch a bounded widget document. Telegram posts are small; the 1 MiB ceiling leaves
 # room for markup and reactions while preventing a malformed response from consuming
@@ -121,6 +134,8 @@ async def _fetch_embed_html(embed_url: str, timeout: float) -> str:
     return b"".join(chunks).decode("utf-8", errors="replace")
 
 
+# Markdown conversion
+
 # Keep enough source text for query-aware BM25 selection, but cap the intermediate
 # document before it reaches the shared read_page budget pass.
 def _pre_budget_limit(markdown: str, max_chars: int) -> str:
@@ -134,10 +149,12 @@ def _pre_budget_limit(markdown: str, max_chars: int) -> str:
     return _truncate_markdown_to_budget(markdown, limit, preserve_fenced_code=True)
 
 
-# Isolate Telegram's message body before using the shared HTML→markdown normalizer.
+# Convert Telegram's message body element (BeautifulSoup node, modified in place) to markdown text.
 def _body_to_markdown(body, source_url: str) -> str:
     from bs4 import NavigableString
 
+    # Replace the formatting elements with their markdown equivalents: emoji by their text, code
+    # blocks and inline code, bold, italics, links (made absolute), quotes and line breaks.
     for emoji in list(body.select("tg-emoji")):
         emoji.replace_with(NavigableString(emoji.get_text("", strip=True)))
     for pre in list(body.select("pre")):
@@ -162,6 +179,7 @@ def _body_to_markdown(body, source_url: str) -> str:
     for line_break in list(body.select("br")):
         line_break.replace_with(NavigableString("\n"))
 
+    # Flatten to text and tidy the whitespace: trailing and leading blanks per line, runs of blank lines.
     text = body.get_text("", strip=False).replace("\xa0", " ")
     text = re.sub(r"[ \t]+\n", "\n", text)
     text = re.sub(r"\n[ \t]+", "\n", text)
@@ -169,13 +187,16 @@ def _body_to_markdown(body, source_url: str) -> str:
     return text.strip()
 
 
-# Isolate Telegram's message body and retain its small, known formatting vocabulary.
+# Isolate Telegram's message body and retain its small, known formatting vocabulary. Return an empty
+# string when the HTML parser is unavailable or the page has no message text.
 def _embed_to_markdown(source_url: str, raw_html: str, *, max_chars: int = 20_000) -> str:
     try:
         from bs4 import BeautifulSoup
     except Exception:
+        # The HTML parser is optional; without it nothing can be extracted.
         return ""
 
+    # Locate the message text and drop embedded scripts and styles.
     soup = BeautifulSoup(raw_html or "", "lxml")
     message = soup.select_one(".tgme_widget_message")
     body = message.select_one(".tgme_widget_message_text") if message else None
@@ -185,6 +206,7 @@ def _embed_to_markdown(source_url: str, raw_html: str, *, max_chars: int = 20_00
     for unwanted in body.select("script, style"):
         unwanted.decompose()
 
+    # Title ("author in channel"), publication time and the converted body.
     author_node = message.select_one(".tgme_widget_message_author_name")
     owner_node = message.select_one(".tgme_widget_message_owner_name")
     time_node = message.select_one(".tgme_widget_message_date time[datetime]")
@@ -196,6 +218,7 @@ def _embed_to_markdown(source_url: str, raw_html: str, *, max_chars: int = 20_00
     if not content:
         return ""
 
+    # Header lines followed by the content, capped before the shared budget pass.
     parts = [f"# {title}", "", "**Site:** t.me", f"**URL:** {source_url}"]
     if published:
         parts.append(f"**Date:** {published[:10]}")
@@ -213,13 +236,16 @@ def _feed_to_markdown(source_url: str, raw_html: str, *, max_chars: int = 20_000
     try:
         from bs4 import BeautifulSoup
     except Exception:
+        # The HTML parser is optional; without it nothing can be extracted.
         return ""
 
+    # No message nodes means the redirect/join card was served instead of a feed.
     soup = BeautifulSoup(raw_html or "", "lxml")
     messages = soup.select(".tgme_widget_message[data-post]")
     if not messages:
         return ""
 
+    # Channel title from the header, falling back to og:title.
     title_node = soup.select_one(".tgme_channel_info_header_title")
     title = title_node.get_text(" ", strip=True) if title_node else ""
     if not title:
@@ -227,6 +253,8 @@ def _feed_to_markdown(source_url: str, raw_html: str, *, max_chars: int = 20_000
         title = str(meta_title.get("content") or "").strip() if meta_title else ""
     title = title or "Telegram channel"
 
+    # Convert every message that has text (the page lists them oldest first, so iterate reversed to
+    # get newest first); each becomes a heading linking to the post plus its body.
     posts: list[tuple[str, str]] = []
     latest_date = ""
     for message in reversed(messages):
@@ -250,6 +278,7 @@ def _feed_to_markdown(source_url: str, raw_html: str, *, max_chars: int = 20_000
             heading += f" — {published[:10]}"
         posts.append((heading, content))
 
+    # Assemble the document: channel header, then the posts.
     if not posts:
         return ""
 
@@ -262,12 +291,17 @@ def _feed_to_markdown(source_url: str, raw_html: str, *, max_chars: int = 20_000
     return _pre_budget_limit("\n".join(parts).strip(), max_chars)
 
 
+# Page reading and handler
+
+# Read a public Telegram post (or a public channel's recent messages) through Telegram's lightweight
+# embed HTML and return markdown, or an "Error: ..." string on failure.
 async def fetch_telegram_post(
     url: str,
     *,
     timeout: float = 10.0,
     max_chars: int = 20_000,
 ) -> str:
+    # Pick the embed widget for a post link, else the channel feed.
     embed_url = telegram_embed_url(url)
     feed_url = telegram_feed_url(url) if embed_url is None else None
     fetch_url = embed_url or feed_url
@@ -278,6 +312,7 @@ async def fetch_telegram_post(
     except Exception as exc:
         return f"Error: Telegram fetch failed for {url}: {exc}"
 
+    # Convert the document; an empty result is reported with an error that fits the kind of URL.
     if embed_url is not None:
         markdown = _embed_to_markdown(url, raw_html, max_chars=max_chars)
     else:
@@ -289,15 +324,17 @@ async def fetch_telegram_post(
     return f"Error: Telegram post has no public extractable text: {url}"
 
 
+# Handler for public Telegram posts and channel feeds (no generic fallback).
 class TelegramHandler:
     name = "telegram"
     fallback_to_generic = False
 
+    # Claim the whole host so unsupported/root/invite links cannot fall through to the generic
+    # parser and ingest Telegram's join CTA as useful page content.
     def matches(self, url: str) -> bool:
-        # Claim the whole host so unsupported/root/invite links cannot fall through to
-        # the generic parser and ingest Telegram's join CTA as useful page content.
         return is_telegram_url(url)
 
+    # Fetch the post or feed as markdown; an "Error:" result is reported as a failed PageResult.
     async def read(self, url: str, ctx: FetchContext) -> PageResult:
         markdown = await fetch_telegram_post(
             url,
@@ -315,6 +352,7 @@ class TelegramHandler:
         )
 
 
+# Handler instance registered in custom_domains/__init__.py.
 HANDLER = TelegramHandler()
 
 __all__ = [

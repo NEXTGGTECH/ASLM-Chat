@@ -37,7 +37,7 @@ def extract_title(html: str) -> str:
     return trim(match.group(1) if match else "", 180)
 
 
-# Heuristic: page looks like a bot/captcha block rather than real content.
+# Return True when the page looks like a bot/captcha block rather than real content (heuristic).
 def looks_blocked(title: str, html: str) -> bool:
     lower_title = (title or "").lower()
     lower_html = (html or "").lower()
@@ -51,6 +51,8 @@ def looks_blocked(title: str, html: str) -> bool:
 def clean_trafilatura_snapshot(text: str) -> str:
     lines = [line.rstrip() for line in (text or "").splitlines()]
     cleaned: list[str] = []
+
+    # Lowercase lines (without markdown heading marks) that are boilerplate and get dropped.
     skip_markers = (
         "oops! looks like we're having trouble connecting to our server.",
         "refresh your browser window to try again.",
@@ -73,6 +75,8 @@ def extract_with_preferred_pipeline(url: str, raw_html: str, *, prefer_trafilatu
     cleaned_html = _preclean_html(raw_html)
     strategy = "normalize_page"
 
+    # Extract the main text: trafilatura first when preferred (falling back to the normalizer if it
+    # returns nothing), the normalizer otherwise. `strategy` records which path produced the text.
     if prefer_trafilatura:
         text = _extract_with_trafilatura_formatted(cleaned_html, url)
         strategy = "trafilatura"
@@ -82,6 +86,7 @@ def extract_with_preferred_pipeline(url: str, raw_html: str, *, prefer_trafilatu
     else:
         text = _extract_content(raw_html, None, url)
 
+    # Clean the text and build the markdown; a long single-block result is re-segmented first.
     if not text.strip():
         markdown = _build_markdown(meta, "*No content extracted.*")
     else:
@@ -93,6 +98,7 @@ def extract_with_preferred_pipeline(url: str, raw_html: str, *, prefer_trafilatu
             cleaned = _clean_content(cleaned, strict=not prefer_trafilatura)
         markdown = _build_markdown(meta, cleaned)
 
+    # Snapshot fields; the preview is a short head of the markdown.
     return {
         "strategy": strategy,
         "markdown": markdown,

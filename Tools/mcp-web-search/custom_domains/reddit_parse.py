@@ -1,31 +1,18 @@
 # Copyright NEXTGGTECH. Elastic License 2.0.
 
-"""Structural old.reddit.com thread parser.
-
-old.reddit.com serves fully server-rendered HTML with stable class names and
-`data-*` attributes — no JS, no API key, no `.json` trick. This parser reads that
-structure directly, keeping what an `inner_text` scrape throws away: each comment's
-exact score, its nesting depth, its author, and self-vs-link on the post.
-
-Ported from the reference `webclaw-core/src/reddit.rs`; the DOM contract (which
-class holds the score, why `.entry` must be scoped to avoid a reply's body, how
-`morechildren` stubs and hidden scores appear) is documented inline where it bites.
-The tests in tests/test_reddit_parse.py run against REAL old.reddit fixtures — not
-synthetic HTML, which is too easy to write to match a wrong assumption.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 
 from selectolax.lexbor import LexborHTMLParser, LexborNode
 
+# Base URL used to turn root-relative old.reddit links into absolute ones.
 _OLD_REDDIT = "https://old.reddit.com"
 
 
-# ─── Public types ────────────────────────────────────────────────────────────
+# Public types
 
-
+# A Reddit post parsed from old.reddit HTML: author, score, self-vs-link and the self-text body.
 @dataclass(slots=True)
 class RedditPost:
     id: str | None
@@ -42,6 +29,7 @@ class RedditPost:
     created_utc: str | None
 
 
+# One comment with its nesting depth and replies.
 @dataclass(slots=True)
 class RedditComment:
     id: str | None
@@ -56,6 +44,7 @@ class RedditComment:
     replies: list["RedditComment"] = field(default_factory=list)
 
 
+# A parsed thread: the post (None when it could not be read) and its top-level comments.
 @dataclass(slots=True)
 class RedditThread:
     source_url: str
@@ -63,12 +52,18 @@ class RedditThread:
     comments: list[RedditComment]
 
 
-# ─── Public API ──────────────────────────────────────────────────────────────
+# Public API
 
-
-# Parse a Reddit thread from old.reddit.com HTML. Returns None when the page has
+# Parse a Reddit thread from old.reddit.com HTML. Return None when the page has
 # no recognisable Reddit structure (a listing page, an antibot wall, an error).
+# old.reddit.com serves fully server-rendered HTML with stable class names and `data-*`
+# attributes (no JS, no API key, no `.json` trick), so the structure is read directly, keeping what
+# an `inner_text` scrape throws away: each comment's exact score, nesting depth and author, and
+# self-vs-link on the post. Ported from the reference `webclaw-core/src/reddit.rs`; the DOM
+# contract (which class holds the score, why `.entry` must be scoped to avoid a reply's body, how
+# `morechildren` stubs and hidden scores appear) is documented inline where it bites.
 def parse_thread(html: str, url: str) -> RedditThread | None:
+    # Only thread pages (URLs with /comments/) are parsed.
     if "/comments/" not in url:
         return None
     doc = LexborHTMLParser(html)
@@ -89,12 +84,14 @@ def try_extract_markdown(html: str, url: str) -> str | None:
     return md or None
 
 
-# ─── Markdown rendering ──────────────────────────────────────────────────────
+# Markdown rendering
 
-
+# Render a parsed thread as markdown: the post header and body, then the comment tree.
 def thread_to_markdown(thread: RedditThread) -> str:
     out: list[str] = []
     p = thread.post
+
+    # Post: title, author line (subreddit, score, comment count), body and external link.
     if p is not None:
         out.append(f"# {p.title}\n\n")
         pts = _pt_label(p.score)
@@ -112,6 +109,8 @@ def thread_to_markdown(thread: RedditThread) -> str:
         if p.url and not p.is_self:
             out.append(f"[Link]({p.url})\n\n")
         out.append("---\n\n")
+
+    # Comments, depth-first.
     if thread.comments:
         out.append("## Comments\n\n")
         for c in thread.comments:
@@ -140,6 +139,7 @@ def _render_comment(c: RedditComment, out: list[str]) -> None:
         _render_comment(reply, out)
 
 
+# Return the score label: "score hidden" for None, otherwise "N pt(s)".
 def _pt_label(n: int | None) -> str:
     if n is None:
         return "score hidden"
@@ -166,15 +166,17 @@ def _collapse_blank_lines(s: str) -> str:
     return "".join(out)
 
 
-# ─── Post parsing ────────────────────────────────────────────────────────────
+# Post parsing
 
-
+# Parse the post from the first link `.thing` of the site table. Return None when it is missing or
+# has no title.
 def _parse_post(doc: LexborHTMLParser) -> RedditPost | None:
     thing = doc.css_first("#siteTable .thing.link")
     if thing is None:
         return None
     attrs = thing.attributes
 
+    # Identity and counters come from the `data-*` attributes of the post element.
     fullname = attrs.get("data-fullname")
     post_id = fullname[3:] if fullname and fullname.startswith("t3_") else fullname
     author = attrs.get("data-author") or "[deleted]"
@@ -190,6 +192,7 @@ def _parse_post(doc: LexborHTMLParser) -> RedditPost | None:
     link_url = attrs.get("data-url")
     url = None if is_self else link_url
 
+    # Title (a post without one is not usable), flair, body and timestamp.
     title_node = thing.css_first(".title a.title")
     title = _node_text(title_node) if title_node is not None else ""
     if not title:
@@ -202,6 +205,7 @@ def _parse_post(doc: LexborHTMLParser) -> RedditPost | None:
     body = _extract_md(entry) if entry is not None else None
     created_utc = _created_utc(thing)
 
+    # Assemble the post; an empty flair becomes None.
     return RedditPost(
         id=post_id,
         title=title,
@@ -218,22 +222,21 @@ def _parse_post(doc: LexborHTMLParser) -> RedditPost | None:
     )
 
 
-# ─── Comment parsing ─────────────────────────────────────────────────────────
-#
-# old.reddit.com nests comments structurally, not via a depth attribute:
+# Comment parsing
+
+# Parse the top-level comments of the thread. old.reddit.com nests comments structurally, not via
+# a depth attribute:
 #
 #   .commentarea
 #     .sitetable.nestedlisting
-#       .comment.thing                          ← root comment
-#         .entry → form → .usertext-body → .md  ← its own body
+#       .comment.thing                          <- root comment
+#         .entry -> form -> .usertext-body -> .md  <- its own body
 #         .child
 #           .sitetable.listing
-#             .comment.thing                    ← reply (recurse)
+#             .comment.thing                    <- reply (recurse)
 #
 # `data-depth`/`data-replies` are absent or "0" in the logged-out HTML, so we
 # walk the tree by recursing into each comment's `.child`.
-
-
 def _parse_comments(doc: LexborHTMLParser, op: str) -> list[RedditComment]:
     # Root listing is `.sitetable.nestedlisting` inside `.commentarea` (a class,
     # not an id). Fall back to the first `.nestedlisting` anywhere for
@@ -258,6 +261,7 @@ def _walk_comment_level(listing: LexborNode, op: str, depth: int) -> list[Reddit
     return out
 
 
+# Parse one `.comment.thing` node and, recursively, its replies. Return None for "load more" stubs.
 def _parse_one_comment(node: LexborNode, op: str, depth: int) -> RedditComment | None:
     attrs = node.attributes
     classes = _classes(node)
@@ -309,8 +313,8 @@ def _parse_one_comment(node: LexborNode, op: str, depth: int) -> RedditComment |
 
 
 # Read a comment's score from the `.score.unvoted` span inside `.entry`. Prefers
-# the `title` attribute (exact integer); falls back to the text ("10 points").
-# Returns None when Reddit hides the score (no `.score.unvoted` span).
+# the `title` attribute (exact integer); fall back to the text ("10 points").
+# Return None when Reddit hides the score (no `.score.unvoted` span).
 def _comment_score(entry: LexborNode) -> int | None:
     span = entry.css_first("span.score.unvoted")
     if span is None:
@@ -320,10 +324,12 @@ def _comment_score(entry: LexborNode) -> int | None:
         try:
             return int(title)
         except ValueError:
+            # Non-numeric title: fall through to parsing the visible text.
             pass
     return _parse_score(_node_text(span))
 
 
+# Return the datetime attribute of the first <time> element under the node, or None.
 def _created_utc(node: LexborNode | None) -> str | None:
     if node is None:
         return None
@@ -333,8 +339,7 @@ def _created_utc(node: LexborNode | None) -> str | None:
     return time_node.attributes.get("datetime")
 
 
-# ─── .md div → markdown ──────────────────────────────────────────────────────
-
+# Body conversion
 
 # Render a reddit `.md` div (server-rendered markdown→HTML) back to markdown.
 def _extract_md(entry: LexborNode | None) -> str | None:
@@ -350,12 +355,14 @@ def _extract_md(entry: LexborNode | None) -> str | None:
     return rendered or None
 
 
+# Convert the children of an `.md` element to a markdown string.
 def _md_to_markdown(el: LexborNode) -> str:
     out: list[str] = []
     _render_children(el, out)
     return "".join(out).strip()
 
 
+# Append the markdown of every child of the element: text nodes verbatim, elements via _render_node.
 def _render_children(el: LexborNode, out: list[str]) -> None:
     for child in el.iter(include_text=True):
         if child.tag == "-text":
@@ -364,6 +371,8 @@ def _render_children(el: LexborNode, out: list[str]) -> None:
             _render_node(child, out)
 
 
+# Append the markdown of one HTML element chosen by its tag: paragraphs, inline emphasis and code,
+# links, quotes, lists, headings and rules; unknown containers just render their children.
 def _render_node(el: LexborNode, out: list[str]) -> None:
     tag = el.tag
     if tag in ("p", "div"):
@@ -451,6 +460,7 @@ def _render_list(list_el: LexborNode, ordered: bool, indent: int, out: list[str]
         if li.tag != "li":
             continue
         n += 1
+
         # Inline content of this <li>, excluding nested lists (rendered after).
         inline: list[str] = []
         for child in li.iter(include_text=True):
@@ -471,18 +481,19 @@ def _render_list(list_el: LexborNode, ordered: bool, indent: int, out: list[str]
         out.append("\n")
 
 
-# ─── DOM / value helpers ─────────────────────────────────────────────────────
+# DOM and value helpers
 
-
+# Return the class names of the node.
 def _classes(node: LexborNode) -> list[str]:
     return (node.attributes.get("class") or "").split()
 
 
+# Return True when the node's class list contains the given class.
 def _has_class(node: LexborNode, name: str) -> bool:
     return name in _classes(node)
 
 
-# First direct child element whose class list includes `cls`.
+# Return the first direct child element whose class list includes `cls`, or None.
 def _direct_child(node: LexborNode, cls: str) -> LexborNode | None:
     for child in node.iter():
         if _has_class(child, cls):
@@ -490,12 +501,14 @@ def _direct_child(node: LexborNode, cls: str) -> LexborNode | None:
     return None
 
 
+# Return the stripped text of the node and its descendants, or an empty string for None.
 def _node_text(node: LexborNode | None) -> str:
     if node is None:
         return ""
     return node.text(deep=True, separator="").strip()
 
 
+# Parse an attribute value as an integer, falling back to the default when it is missing or malformed.
 def _int_attr(value: str | None, default: int) -> int:
     try:
         return int(value)  # type: ignore[arg-type]
@@ -503,11 +516,14 @@ def _int_attr(value: str | None, default: int) -> int:
         return default
 
 
+# Parse the leading token of a score text such as "10 points" as an integer, or None if it is not a number.
 def _parse_score(text: str) -> int | None:
     parts = text.split()
     if not parts:
         return None
-    token = parts[0].replace("−", "-")  # unicode minus → ASCII
+
+    # Replace the unicode minus sign with an ASCII one so int() accepts negative scores.
+    token = parts[0].replace("−", "-")
     try:
         return int(token)
     except ValueError:

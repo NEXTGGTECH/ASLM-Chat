@@ -20,6 +20,7 @@ def rewrite_read_page_url(url: str) -> str:
     host = parsed.netloc.lower().removeprefix("www.").removeprefix("m.")
     path = parsed.path or "/"
 
+    # Only a plain product page is rewritten; known subpages are left as they are.
     if host == "dns-shop.ru" and path.startswith("/product/"):
         subpages = (
             "/product/characteristics/",
@@ -64,10 +65,12 @@ def dns_variant_urls(url: str) -> list[str]:
 def extract_dns_metadata(raw_html: str) -> dict[str, str]:
     meta: dict[str, str] = {}
 
+    # Title from the first <h1>.
     title_match = re.search(r"<h1[^>]*>(.*?)</h1>", raw_html, re.IGNORECASE | re.DOTALL)
     if title_match:
         meta["title"] = strip_html_fragment(title_match.group(1))[:180]
 
+    # Price from the buy block; DNS-shop prices are in RUB.
     price_match = re.search(
         r'<div[^>]+class="[^"]*product-buy__price[^"]*"[^>]*>(.*?)</div>',
         raw_html,
@@ -80,6 +83,7 @@ def extract_dns_metadata(raw_html: str) -> dict[str, str]:
             meta["price"] = price
             meta["currency"] = "RUB"
 
+    # Availability: the first status phrase (in stock, on order, out of stock) that normalizes to a value.
     availability_patterns = (
         r"В наличии[^<]{0,120}",
         r"Под заказ[^<]{0,120}",
@@ -94,6 +98,7 @@ def extract_dns_metadata(raw_html: str) -> dict[str, str]:
             meta["availability"] = availability
             break
 
+    # Fallback to pickup and delivery hints when no status phrase matched.
     if "availability" not in meta:
         fallback_patterns = (
             r"доступно\s*в\s*\d+\s*магазин",
@@ -108,6 +113,7 @@ def extract_dns_metadata(raw_html: str) -> dict[str, str]:
             if meta["availability"]:
                 break
 
+    # Summary from the meta description.
     summary_match = re.search(
         r'<meta\s+name="description"\s+content="([^"]+)"',
         raw_html,
@@ -116,6 +122,7 @@ def extract_dns_metadata(raw_html: str) -> dict[str, str]:
     if summary_match:
         meta["hero_summary"] = strip_html_fragment(summary_match.group(1))[:280]
 
+    # Up to six distinct spec lines from the characteristics list items.
     specs: list[str] = []
     for match in re.finditer(
         r'<li[^>]*class="[^"]*(?:characteristics|specs|spec)[^"]*"[^>]*>(.*?)</li>',
@@ -149,7 +156,7 @@ class DnsShopHandler:
     name = "dns_shop"
     fallback_to_generic = False
 
-    # True for dns-shop.ru product pages.
+    # Return True for dns-shop.ru pages.
     def matches(self, url: str) -> bool:
         return _host(url) == "dns-shop.ru"
 
@@ -161,4 +168,5 @@ class DnsShopHandler:
         )
 
 
+# Handler instance registered in custom_domains/__init__.py.
 HANDLER = DnsShopHandler()

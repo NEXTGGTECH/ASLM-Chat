@@ -12,6 +12,7 @@ from custom_domains.retail_common import format_price_value, normalize_availabil
 def extract_citilink_metadata(raw_html: str) -> dict[str, str]:
     meta: dict[str, str] = {}
 
+    # JSON-LD blocks: take the Product name/description and the offer price, currency and availability.
     for match in re.finditer(
         r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
         raw_html,
@@ -23,6 +24,7 @@ def extract_citilink_metadata(raw_html: str) -> dict[str, str]:
         try:
             data = json.loads(payload)
         except Exception:
+            # A malformed JSON-LD block is skipped; other blocks may still be valid.
             continue
         if not isinstance(data, dict):
             continue
@@ -47,17 +49,20 @@ def extract_citilink_metadata(raw_html: str) -> dict[str, str]:
             if normalized:
                 meta["availability"] = normalized
 
+    # Fallback to the inline page state when JSON-LD gave no price (Citilink prices are in RUB).
     price_match = re.search(r'"price"\s*:\s*\{\s*"current"\s*:\s*"([^"]+)"', raw_html, re.IGNORECASE)
     if price_match and "price" not in meta:
         meta["price"] = format_price_value(price_match.group(1))
         meta.setdefault("currency", "RUB")
 
+    # Same fallback for availability.
     availability_match = re.search(r'"availability"\s*:\s*"([^"]+)"', raw_html, re.IGNORECASE)
     if availability_match and "availability" not in meta:
         normalized = normalize_availability(availability_match.group(1).rsplit("/", 1)[-1])
         if normalized:
             meta["availability"] = normalized
 
+    # Collect up to six distinct spec names from the inline specs/characteristics arrays.
     specs: list[str] = []
     for match in re.finditer(
         r'"(?:specs?|characteristics?)"\s*:\s*\[(.*?)\]',

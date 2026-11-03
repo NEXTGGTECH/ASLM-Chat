@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+# Make the web search root importable when this file runs as a standalone script.
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -27,6 +28,7 @@ async def fetch_ebay_snapshot(url: str, timeout: float = 20.0, wait: float = 4.0
     # browser client (warm daemon, autostarted on first call).
     from core.fetch.browser.client import browser_fetch
 
+    # Retry the browser fetch until a non-blocked page with HTML comes back, then extract it.
     for attempt in range(1, attempts_per_engine + 1):
         result = await browser_fetch(url, nav_timeout=timeout, wait_sec=wait)
         html = result.html or ""
@@ -51,6 +53,7 @@ async def fetch_ebay_snapshot(url: str, timeout: float = 20.0, wait: float = 4.0
             )
             break
 
+    # Return the richest candidate, or an empty "blocked" snapshot when every attempt failed.
     if candidates:
         best = max(candidates, key=lambda item: (int(item["markdown_chars"]), int(item["raw_html_chars"])))
         best["duration_sec"] = round(time.perf_counter() - started, 3)
@@ -98,6 +101,7 @@ from urllib.parse import urlparse
 
 from custom_domains.base import FetchContext, PageResult
 
+# eBay marketplace hosts (without the www./m. prefix) that this handler serves.
 _EBAY_HOSTS = frozenset({
     "ebay.com", "ebay.co.uk", "ebay.de", "ebay.fr", "ebay.it",
 })
@@ -107,9 +111,10 @@ _EBAY_HOSTS = frozenset({
 class EbayHandler:
     name = "ebay"
     fallback_to_generic = True
-    scope = "read_page"  # retail page is heavy/antibot; snippet-only in web_search
+    # The retail page is heavy and behind anti-bot checks, so web_search keeps it snippet-only.
+    scope = "read_page"
 
-    # True for known eBay marketplace hosts.
+    # Return True for known eBay marketplace hosts.
     def matches(self, url: str) -> bool:
         host = urlparse(url).netloc.lower().removeprefix("www.").removeprefix("m.")
         return host in _EBAY_HOSTS
@@ -131,4 +136,5 @@ class EbayHandler:
         )
 
 
+# Handler instance registered in custom_domains/__init__.py.
 HANDLER = EbayHandler()

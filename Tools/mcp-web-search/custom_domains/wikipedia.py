@@ -1,7 +1,5 @@
 # Copyright NEXTGGTECH. Elastic License 2.0.
 
-"""Read Wikipedia articles through the official MediaWiki Action API."""
-
 from __future__ import annotations
 
 import html
@@ -13,6 +11,8 @@ from core.extract.page_normalizer import normalize_page
 
 from custom_domains.base import FetchContext, PageResult
 
+# Size cap for an API response (the body holds the complete rendered article HTML) and the
+# User-Agent sent to the API.
 _API_MAX_BYTES = 8 * 1024 * 1024
 _API_UA = "ASLM-Chat/1.0 (https://github.com/NGGTLightKeeper/ASLM-Chat)"
 
@@ -27,12 +27,14 @@ def _wikipedia_host(url: str) -> str:
     return host
 
 
-# Convert an article URL into its API endpoint and parse parameters.
+# Convert an article URL into its API endpoint and parse parameters. Return None for non-Wikipedia
+# URLs and for URLs that identify no article.
 def _api_request(url: str) -> tuple[str, dict[str, str]] | None:
     host = _wikipedia_host(url)
     if not host:
         return None
 
+    # Article identity: the /wiki/ title or /w/index.php?title=, plus optional oldid / curid.
     parsed = urlparse(url)
     query = parse_qs(parsed.query)
     title = ""
@@ -43,6 +45,9 @@ def _api_request(url: str) -> tuple[str, dict[str, str]] | None:
 
     oldid = (query.get("oldid") or [""])[0]
     pageid = (query.get("curid") or [""])[0]
+
+    # Parse request: follow redirects, return only the rendered text, and select the article by
+    # revision id, page id or title (in that order of preference).
     params = {
         "action": "parse",
         "prop": "text",
@@ -67,6 +72,7 @@ def _api_request(url: str) -> tuple[str, dict[str, str]] | None:
 async def _api_get_json(endpoint: str, params: dict[str, str], timeout: float) -> Any:
     import httpx
 
+    # Stream the body and abort once it exceeds the cap, whether declared or actual.
     headers = {"User-Agent": _API_UA, "Api-User-Agent": _API_UA}
     chunks: list[bytes] = []
     total = 0
@@ -86,6 +92,7 @@ async def _api_get_json(endpoint: str, params: dict[str, str], timeout: float) -
 
 # Turn API HTML into the same structured markdown used by the generic reader.
 def _payload_to_markdown(url: str, payload: Any) -> str:
+    # Pull the title and article HTML out of the parse payload; an unexpected shape yields "".
     if not isinstance(payload, dict):
         return ""
     parsed = payload.get("parse")
@@ -97,6 +104,8 @@ def _payload_to_markdown(url: str, payload: Any) -> str:
         article_html = article_html.get("*")
     if not isinstance(article_html, str) or not article_html.strip():
         return ""
+
+    # Wrap the fragment in a minimal HTML document so the generic normalizer can process it.
     document = (
         "<!doctype html><html><head><title>"
         + html.escape(title or url)
@@ -106,6 +115,8 @@ def _payload_to_markdown(url: str, payload: Any) -> str:
         + article_html
         + "</article></body></html>"
     )
+
+    # Normalize, then force the first heading to the exact API title.
     markdown = normalize_page(url, document, favor_recall=True)
     if title and markdown:
         lines = markdown.splitlines()
@@ -115,7 +126,8 @@ def _payload_to_markdown(url: str, payload: Any) -> str:
     return markdown
 
 
-# Fetch and normalize one Wikipedia article.
+# Fetch and normalize one Wikipedia article through the official MediaWiki Action API. Return
+# markdown, or an "Error: ..." string when the URL is unsupported or the API call fails.
 async def fetch_wikipedia_page(url: str, timeout: float = 20.0) -> str:
     request = _api_request(url)
     if request is None:
@@ -126,6 +138,7 @@ async def fetch_wikipedia_page(url: str, timeout: float = 20.0) -> str:
     except Exception as exc:
         return f"Error: Wikipedia API fetch failed for {url}: {exc}"
 
+    # Convert the payload, or report the API's own error message when there is nothing to show.
     markdown = _payload_to_markdown(url, payload)
     if markdown:
         return markdown
@@ -134,13 +147,16 @@ async def fetch_wikipedia_page(url: str, timeout: float = 20.0) -> str:
     return f"Error: Wikipedia API parse failed for {url}: {detail}"
 
 
+# Handler for Wikipedia articles; failures defer to the generic pipeline.
 class WikipediaHandler:
     name = "wikipedia"
     fallback_to_generic = True
 
+    # Return True when the URL identifies a Wikipedia article.
     def matches(self, url: str) -> bool:
         return _api_request(url) is not None
 
+    # Fetch the article through the API; an "Error:" result is reported as a failed PageResult.
     async def read(self, url: str, ctx: FetchContext) -> PageResult:
         markdown = await fetch_wikipedia_page(url, timeout=ctx.timeout)
         ok = bool(markdown) and not markdown.lstrip().lower().startswith("error:")
@@ -153,6 +169,7 @@ class WikipediaHandler:
         )
 
 
+# Handler instance registered in custom_domains/__init__.py.
 HANDLER = WikipediaHandler()
 
 __all__ = ["HANDLER", "WikipediaHandler", "fetch_wikipedia_page"]
