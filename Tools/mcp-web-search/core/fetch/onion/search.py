@@ -1,19 +1,5 @@
 # Copyright NEXTGGTECH. Elastic License 2.0.
 
-"""Deep onion search: discover article URLs on a vetted service via the hardened clearnet
-SERP (`site:<host> <query>`) → rewrite the clearnet host to its onion mirror → scrape those
-pages over Tor → BM25-compressed content returned directly (no bare-snippet SERP).
-
-Why SERP-scoped discovery instead of each site's internal search: per-site search paths rot
-(go SPA, 404/403, change without notice) and only one ever worked reliably. The onion mirror
-serves the SAME paths as the clearnet site, so the robust move is to let the already-hardened
-multi-engine SERP find the article URLs on the clearnet host, then swap the host to the onion
-mirror and fetch over Tor. Discovery is clearnet (fast, reliable) and consistent with the
-resolver, which already reaches the clearnet anchor; only the article fetch rides Tor. One SERP
-call per provider runs in parallel; the Tor scrapes run in parallel too, each bounded by a
-per-link timeout so one slow circuit can't stall the batch.
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -46,6 +32,8 @@ _LISTING_SEGMENTS = frozenset({
 _ARTICLE_RE = _re.compile(r"/(19|20)\d{2}/|/a-?\d{4,}\b|/\d{7,}\b")
 
 
+# One scraped onion article: its onion URL, host, extracted title, BM25-compressed content and
+# the name of the service (provider) it came from.
 @dataclass(slots=True)
 class OnionResult:
     url: str
@@ -69,8 +57,8 @@ def _is_article_path(path: str) -> bool:
     return bool(_ARTICLE_RE.search(path))
 
 
-# Names of the providers to search: explicit list (resolved to services) or, by default, every
-# vetted service in a searchable category.
+# Return the services to search: the explicit provider names (resolved to services, unknown names
+# dropped) or, by default, every vetted service in a searchable category.
 def _resolve_providers(providers: tuple[str, ...] | None):
     if providers is not None:
         out = [service_for(n) for n in providers]
@@ -88,12 +76,15 @@ async def _discover_for_service(svc, query: str, *, limit: int, serp_timeout: fl
     clearnet_host = _anchor_host(svc.clearnet_anchor)
     if not clearnet_host:
         return []
-    onion = resolve_onion(svc)                       # current onion URL (cached/seeded)
+
+    # Current onion URL (cached or seeded); without a host there is nothing to rewrite to.
+    onion = resolve_onion(svc)
     onion_parsed = urlparse(onion)
     onion_host, onion_scheme = onion_parsed.netloc, (onion_parsed.scheme or "http")
     if not onion_host:
         return []
 
+    # Search the clearnet host through the SERP; discovery is best-effort and soft-fails.
     try:
         result = await run_serp_search(
             f"site:{clearnet_host} {query}", timeout_seconds=serp_timeout, source_limit=limit
@@ -102,6 +93,8 @@ async def _discover_for_service(svc, query: str, *, limit: int, serp_timeout: fl
         logger.debug("onion discovery SERP failed for site:%s", clearnet_host, exc_info=True)
         return []
 
+    # Collect unique article URLs of this service from every engine, rewritten to the onion
+    # mirror (it serves the same paths as the clearnet site), up to the limit.
     out: list[tuple[str, str]] = []
     seen: set[str] = set()
     for engine in (result.get("engines") or {}).values():
@@ -111,6 +104,7 @@ async def _discover_for_service(svc, query: str, *, limit: int, serp_timeout: fl
                 continue
             p = urlparse(u)
             host = p.netloc.lower().removeprefix("www.")
+
             # Keep only results actually on this service's domain (site: is advisory, not law).
             if host != clearnet_host and not host.endswith("." + clearnet_host):
                 continue
@@ -134,6 +128,7 @@ async def _scrape_one(url: str, query: str, provider: str, *, timeout: float, ma
     from core.fetch.antibot import is_antibot
     from core.fetch.thread_pool import io_pool as _io_pool
 
+    # Fetch over Tor with a hard outer bound slightly above the fetch timeout.
     try:
         r = await asyncio.wait_for(onion_fetch(url, timeout=timeout), timeout=timeout + 5)
     except asyncio.TimeoutError:
@@ -142,6 +137,8 @@ async def _scrape_one(url: str, query: str, provider: str, *, timeout: float, ma
     except Exception:  # noqa: BLE001 — one failed source must not sink the search
         logger.warning("onion fetch raised provider=%s url=%r", provider, url, exc_info=True)
         return None
+
+    # Reject failed responses and anti-bot walls.
     if not r.ok or not r.text:
         logger.warning(
             "onion fetch failed provider=%s url=%r http_status=%d error=%s",
@@ -154,6 +151,8 @@ async def _scrape_one(url: str, query: str, provider: str, *, timeout: float, ma
     if is_antibot(r.text):
         logger.warning("onion fetch returned an antibot wall provider=%s url=%r", provider, url)
         return None
+
+    # Convert the HTML to markdown in the io pool (CPU-bound), bounded to 10 seconds.
     loop = asyncio.get_running_loop()
     try:
         md = await asyncio.wait_for(
@@ -166,6 +165,8 @@ async def _scrape_one(url: str, query: str, provider: str, *, timeout: float, ma
     except Exception:  # noqa: BLE001 — one failed extraction must not sink the search
         logger.warning("onion extraction failed provider=%s url=%r", provider, url, exc_info=True)
         return None
+
+    # Reject pages without extractable content, then compress to the character budget.
     if not has_extractable_content(md):
         logger.warning(
             "onion extraction returned no page content provider=%s url=%r html_len=%d",
@@ -178,6 +179,8 @@ async def _scrape_one(url: str, query: str, provider: str, *, timeout: float, ma
     if not content.strip():
         logger.warning("onion compression returned no content provider=%s url=%r", provider, url)
         return None
+
+    # The title is the first non-empty line of the content, stripped of markdown heading marks.
     title = next((ln.lstrip("# ").strip() for ln in (content or md).splitlines() if ln.strip()), url)
     return OnionResult(url=url, host=urlparse(url).netloc, title=title[:200],
                        content=content, provider=provider)
@@ -195,13 +198,19 @@ async def _warm_tor(budget: float) -> bool:
             loop.run_in_executor(_io_pool, resolve_socks), timeout=budget
         )
     except Exception:  # noqa: BLE001
+        # A failed or timed-out probe means tor is unusable, which is reported as False.
         return False
     return socks is not None
 
 
-# Deep onion search: discover article URLs via the clearnet SERP, then scrape+compress the top
-# results over Tor — discovery and scraping each parallel and per-link bounded. Returns
-# BM25-compressed content records.
+# Deep onion search: discover article URLs on vetted services via the hardened clearnet SERP
+# (`site:<host> <query>`), rewrite the clearnet host to its onion mirror, scrape those pages over
+# Tor and return the BM25-compressed content directly (no bare-snippet SERP). Discovery and
+# scraping each run in parallel and per-link bounded, so one slow circuit cannot stall the batch.
+# SERP-scoped discovery is used instead of each site's internal search because per-site search
+# paths rot (SPA rewrites, 404/403, silent changes). The onion mirror serves the SAME paths as
+# the clearnet site, so discovery stays clearnet (fast, reliable, like the resolver reaching the
+# clearnet anchor) and only the article fetch rides Tor.
 async def onion_search(
     query: str, *, limit: int = 5, per_link_timeout: float = 20.0,
     max_chars: int = 4000, concurrency: int = 4, providers: tuple[str, ...] | None = None,
@@ -209,6 +218,7 @@ async def onion_search(
     services = _resolve_providers(providers)
     if not services:
         return []
+
     # Discovery is clearnet, so a normal SERP timeout suffices — no Tor cold-start budget needed.
     serp_timeout = min(max(per_link_timeout, 8.0), 12.0)
 
@@ -234,6 +244,7 @@ async def onion_search(
     # 3. Scrape + compress the candidates in parallel, bounded by a semaphore.
     sem = asyncio.Semaphore(max(1, concurrency))
 
+    # Scrape one candidate while holding a concurrency slot.
     async def _guarded(name: str, url: str):
         async with sem:
             return await _scrape_one(url, query, name, timeout=per_link_timeout, max_chars=max_chars)

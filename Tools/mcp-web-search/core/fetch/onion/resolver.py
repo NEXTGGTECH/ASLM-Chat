@@ -1,14 +1,5 @@
 # Copyright NEXTGGTECH. Elastic License 2.0.
 
-"""Resolve the current onion address of a vetted service from its clearnet anchor.
-
-Trust model: the address comes from the service's OWN TLS clearnet site (its
-`Onion-Location` header), fetched over clearnet (not Tor) so the https cert anchors trust.
-A v3 onion self-authenticates on connect, so a refreshed address can't be MITM'd, and an
-operator key rotation is picked up automatically. The seeded `onion` is only a fallback
-when the anchor is unreachable. Results are cached with a TTL so we refresh rarely.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -20,9 +11,13 @@ from .registry import load_services
 
 logger = logging.getLogger("core.fetch.onion.resolver")
 
-_DEFAULT_TTL = 86_400.0   # 24h — onion addresses are stable; refresh is cheap insurance
+# How long a resolved address stays cached: 24 hours, since onion addresses are stable and a
+# refresh is cheap insurance.
+_DEFAULT_TTL = 86_400.0
+
+# Resolved-address cache keyed by service name, holding (onion_url, fetched_at), and its lock.
 _lock = threading.Lock()
-_cache: dict[str, tuple[str, float]] = {}   # name -> (onion_url, fetched_at)
+_cache: dict[str, tuple[str, float]] = {}
 
 
 # Read a clearnet anchor's Onion-Location header over plain https (TLS-verified, no Tor).
@@ -39,16 +34,24 @@ def _fetch_onion_location(anchor: str, timeout: float) -> str | None:
     return value.strip() if value else None
 
 
-# Current onion URL for a service: cached if fresh, else refreshed from the clearnet anchor,
-# else the seeded fallback. Never raises — always returns a usable URL (seed at worst).
+# Return the current onion URL for a service: cached if fresh, else refreshed from the clearnet
+# anchor, else the seeded fallback. Never raises — always returns a usable URL (seed at worst).
+# Trust model: the address comes from the service's OWN TLS clearnet site (its Onion-Location
+# header), fetched over clearnet (not Tor) so the https certificate anchors trust. A v3 onion
+# self-authenticates on connect, so a refreshed address cannot be MITM'd, and an operator key
+# rotation is picked up automatically. The seeded onion is only a fallback when the anchor is
+# unreachable.
 def resolve_onion(service: OnionService, *, ttl: float = _DEFAULT_TTL,
                   timeout: float = 20.0, force: bool = False) -> str:
     now = time.time()
+
+    # Serve a fresh cached address unless a refresh is forced.
     with _lock:
         hit = _cache.get(service.name)
         if hit and not force and now - hit[1] < ttl:
             return hit[0]
 
+    # Refresh from the anchor, falling back to the seed, and cache the result either way.
     fresh = _fetch_onion_location(service.clearnet_anchor, timeout)
     addr = fresh or service.onion
     if fresh and fresh != service.onion:
@@ -58,12 +61,12 @@ def resolve_onion(service: OnionService, *, ttl: float = _DEFAULT_TTL,
     return addr
 
 
-# Refresh every vetted service's address (e.g. a periodic warm). Returns name -> url.
+# Resolve every vetted service's address (e.g. a periodic warm) and return a name -> url map.
 def resolve_all(*, ttl: float = _DEFAULT_TTL, timeout: float = 20.0) -> dict[str, str]:
     return {s.name: resolve_onion(s, ttl=ttl, timeout=timeout) for s in load_services()}
 
 
-# Drop the resolver cache (tests / forced refresh).
+# Clear the resolver cache (tests / forced refresh).
 def reset_cache() -> None:
     with _lock:
         _cache.clear()
