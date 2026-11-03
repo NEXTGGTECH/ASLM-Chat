@@ -1,4 +1,4 @@
-﻿# Copyright NEXTGGTECH. Elastic License 2.0.
+# Copyright NEXTGGTECH. Elastic License 2.0.
 
 from __future__ import annotations
 
@@ -24,6 +24,7 @@ NOISY_URL_HOSTS = {
     "bing.com",
 }
 
+# Lowercased line prefixes of search-tool boilerplate (citation instructions, result headers) that is dropped.
 RAW_TOOL_NOISE_MARKERS = (
     "citation rules",
     "cite search evidence",
@@ -32,6 +33,8 @@ RAW_TOOL_NOISE_MARKERS = (
     "search results for:",
 )
 
+
+# Compression decision
 
 # Snapshot returned when evaluating whether history compression should run.
 @dataclass
@@ -50,6 +53,7 @@ def resolve_context_window_tokens(
     active_engine: str = "",
     active_model: str = "",
 ) -> int:
+    # Coerce a value to a positive int, returning 0 for bools, None, non-numbers and non-positive numbers.
     def _positive_int(value: Any) -> int:
         if isinstance(value, bool) or value is None:
             return 0
@@ -101,7 +105,8 @@ def resolve_context_window_tokens(
 
     model_key = f"{active_engine}:{active_model}" if active_engine and active_model else ""
     targets: list[dict[str, Any]] = []
-    # Search active model first, then the engine default, then any registered model.
+
+    # Search the requested model first, then the model marked active in the registry, then every registered model.
     if model_key and isinstance(models.get(model_key), dict):
         targets.append(models[model_key])
     active = payload.get("active", {})
@@ -114,6 +119,7 @@ def resolve_context_window_tokens(
         if isinstance(item, dict):
             targets.append(item)
 
+    # The configured context window of the first target that defines one wins over any model limit.
     for target in targets:
         limits = target.get("limits", {})
         if not isinstance(limits, dict):
@@ -122,6 +128,7 @@ def resolve_context_window_tokens(
         if context_window:
             return context_window
 
+    # No configured window anywhere: use the first model_context_limit.
     for target in targets:
         limits = target.get("limits", {})
         if not isinstance(limits, dict):
@@ -145,6 +152,7 @@ def decide_compression(
     debug_force_4k: bool = False,
     trigger_ratio: float = 0.80,
 ) -> CompressionDecision:
+    # Resolve the context window, which debug mode overrides with a fixed 4096 tokens.
     context_window_tokens = resolve_context_window_tokens(
         model_info_payload,
         runtime_metadata_path=runtime_metadata_path,
@@ -154,6 +162,7 @@ def decide_compression(
     if debug_force_4k:
         context_window_tokens = 4096
 
+    # Compression is enabled once the used history reaches trigger_ratio (clamped to 0..1) of the budget.
     threshold = int(max(0, history_budget_chars) * max(0.0, min(1.0, trigger_ratio)))
     enabled = history_budget_chars > 0 and used_history_chars >= threshold
     reason = f"used={used_history_chars}, threshold={threshold}, budget={history_budget_chars}, ctx={context_window_tokens}"
@@ -164,6 +173,8 @@ def decide_compression(
         reason=reason,
     )
 
+
+# Transcript text cleanup
 
 # Remove model control tokens and thinking wrappers from transcript text.
 def _strip_control_tokens(text: str) -> str:
@@ -184,6 +195,8 @@ def _entry_text(entry: dict[str, Any], max_chars: int = COMPRESSION_ENTRY_MAX_CH
         raw = raw[:max_chars].rstrip() + "..."
     return f"{role}: {raw}" if raw else f"{role}:"
 
+
+# URL and path validation
 
 # Return True when a URL points at localhost, Bing, or other low-value hosts.
 def _is_noisy_url(url: str) -> bool:
@@ -315,6 +328,8 @@ def _looks_like_valid_path(value: str) -> bool:
     return True
 
 
+# Memory sanitization
+
 # Lowercased assistant phrases that indicate navigation filler, not durable facts.
 _ASSISTANT_NAV_PREFIXES = (
     "assistant: now let me",
@@ -342,6 +357,7 @@ def _passes_semantic_threshold(text: str) -> bool:
     if len(text) < 15:
         return False
     bare = text.rstrip(":").strip()
+
     # Title-cased text with digits is usually a real fact ("Django 5.2 REST API"),
     # not a heading fragment — only digit-free title case is treated as a heading.
     if bare and bare == bare.title() and not any(ch.isdigit() for ch in bare):
@@ -421,12 +437,14 @@ def _tool_observation_text(entry: dict[str, Any], max_chars: int = TOOL_OBSERVAT
     if not text:
         return ""
 
+    # Locate the tool name and the labeled fields (title, site, URL, error signal) in the cleaned output.
     tool_name = str(entry.get("tool_name") or entry.get("name") or entry.get("alias") or entry.get("tool_id") or "tool").strip()
     title_match = re.search(r"^\s*#\s+(.+)$", text, flags=re.MULTILINE)
     site_match = re.search(r"\*\*Site:\*\*\s*([^\n]+)", text)
     url_match = re.search(r"\*\*URL:\*\*\s*([^\n]+)", text)
     error_match = re.search(r"(Traceback[\s\S]{0,500}|[A-Za-z_]*Error:\s*[^\n]+|exit_code['\"]?\s*:\s*[1-9]\d*)", text)
 
+    # Lead with the labeled fields so they survive the length cap.
     parts: list[str] = []
     if tool_name:
         parts.append(f"Tool outcome from {tool_name}.")
@@ -439,6 +457,8 @@ def _tool_observation_text(entry: dict[str, Any], max_chars: int = TOOL_OBSERVAT
     if error_match:
         parts.append(f"Error signal: {error_match.group(1).strip()}.")
 
+    # Fill the remaining slots (up to 6 parts) with content lines, skipping boilerplate,
+    # link lists, noisy URLs and JSON objects.
     for line in _line_candidates(text):
         lowered = line.lower()
         if lowered.startswith(RAW_TOOL_NOISE_MARKERS):
@@ -455,6 +475,7 @@ def _tool_observation_text(entry: dict[str, Any], max_chars: int = TOOL_OBSERVAT
         if len(parts) >= 6:
             break
 
+    # Join into one line and clamp to the character budget.
     observation = " ".join(part for part in parts if part).strip()
     if len(observation) > max_chars:
         observation = observation[:max_chars].rstrip() + "..."
@@ -570,6 +591,8 @@ def _line_candidates(text: str) -> list[str]:
     return candidates
 
 
+# Summary payload
+
 # Return the canonical empty structured summary object.
 def _empty_summary_payload() -> dict[str, Any]:
     return {
@@ -595,16 +618,19 @@ def _raw_context_payload(
     warning: str = "",
     raw_model_output: str = "",
 ) -> dict[str, Any]:
+    # Collected artifacts and memory lines.
     urls: list[str] = []
     files: list[str] = []
     tools_used: list[str] = []
     source_memory: list[str] = []
 
+    # Patterns for URLs, and for Windows absolute paths or any name with a short extension.
     url_pattern = re.compile(r"https?://[^\s)>\]\"']+", flags=re.IGNORECASE)
     file_pattern = re.compile(r"(?:[A-Za-z]:\\[^\n\r\t*?\"<>|]+|[\w./\\-]+\.[A-Za-z0-9]{1,12})")
 
     # Harvest URLs, paths, tool names, and memory lines from each overflow turn.
     for entry in overflow_entries:
+        # Assistant thinking is not harvested; only content is.
         role = str(entry.get("role") or "").strip().lower()
         content = _strip_control_tokens(str(entry.get("content") or ""))
         thinking = "" if role == "assistant" else _strip_control_tokens(str(entry.get("thinking") or ""))
@@ -612,6 +638,7 @@ def _raw_context_payload(
         if not text:
             continue
 
+        # Keep non-noisy URLs and plausible file paths (web host paths and code fragments are rejected).
         urls.extend(url for url in (_clean_url(url) for url in url_pattern.findall(text)) if url)
         files.extend(
             file_name
@@ -621,6 +648,7 @@ def _raw_context_payload(
             and _looks_like_valid_path(file_name)
         )
 
+        # Tool entries only contribute their tool name; every other role contributes a sanitized memory line.
         if role == "tool":
             tool_name = str(entry.get("tool_name") or entry.get("name") or entry.get("alias") or entry.get("tool_id") or "").strip()
             if tool_name:
@@ -631,12 +659,17 @@ def _raw_context_payload(
             if memory_text and memory_text.strip().lower() not in {"assistant:", "user:"}:
                 source_memory.append(memory_text)
 
+    # The latest non-empty user message becomes the goal and focus; a warning becomes a risk flag.
     latest_user = next((msg for msg in recent_user_messages if str(msg or "").strip()), "")
     risk_flags = [warning] if warning else []
+
+    # Keep the unparsed model output (capped at 6000 chars) as the work summary so no information is lost.
     cleaned_raw_output = _clean_memory_text(raw_model_output)
     if len(cleaned_raw_output) > 6000:
         cleaned_raw_output = cleaned_raw_output[:6000].rstrip() + "..."
     work_summary = f"{{{cleaned_raw_output}}}" if cleaned_raw_output else "Raw compressed context was preserved without semantic extraction."
+
+    # Assemble the payload with per-field size limits.
     return {
         "summary_version": 1,
         "session_goal": _clean_memory_text(latest_user)[:900],
@@ -700,6 +733,7 @@ def _sanitize_summary_payload(model_payload: dict[str, Any]) -> dict[str, Any]:
             apply_semantic_threshold=(key == "key_facts"),
         )
 
+    # Keep only plausible file paths and non-noisy URLs, deduplicated, in the artifacts block.
     artifacts = merged.get("artifacts") if isinstance(merged.get("artifacts"), dict) else {}
     merged["artifacts"] = {
         "files": _dedupe_strings(
@@ -720,6 +754,7 @@ def _sanitize_summary_payload(model_payload: dict[str, Any]) -> dict[str, Any]:
 def _merge_model_summary_with_raw_context(model_payload: dict[str, Any], raw_payload: dict[str, Any]) -> dict[str, Any]:
     merged = _sanitize_summary_payload(model_payload)
 
+    # Append the harvested user messages and memory lines to the model's lists, then re-sanitize and re-cap them.
     for key in ("recent_user_messages", "source_memory"):
         max_chars = 900 if key == "recent_user_messages" else MEMORY_ENTRY_MAX_CHARS
         limit = 12 if key == "recent_user_messages" else 96
@@ -732,6 +767,7 @@ def _merge_model_summary_with_raw_context(model_payload: dict[str, Any], raw_pay
             allow_tool_memory=(key == "source_memory"),
         )
 
+    # Union the model's artifacts with the harvested ones, filtered and deduplicated the same way.
     artifacts = merged.get("artifacts") if isinstance(merged.get("artifacts"), dict) else {}
     raw_artifacts = raw_payload.get("artifacts") if isinstance(raw_payload.get("artifacts"), dict) else {}
     merged["artifacts"] = {
@@ -759,6 +795,7 @@ def _summary_text_from_payload(payload: dict[str, Any]) -> str:
 
 # Fit a summary into a character budget while preserving valid JSON.
 def fit_summary_text(summary_payload: dict[str, Any], max_chars: int) -> tuple[str, dict[str, Any]]:
+    # A missing or non-positive budget means no limit: return the payload as it is.
     try:
         budget = int(max_chars)
     except (TypeError, ValueError):
@@ -766,6 +803,7 @@ def fit_summary_text(summary_payload: dict[str, Any], max_chars: int) -> tuple[s
     if budget <= 0:
         return _summary_text_from_payload(summary_payload), summary_payload
 
+    # Work on a deep copy so the caller's payload is never mutated; a payload that already fits is returned as is.
     fitted = json.loads(json.dumps(summary_payload, ensure_ascii=False))
     if not isinstance(fitted, dict):
         fitted = {}
@@ -773,11 +811,13 @@ def fit_summary_text(summary_payload: dict[str, Any], max_chars: int) -> tuple[s
     if len(_summary_text_from_payload(fitted)) <= budget:
         return _summary_text_from_payload(fitted), fitted
 
+    # Record in the payload that content may have been dropped.
     risk_flags = fitted.get("risk_flags") if isinstance(fitted.get("risk_flags"), list) else []
     risk_flags.append("Compression summary was size-fitted; low-priority excerpts may be omitted.")
     fitted["risk_flags"] = risk_flags
 
-    # Drop or truncate lower-priority fields until the serialized summary fits.
+    # Drop or truncate lower-priority fields until the serialized summary fits: narrative fields are cut to
+    # a fixed length, list fields lose trailing items down to 8 entries.
     shrink_order = [
         "reflection_summary",
         "work_summary",
@@ -803,6 +843,7 @@ def fit_summary_text(summary_payload: dict[str, Any], max_chars: int) -> tuple[s
         while len(values) > 8 and len(_summary_text_from_payload(fitted)) > budget:
             values.pop()
 
+    # Still too large: trim the artifact lists the same way.
     artifacts = fitted.get("artifacts") if isinstance(fitted.get("artifacts"), dict) else {}
     for key in ("urls", "files", "tools_used"):
         values = artifacts.get(key)
@@ -811,6 +852,7 @@ def fit_summary_text(summary_payload: dict[str, Any], max_chars: int) -> tuple[s
         while len(values) > 8 and len(_summary_text_from_payload(fitted)) > budget:
             values.pop()
 
+    # Still too large: truncate individual long memory and fact entries.
     for key in ("source_memory", "key_facts"):
         values = fitted.get(key)
         if not isinstance(values, list):
@@ -822,6 +864,7 @@ def fit_summary_text(summary_payload: dict[str, Any], max_chars: int) -> tuple[s
             if len(text) > 700:
                 values[index] = text[:700].rstrip() + "..."
 
+    # Last resort: drop source_memory entries one by one until the text fits or none are left.
     while len(_summary_text_from_payload(fitted)) > budget:
         values = fitted.get("source_memory")
         if isinstance(values, list) and values:
@@ -832,11 +875,15 @@ def fit_summary_text(summary_payload: dict[str, Any], max_chars: int) -> tuple[s
     return _summary_text_from_payload(fitted), fitted
 
 
+# Model output parsing
+
 # Parse a JSON object from raw model text, including fenced or prose-wrapped payloads.
 def _extract_json_object(text: str) -> dict[str, Any] | None:
     raw = str(text or "").strip()
     if not raw:
         return None
+
+    # Unwrap a fenced code block first, then try the whole text as JSON.
     fence_match = re.search(r"```(?:json)?\s*([\s\S]*?)```", raw, flags=re.IGNORECASE)
     if fence_match:
         raw = fence_match.group(1).strip()
@@ -844,7 +891,10 @@ def _extract_json_object(text: str) -> dict[str, Any] | None:
         payload = json.loads(raw)
         return payload if isinstance(payload, dict) else None
     except ValueError:
+        # Not pure JSON; fall through to extracting the outermost braces below.
         pass
+
+    # Retry on the span from the first "{" to the last "}" to cope with prose around the object.
     start = raw.find("{")
     end = raw.rfind("}")
     if start != -1 and end > start:
@@ -905,7 +955,7 @@ MARKDOWN_SECTION_HEADINGS = {
 }
 
 
-# Map normalized headings and aliases back to internal summary field names.
+# Map normalized headings and aliases back to internal summary field names (filled once at import time).
 NORMALIZED_MARKDOWN_SECTIONS = {}
 for field_name, heading in MARKDOWN_SECTION_HEADINGS.items():
     NORMALIZED_MARKDOWN_SECTIONS[_normalize_markdown_heading(field_name)] = field_name
@@ -919,6 +969,8 @@ def _canonical_markdown_section(heading: str) -> str:
 
 # Parse fixed-section Markdown model output into a summary payload dict.
 def _extract_markdown_summary(text: str) -> dict[str, Any] | None:
+    # Split the text into sections keyed by field name. A "#" heading or a "Label:" line starts a section;
+    # every other line belongs to the current section. Lines before the first recognized heading are ignored.
     sections: dict[str, list[str]] = {}
     current = ""
     for raw_line in str(text or "").splitlines():
@@ -944,9 +996,11 @@ def _extract_markdown_summary(text: str) -> dict[str, Any] | None:
     if not sections:
         return None
 
+    # Return the collected lines of one section, or an empty list when the model omitted it.
     def section(field_name: str) -> list[str]:
         return sections.get(field_name, [])
 
+    # Fill the payload: narrative fields become text blocks, list fields become bullet items.
     payload = _empty_summary_payload()
     payload["session_goal"] = _markdown_block(section("session_goal"))
     payload["current_focus"] = _markdown_block(section("current_focus"))
@@ -963,6 +1017,7 @@ def _extract_markdown_summary(text: str) -> dict[str, Any] | None:
         "tools_used": _markdown_list_items(section("tools_used")),
     }
 
+    # Reject output that parsed into sections but carries no content at all.
     has_semantic_content = any(
         payload.get(key)
         for key in ("session_goal", "current_focus", "work_summary", "reflection_summary", "recent_user_messages", "key_facts", "open_tasks", "risk_flags", "source_memory")
@@ -977,6 +1032,8 @@ def _extract_summary_payload(text: str) -> dict[str, Any] | None:
     return _extract_json_object(text) or _extract_markdown_summary(text)
 
 
+# Summary construction
+
 # Build the structured history compression block and parsed payload metadata.
 def build_structured_history_summary(
     *,
@@ -986,6 +1043,8 @@ def build_structured_history_summary(
     summarize_with_model: Callable[[list[dict[str, str]]], str] | None,
     max_overflow_entries: int = 40,
 ) -> tuple[str, dict[str, Any]]:
+    # Limit the span to the most recent overflow entries and render the first and last ones
+    # as the model transcript.
     scoped_full = overflow_entries[-max(1, max_overflow_entries):]
     scoped = _scoped_context_entries(scoped_full)
     transcript_lines = []
@@ -995,12 +1054,14 @@ def build_structured_history_summary(
             transcript_lines.append(f"[{idx}] {entry_text}")
     transcript = "\n".join(transcript_lines)
 
+    # The raw harvest is always computed: it backs up and enriches whatever the model returns.
     summary_payload: dict[str, Any] | None = None
     raw_payload = _raw_context_payload(scoped_full, recent_user_messages)
     model_text = ""
 
     # Ask the model for contract Markdown when a callback is available.
     if summarize_with_model is not None and transcript.strip():
+        # System message sets the rules; the user message lists the required headings, field rules and the context.
         prompt_messages = [
             {
                 "role": "system",
@@ -1056,11 +1117,14 @@ def build_structured_history_summary(
                 ),
             },
         ]
+
+        # Run the model and parse its reply (JSON or Markdown sections).
         model_text = summarize_with_model(prompt_messages)
         summary_payload = _extract_summary_payload(model_text)
 
     # Fall back to raw harvest when the model output cannot be parsed.
     if not isinstance(summary_payload, dict):
+        # Warn only when a model was actually asked and gave unusable output.
         warning = ""
         if summarize_with_model is not None and transcript.strip():
             if _clean_memory_text(model_text):
@@ -1069,9 +1133,9 @@ def build_structured_history_summary(
                 warning = "Model returned empty summary output; raw compressed context was preserved."
         summary_payload = _raw_context_payload(scoped_full, recent_user_messages, warning=warning, raw_model_output=model_text)
     else:
+        # Parsed model output is sanitized and merged with the raw harvest.
         summary_payload = _merge_model_summary_with_raw_context(summary_payload, raw_payload)
 
     summary_payload.setdefault("summary_version", 1)
     summary_text = _summary_text_from_payload(summary_payload)
     return summary_text, summary_payload
-
