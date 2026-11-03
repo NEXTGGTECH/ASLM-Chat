@@ -26,7 +26,7 @@ pytestmark = [pytest.mark.component]
 
 # Cover fast attachment validation helpers.
 class AttachmentNormalizationTests(SimpleTestCase):
-    # Test invalid base64 attachments are ignored before persistence.
+    # Verify that an attachment whose data is not valid base64 is dropped from the normalized attachments.
     def test_invalid_base64_attachments_are_ignored(self):
         self.assertEqual(
             _normalize_request_attachments({
@@ -35,7 +35,8 @@ class AttachmentNormalizationTests(SimpleTestCase):
             [],
         )
 
-    # Test data URL attachments keep MIME, filename and decoded size.
+    # Verify that a data URL attachment is normalized to a file with its MIME type, name, base64 data, decoded
+    # size and order.
     def test_data_url_attachments_are_normalized_for_storage(self):
         attachments = _normalize_request_attachments({
             "attachments": [
@@ -54,7 +55,8 @@ class AttachmentNormalizationTests(SimpleTestCase):
         self.assertEqual(attachments[0]["size_bytes"], 5)
         self.assertEqual(attachments[0]["order"], 0)
 
-    # Test legacy image payloads are detected and named.
+    # Verify that a legacy bare base64 image is normalized to an image attachment with a generated name and
+    # the MIME type detected from its bytes.
     def test_legacy_image_payloads_are_normalized_with_detected_mime(self):
         attachments = _normalize_request_attachments({
             "images": ["iVBORw0KGgo="],
@@ -66,7 +68,7 @@ class AttachmentNormalizationTests(SimpleTestCase):
         self.assertEqual(attachments[0]["mime_type"], "image/png")
         self.assertEqual(attachments[0]["order"], 0)
 
-    # Test empty entries are skipped without breaking later order values.
+    # Verify that an attachment with empty data is skipped and the surviving attachment gets order 0.
     def test_attachment_order_uses_surviving_items_only(self):
         attachments = _normalize_request_attachments({
             "attachments": [
@@ -79,10 +81,10 @@ class AttachmentNormalizationTests(SimpleTestCase):
         self.assertEqual(attachments[0]["name"], "ok.txt")
         self.assertEqual(attachments[0]["order"], 0)
 
-# Attachment extraction tests.
+
 # Cover prompt text extraction and database caching for stored files.
 class AttachmentExtractionTests(TestCase):
-    # Cache extracted text back onto the attachment record.
+    # Verify that extracting the text of a stored text attachment decodes it and caches it on the record.
     def test_text_attachment_extraction_is_cached_on_record(self):
         chat = Chat.objects.create(title="Chat")
         message = Message.objects.create(chat=chat, role="user", content="See file")
@@ -103,7 +105,8 @@ class AttachmentExtractionTests(TestCase):
         self.assertTrue(attachment.extracted_text_ready)
         self.assertEqual(attachment.extracted_text, "Hello from file")
 
-    # Reuse cached text without trying to decode a broken payload.
+    # Verify that already cached extracted text is returned without decoding the stored data, which is
+    # deliberately invalid base64.
     def test_cached_attachment_text_is_reused(self):
         chat = Chat.objects.create(title="Chat")
         message = Message.objects.create(chat=chat, role="user", content="See file")
@@ -120,9 +123,11 @@ class AttachmentExtractionTests(TestCase):
 
         self.assertEqual(_extract_attachment_text(payload), "Cached text")
 
+
 # Cover the standalone manifest builder used by the upload layer.
 class UploadedFileManifestTests(SimpleTestCase):
-    # Test text files expose bounded previews instead of unbounded content.
+    # Verify that a large text file gets a truncated, bounded text preview together with its sandbox path and
+    # the sandbox and file search tool recommendations.
     def test_text_manifest_uses_bounded_preview(self):
         content = ("hello\n" * (TEXT_PREVIEW_CHAR_LIMIT // 6 + 100)).encode("utf-8")
 
@@ -144,7 +149,8 @@ class UploadedFileManifestTests(SimpleTestCase):
         self.assertIn("sandbox", manifest.recommended_tools)
         self.assertIn("file_search", manifest.recommended_tools)
 
-    # Test binary-looking files do not get decoded through permissive encodings.
+    # Verify that a binary-looking file gets no text preview or archive tree and is recommended only for the
+    # sandbox tool.
     def test_binary_manifest_does_not_expose_text_preview(self):
         payload = b"MZ\x00\x00\x03\x00" + bytes(range(32)) * 8
 
@@ -161,12 +167,12 @@ class UploadedFileManifestTests(SimpleTestCase):
         self.assertEqual(manifest.archive_tree, None)
         self.assertEqual(manifest.recommended_tools, ["sandbox"])
 
-    # Test uploaded names are reduced to safe basenames.
+    # Verify that upload names with POSIX or Windows parent directory segments are reduced to their basename.
     def test_upload_name_is_normalized_to_basename(self):
         self.assertEqual(normalize_upload_name("../secrets/.env"), ".env")
         self.assertEqual(normalize_upload_name(r"..\..\report.pdf"), "report.pdf")
 
-    # Test zip files include a bounded archive tree without unpacking.
+    # Verify that a zip file's manifest lists the archive entries and recommends the archive tool.
     def test_zip_manifest_includes_archive_tree(self):
         buffer = io.BytesIO()
         with zipfile.ZipFile(buffer, "w") as archive:
@@ -183,7 +189,7 @@ class UploadedFileManifestTests(SimpleTestCase):
         self.assertEqual(manifest.archive_tree, ["docs/readme.txt", "src/app.py"])
         self.assertIn("archive", manifest.recommended_tools)
 
-    # Test PDF files with a text layer expose a model-readable preview.
+    # Verify that a PDF with a text layer gets a text preview extracted from that layer.
     def test_pdf_manifest_extracts_text_layer(self):
         import fitz
 
@@ -202,7 +208,7 @@ class UploadedFileManifestTests(SimpleTestCase):
         self.assertTrue(manifest.text_available)
         self.assertIn("PDF upload text layer", manifest.text_preview or "")
 
-    # Test docx files expose text from their document XML.
+    # Verify that a docx file gets a text preview extracted from its word/document.xml.
     def test_docx_manifest_extracts_document_xml_text(self):
         buffer = io.BytesIO()
         with zipfile.ZipFile(buffer, "w") as archive:
@@ -224,7 +230,7 @@ class UploadedFileManifestTests(SimpleTestCase):
         self.assertTrue(manifest.text_available)
         self.assertIn("Word upload text", manifest.text_preview or "")
 
-    # Test pptx files expose slide text from their slide XML.
+    # Verify that a pptx file gets a text preview extracted from its slide XML.
     def test_pptx_manifest_extracts_slide_text(self):
         buffer = io.BytesIO()
         with zipfile.ZipFile(buffer, "w") as archive:
@@ -247,8 +253,10 @@ class UploadedFileManifestTests(SimpleTestCase):
         self.assertTrue(manifest.text_available)
         self.assertIn("Slide upload text", manifest.text_preview or "")
 
-    # Test xlsx files expose a small table preview from worksheet XML.
+    # Verify that an xlsx file gets a text preview and a table preview built from its shared strings and
+    # worksheet XML.
     def test_xlsx_manifest_extracts_sheet_text(self):
+        # Arrange: a minimal xlsx archive with a shared strings table and one worksheet of two rows.
         buffer = io.BytesIO()
         with zipfile.ZipFile(buffer, "w") as archive:
             archive.writestr(
@@ -271,17 +279,20 @@ class UploadedFileManifestTests(SimpleTestCase):
                 """,
             )
 
+        # Act
         manifest = build_uploaded_file_manifest(
             buffer.getvalue(),
             name="sheet.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
+        # Assert: the cells are joined into rows, with shared strings resolved.
         self.assertTrue(manifest.text_available)
         self.assertIn("Name | 42", manifest.text_preview or "")
         self.assertIn("Alice | 7", manifest.table_preview or "")
 
-    # Test non-vision image uploads keep metadata and sandbox access only.
+    # Verify that an image uploaded for a model without vision gets no vision or text access and is
+    # recommended only for the sandbox tool.
     def test_non_vision_image_manifest_keeps_sandbox_without_text(self):
         manifest = build_uploaded_file_manifest(
             b"\x89PNG\r\n\x1a\n",
@@ -296,9 +307,11 @@ class UploadedFileManifestTests(SimpleTestCase):
         self.assertEqual(manifest.sandbox_path, "/workspace/_sandbox/User/chat/file__photo.png")
         self.assertEqual(manifest.recommended_tools, ["sandbox"])
 
-# Cover the public upload contract without exposing model-only manifests.
+
+# Cover the upload and shared file endpoints, the private manifests and the model prompt blocks built from
+# them, without exposing model-only manifests in the public payload.
 class UploadFilesApiTests(TestCase):
-    # Isolate sandbox writes in a temporary directory.
+    # Redirect the upload and manifest storage roots into temporary directories.
     def setUp(self):
         super().setUp()
         self._upload_root_context = tempfile.TemporaryDirectory()
@@ -310,7 +323,7 @@ class UploadFilesApiTests(TestCase):
         self.upload_root_patch.start()
         self.manifest_root_patch.start()
 
-    # Clean up the temporary sandbox.
+    # Undo the storage root patches and remove the temporary directories.
     def tearDown(self):
         self.manifest_root_patch.stop()
         self.upload_root_patch.stop()
@@ -318,12 +331,15 @@ class UploadFilesApiTests(TestCase):
         self._upload_root_context.cleanup()
         super().tearDown()
 
-    # Test the upload API returns only card-safe fields while storing a private manifest.
+    # Verify that the upload endpoint returns only card-safe fields to the client and keeps the manifest, with
+    # the sandbox path and text preview, private in the manifest root.
     def test_upload_api_returns_public_file_card_payload_only(self):
+        # Act: upload one text file.
         upload = SimpleUploadedFile("notes.txt", b"Hello from upload", content_type="text/plain")
 
         response = self.client.post(reverse("uploads_api"), {"files": [upload], "scope": "chat-1"})
 
+        # Assert: the public payload has the card fields but no sha256, sandbox path or text preview.
         self.assertEqual(response.status_code, 200)
         payload = response.json()
         self.assertEqual(len(payload["files"]), 1)
@@ -336,6 +352,7 @@ class UploadFilesApiTests(TestCase):
         self.assertNotIn("sandbox_path", public_file)
         self.assertNotIn("text_preview", public_file)
 
+        # Assert: no manifest sits next to the uploaded file; the private one is stored by content hash.
         self.assertEqual(list(self.upload_root.glob("chat-1/*.manifest.json")), [])
         self.assertEqual(list(self.upload_root.glob("pending/*.manifest.json")), [])
         manifests = list(self.manifest_root.glob("*/*.manifest.json"))
@@ -346,7 +363,7 @@ class UploadFilesApiTests(TestCase):
         self.assertEqual(manifests[0].parent.name, private_manifest["sha256"])
         self.assertTrue(private_manifest["sandbox_path"].startswith(f"/workspace/_sandbox/User/{private_manifest['sha256']}/"))
 
-    # Test archive uploads get a simple English card label.
+    # Verify that a zip upload is labeled as an archive with the "ZIP archive" card label.
     def test_upload_api_labels_zip_archive_for_card(self):
         buffer = io.BytesIO()
         with zipfile.ZipFile(buffer, "w") as archive:
@@ -360,8 +377,10 @@ class UploadFilesApiTests(TestCase):
         self.assertEqual(public_file["display_kind"], "archive")
         self.assertEqual(public_file["type_label"], "ZIP archive")
 
-    # Test unusual extensions are accepted and routed as generic files.
+    # Verify that a file with an unknown extension is accepted as a generic file and gets a private manifest
+    # without text and with a sandbox path.
     def test_upload_api_accepts_unknown_extension_as_generic_file(self):
+        # Act: upload a file with an unknown extension.
         upload = SimpleUploadedFile(
             "sample.abc",
             b"custom binary-ish payload",
@@ -370,6 +389,7 @@ class UploadFilesApiTests(TestCase):
 
         response = self.client.post(reverse("uploads_api"), {"files": [upload], "scope": "chat-abc"})
 
+        # Assert: the public card is a ready generic file.
         self.assertEqual(response.status_code, 200)
         public_file = response.json()["files"][0]
         self.assertEqual(public_file["name"], "sample.abc")
@@ -377,6 +397,7 @@ class UploadFilesApiTests(TestCase):
         self.assertEqual(public_file["display_kind"], "file")
         self.assertEqual(public_file["type_label"], "File")
 
+        # Assert: only the private manifest exists, stored by content hash.
         self.assertEqual(list(self.upload_root.glob("chat-abc/*.manifest.json")), [])
         self.assertEqual(list(self.upload_root.glob("pending/*.manifest.json")), [])
         manifests = list(self.manifest_root.glob("*/*.manifest.json"))
@@ -388,11 +409,12 @@ class UploadFilesApiTests(TestCase):
         self.assertFalse(private_manifest["text_available"])
         self.assertTrue(private_manifest["sandbox_path"].startswith(f"/workspace/_sandbox/User/{private_manifest['sha256']}/"))
 
-    # Test the configured upload ceiling matches the advertised large-video contract.
+    # Verify that the maximum upload size is 16 GiB, the limit advertised for large videos.
     def test_upload_limit_is_16_gb(self):
         self.assertEqual(upload_storage.MAX_UPLOAD_BYTES, 16 * 1024 * 1024 * 1024)
 
-    # Test uploads beyond the inline manifest threshold are stored without full in-memory extraction.
+    # Verify that an upload larger than the inline manifest threshold is stored whole and gets a lightweight
+    # manifest with its size but no text preview.
     def test_upload_api_uses_lightweight_manifest_after_inline_threshold(self):
         upload = SimpleUploadedFile("clip.mp4", b"12345", content_type="video/mp4")
 
@@ -417,7 +439,7 @@ class UploadFilesApiTests(TestCase):
         self.assertEqual(len(stored_files), 1)
         self.assertEqual(stored_files[0].read_bytes(), b"12345")
 
-    # Test oversize uploads are rejected before being stored.
+    # Verify that an upload larger than the maximum size is reported as an error entry and writes no manifest.
     def test_upload_api_reports_oversized_files(self):
         upload = SimpleUploadedFile("too-big.mp4", b"12345", content_type="video/mp4")
 
@@ -430,7 +452,8 @@ class UploadFilesApiTests(TestCase):
         self.assertIn("File is too large", public_file["error"])
         self.assertEqual(list(self.manifest_root.glob("*/*.manifest.json")), [])
 
-    # Test media content endpoint supports suffix ranges needed by MP4 metadata reads.
+    # Verify that the uploaded file content endpoint answers a suffix byte range (the last 4 bytes) with a
+    # 206 response, as MP4 metadata reads need.
     def test_uploaded_file_content_supports_suffix_byte_range(self):
         upload = SimpleUploadedFile("clip.mp4", b"0123456789", content_type="video/mp4")
         upload_response = self.client.post(reverse("uploads_api"), {"files": [upload]})
@@ -444,7 +467,8 @@ class UploadFilesApiTests(TestCase):
         self.assertEqual(response["Content-Range"], "bytes 6-9/10")
         self.assertEqual(b"".join(response.streaming_content), b"6789")
 
-    # Test open-ended media ranges are chunked so playback can start without reading the rest of a large file.
+    # Verify that an open-ended byte range is cut to the media chunk size, so playback can start without
+    # reading the rest of a large file.
     def test_uploaded_file_content_chunks_open_ended_range(self):
         upload = SimpleUploadedFile("clip.mp4", b"0123456789", content_type="video/mp4")
         upload_response = self.client.post(reverse("uploads_api"), {"files": [upload]})
@@ -461,7 +485,7 @@ class UploadFilesApiTests(TestCase):
         self.assertEqual(response["Content-Range"], "bytes 2-5/10")
         self.assertEqual(b"".join(response.streaming_content), b"2345")
 
-    # Test model-shared files use the same range streaming path as uploaded files.
+    # Verify that the shared file download endpoint also answers a suffix byte range with a 206 response.
     def test_shared_file_download_supports_byte_range(self):
         with tempfile.NamedTemporaryFile(delete=False) as handle:
             handle.write(b"abcdefghij")
@@ -480,7 +504,8 @@ class UploadFilesApiTests(TestCase):
         finally:
             temp_path.unlink(missing_ok=True)
 
-    # Test reveal endpoint applies path validation before opening the file manager.
+    # Verify that the reveal endpoint resolves the shared file path first and opens the file manager on
+    # the resolved target.
     @patch("Apps.UI.views._reveal_file_in_file_manager")
     @patch("Apps.UI.views._resolve_shared_file_path")
     def test_shared_file_reveal_opens_validated_target(self, resolve_mock, reveal_mock):
@@ -498,7 +523,7 @@ class UploadFilesApiTests(TestCase):
         resolve_mock.assert_called_once_with("/workspace/_sandbox/User/report.svg")
         reveal_mock.assert_called_once_with(target)
 
-    # Test missing or forbidden shared files are never sent to the file manager.
+    # Verify that a shared file path that cannot be resolved returns a 404 and never reaches the file manager.
     @patch("Apps.UI.views._reveal_file_in_file_manager")
     @patch("Apps.UI.views._resolve_shared_file_path", side_effect=FileNotFoundError)
     def test_shared_file_reveal_rejects_invalid_target(self, _resolve_mock, reveal_mock):
@@ -511,7 +536,7 @@ class UploadFilesApiTests(TestCase):
         self.assertEqual(response.status_code, 404)
         reveal_mock.assert_not_called()
 
-    # Test Windows reveal uses Explorer's select-file argument.
+    # Verify that on Windows the file manager helper starts Explorer with the select argument for the file.
     @patch("Apps.UI.views.subprocess.Popen")
     def test_reveal_file_manager_selects_file_on_windows(self, popen_mock):
         target = Path("C:/sandbox/User/report.svg")
@@ -526,8 +551,10 @@ class UploadFilesApiTests(TestCase):
             close_fds=True,
         )
 
-    # Test dynamic shared images render inline while the card link remains a download.
+    # Verify that an animated GIF is served inline for a preview request and as an attachment for a plain
+    # download request.
     def test_shared_file_dynamic_image_preview_is_inline(self):
+        # Arrange: a minimal two-frame animated GIF saved as a temporary file.
         animated_gif = bytes.fromhex(
             "47494638396101000100800000000000ffffff"
             "21ff0b4e45545343415045322e300301000000"
@@ -539,6 +566,7 @@ class UploadFilesApiTests(TestCase):
             handle.write(animated_gif)
             temp_path = Path(handle.name)
         try:
+            # Act: request the file once as a preview and once as a plain download.
             with patch("Apps.UI.views._resolve_shared_file_path", return_value=temp_path):
                 preview_response = self.client.get(
                     reverse("shared_file_download_api"),
@@ -549,6 +577,7 @@ class UploadFilesApiTests(TestCase):
                     {"path": str(temp_path), "name": "animated.gif"},
                 )
 
+            # Assert: the preview is the inline GIF and the download is an attachment.
             self.assertEqual(preview_response.status_code, 200)
             self.assertEqual(preview_response["Content-Type"], "image/gif")
             self.assertTrue(preview_response["Content-Disposition"].startswith("inline;"))
@@ -558,7 +587,7 @@ class UploadFilesApiTests(TestCase):
         finally:
             temp_path.unlink(missing_ok=True)
 
-    # Test shared-file downloads are limited to the sandbox workspace.
+    # Verify that a shared file download of an absolute project path outside the sandbox workspace returns 404.
     def test_shared_file_download_rejects_project_absolute_path(self):
         response = self.client.get(
             reverse("shared_file_download_api"),
@@ -567,7 +596,8 @@ class UploadFilesApiTests(TestCase):
 
         self.assertEqual(response.status_code, 404)
 
-    # Test container-style sandbox paths are still mapped to the host sandbox.
+    # Verify that a container-style /workspace/_sandbox path is mapped to the host sandbox folder and the
+    # file is downloaded from there.
     def test_shared_file_download_allows_container_sandbox_path(self):
         sandbox_file = Path("Tools/mcp-sandbox/_sandbox/User/shared-test.txt")
         sandbox_file.parent.mkdir(parents=True, exist_ok=True)
@@ -583,14 +613,15 @@ class UploadFilesApiTests(TestCase):
         finally:
             sandbox_file.unlink(missing_ok=True)
 
-    # Test empty upload requests fail before returning a card payload.
+    # Verify that an upload request without files returns a 400 error.
     def test_upload_api_requires_files(self):
         response = self.client.post(reverse("uploads_api"), {})
 
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.json()["error"], "No files uploaded")
 
-    # Test model-facing upload manifests do not expose sandbox paths unless selected.
+    # Verify that the model-facing manifest has no sandbox path and no sandbox tool recommendation unless the
+    # sandbox is enabled.
     def test_model_upload_manifest_respects_sandbox_selection(self):
         upload = SimpleUploadedFile("notes.txt", b"Hello from upload", content_type="text/plain")
         response = self.client.post(reverse("uploads_api"), {"files": [upload], "scope": "chat-1"})
@@ -604,7 +635,8 @@ class UploadFilesApiTests(TestCase):
         self.assertTrue(with_sandbox["sandbox_path"].startswith(f"/workspace/_sandbox/User/{with_sandbox['sha256']}/"))
         self.assertIn("sandbox", with_sandbox["recommended_tools"])
 
-    # JSON uploads are sent as complete text context rather than a short preview.
+    # Verify that an uploaded JSON file is added to the model message as full JSON content, including its
+    # tail, instead of a short text preview.
     def test_uploaded_json_is_added_to_model_context(self):
         json_payload = json.dumps({"items": list(range(8000)), "tail": "context-tail"})
         upload = SimpleUploadedFile("payload.json", json_payload.encode("utf-8"), content_type="application/json")
@@ -621,7 +653,8 @@ class UploadFilesApiTests(TestCase):
         self.assertIn('"tail": "context-tail"', entry["content"])
         self.assertNotIn("Text preview:", entry["content"])
 
-    # Uploaded media bytes are attached only for model-supported modalities.
+    # Verify that uploaded audio is attached to the model message as media only when audio is among the
+    # modalities the model supports.
     def test_uploaded_media_is_gated_by_model_capabilities(self):
         upload = SimpleUploadedFile("voice.mp3", b"fake-mp3-bytes", content_type="audio/mpeg")
         response = self.client.post(reverse("uploads_api"), {"files": [upload]})
@@ -643,7 +676,8 @@ class UploadFilesApiTests(TestCase):
         self.assertEqual(supported_entry["media"][0]["kind"], "audio")
         self.assertEqual(supported_entry["media"][0]["data"], "ZmFrZS1tcDMtYnl0ZXM=")
 
-    # Test the private prompt block only includes sandbox path when allowed.
+    # Verify that the prompt block of a manifest without a sandbox path lists the file and its text preview
+    # but no sandbox path line.
     def test_uploaded_file_prompt_block_hides_disabled_sandbox_path(self):
         manifest = {
             "file_id": "file-1",
@@ -662,7 +696,8 @@ class UploadFilesApiTests(TestCase):
         self.assertIn("Text preview:\nHello", block)
         self.assertNotIn("Sandbox path:", block)
 
-    # Verify uploaded archive prompt block says preview not extracted.
+    # Verify that the prompt block of an archive manifest lists the archive entries as a preview and states
+    # that the archive has not been extracted.
     def test_uploaded_archive_prompt_block_says_preview_not_extracted(self):
         manifest = {
             "file_id": "file-zip",
@@ -682,7 +717,8 @@ class UploadFilesApiTests(TestCase):
         self.assertNotIn("Archive tree:", block)
         self.assertIn("- bundle/manage.py", block)
 
-    # Test upload file ids can be read from current and future request shapes.
+    # Verify that uploaded file ids are collected, without duplicates, from the uploaded id list and from
+    # attachments that carry a file id.
     def test_uploaded_file_ids_are_normalized_from_request_shapes(self):
         self.assertEqual(
             _normalize_uploaded_file_ids({
@@ -692,7 +728,8 @@ class UploadFilesApiTests(TestCase):
             ["a", "b", "c"],
         )
 
-    # Test upload ids can be persisted on a user message for regenerate/history replay.
+    # Verify that the uploaded file ids stored in a message transcript entry can be read back from the
+    # message, without duplicates, for regeneration and history replay.
     def test_uploaded_file_context_entry_round_trips_file_ids(self):
         entry = _build_uploaded_file_context_entry(["file-1", "file-2", "file-1"])
         message = Message(role="user", content="read this", llm_transcript=[entry])
@@ -700,15 +737,16 @@ class UploadFilesApiTests(TestCase):
         self.assertEqual(entry["type"], "uploaded_file_context")
         self.assertEqual(_extract_uploaded_file_ids_from_message(message), ["file-1", "file-2"])
 
-    # Test sandbox state is derived only from resolved tool servers.
+    # Verify that the sandbox counts as selected only when a resolved tool server with the sandbox id is present.
     def test_selected_tools_include_sandbox_only_when_resolved(self):
         self.assertTrue(_selected_tools_include_sandbox([{"id": "sandbox"}]))
         self.assertFalse(_selected_tools_include_sandbox([{"id": "other"}]))
         self.assertFalse(_selected_tools_include_sandbox([]))
 
-# Cover file type classification used by public upload cards.
+
+# Cover the file type classification used by public upload cards.
 class UploadRoutingTests(SimpleTestCase):
-    # Test routing common file types to stable card labels.
+    # Verify that common file types are routed to their display kind and card label.
     def test_display_kind_routes_known_file_types(self):
         cases = [
             ("photo.png", "image/png", ("image", "Image")),
@@ -726,7 +764,7 @@ class UploadRoutingTests(SimpleTestCase):
             with self.subTest(name=name):
                 self.assertEqual(display_kind_for_upload(name, mime), expected)
 
-    # Test unknown extensions fall back to generic File, not rejection.
+    # Verify that unknown or missing extensions fall back to the generic "File" kind instead of being rejected.
     def test_display_kind_routes_unknown_extension_to_file(self):
         self.assertEqual(display_kind_for_upload("mystery.abc", "application/x-abc"), ("file", "File"))
         self.assertEqual(display_kind_for_upload("no-extension", "application/octet-stream"), ("file", "File"))

@@ -32,9 +32,9 @@ class EngineAvailabilitySettingsTests(SimpleTestCase):
                     project_settings._invalidate_settings_cache()
                     assertion()
 
-    # Test supported engines only includes enabled engine flags.
+    # Verify that the supported engine list contains only the engines whose settings flag is enabled.
     def test_supported_engines_only_includes_enabled_flags(self):
-        # Assertion.
+        # Check the supported engine list against the two enabled engines.
         def assertion():
             self.assertEqual(
                 project_settings.get_supported_engines(),
@@ -55,9 +55,9 @@ class EngineAvailabilitySettingsTests(SimpleTestCase):
             assertion,
         )
 
-    # Test disabled active engine falls back to the first enabled engine.
+    # Verify that a configured but disabled active engine falls back to the first enabled engine.
     def test_active_engine_falls_back_when_configured_engine_is_disabled(self):
-        # Assertion.
+        # Check the active engine against the only enabled engine.
         def assertion():
             self.assertEqual(project_settings.get_llm_engine(), "ollama-service")
 
@@ -72,8 +72,10 @@ class EngineAvailabilitySettingsTests(SimpleTestCase):
             assertion,
         )
 
-# Verify enabled-engine runtime synchronization.
+
+# Cover the synchronization of engine runtimes with the enabled engines.
 class LlmApiRuntimeSyncTests(SimpleTestCase):
+    # Verify that syncing prepares the runtime of every enabled engine and cleans up the disabled ones.
     @patch("API.llm_api.cleanup_runtime")
     @patch("API.llm_api.prepare_runtime")
     @patch("Settings.settings.get_enabled_engine_ids", return_value=["ollama-service", "lms"])
@@ -85,34 +87,41 @@ class LlmApiRuntimeSyncTests(SimpleTestCase):
         mock_cleanup.assert_any_call("openai")
         mock_cleanup.assert_any_call("google-genai")
 
+    # Verify that handling an engine transition triggers a runtime sync.
     @patch("API.llm_api.sync_enabled_engine_runtimes")
     def test_handle_engine_transition_calls_sync(self, mock_sync):
         llm_api.handle_engine_transition("ollama-service", "lms")
 
         mock_sync.assert_called_once()
 
-# Verify request-level engine resolution.
+
+# Cover the resolution of the engine for one API request.
 class RequestEngineResolutionTests(SimpleTestCase):
+    # Build a mock request whose GET parameters are the given query dict.
     def _build_request(self, query=None):
         request = Mock()
         request.GET = query or {}
         return request
 
+    # Verify that a request without an engine parameter resolves to the active engine.
     @patch("Settings.settings.get_llm_engine", return_value="ollama-service")
     def test_resolve_defaults_to_active_engine(self, _mock_active):
         engine = _resolve_request_engine(self._build_request())
         self.assertEqual(engine, "ollama-service")
 
+    # Verify that the engine named in the query is used when that engine is enabled.
     @patch("Settings.settings.is_engine_enabled", return_value=True)
     def test_resolve_query_engine_when_enabled(self, _mock_enabled):
         engine = _resolve_request_engine(self._build_request({"engine": "openai"}))
         self.assertEqual(engine, "openai")
 
+    # Verify that an explicitly requested engine that is disabled raises RequestEngineResolutionError.
     @patch("Settings.settings.is_engine_enabled", return_value=False)
     def test_resolve_rejects_disabled_engine(self, _mock_enabled):
         with self.assertRaises(RequestEngineResolutionError):
             _resolve_request_engine(self._build_request({"engine": "openai"}))
 
+    # Verify that the engine in the request body wins over the engine in the query.
     @patch("Settings.settings.is_engine_enabled", return_value=True)
     def test_body_engine_takes_priority_over_query(self, _mock_enabled):
         engine = _resolve_request_engine(
@@ -121,12 +130,16 @@ class RequestEngineResolutionTests(SimpleTestCase):
         )
         self.assertEqual(engine, "openai")
 
-# Verify disabled explicit engines are rejected at the HTTP layer.
+
+# Cover how the HTTP layer treats the explicit engine of a request when engines are enabled or disabled.
 class DisabledEngineApiTests(TestCase):
+    # Save the payload to a temporary settings file with every related config file redirected into the same
+    # temporary directory, then yield and invalidate the settings cache afterwards.
     @contextmanager
     def isolated_settings_payload(self, payload):
         with tempfile.TemporaryDirectory() as temp_dir:
             settings_file = Path(temp_dir) / "settings.json"
+
             # Generated tool configs must land in the same temporary
             # directory, otherwise save_settings writes into the repository.
             with (
@@ -145,6 +158,7 @@ class DisabledEngineApiTests(TestCase):
                 finally:
                     project_settings._invalidate_settings_cache()
 
+    # Verify that the models endpoint rejects a request for a disabled engine with a 400 error.
     def test_models_api_rejects_disabled_engine(self):
         with self.isolated_settings_payload(
             {
@@ -160,6 +174,8 @@ class DisabledEngineApiTests(TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn("not enabled", response.json()["error"])
 
+    # Verify that the chat endpoint uses the enabled engine from the query string instead of the active
+    # engine and streams the generated text.
     @patch("Apps.API.views.llm_api.prepare_runtime")
     @patch("Apps.API.views.llm_api.generate")
     def test_chat_api_accepts_engine_query_param(self, mock_generate, _mock_prepare_runtime):
@@ -184,8 +200,10 @@ class DisabledEngineApiTests(TestCase):
         self.assertEqual(b"".join(response.streaming_content), b"Hi there")
         self.assertEqual(mock_generate.call_args.kwargs["engine"], "openai")
 
-# Verify runtime settings and dynamic model selection endpoints.
+
+# Cover the runtime settings, model list, model info and inference info endpoints.
 class RuntimeSettingsApiTests(TestCase):
+    # Runtime settings that report a saved OpenAI API key, used to check that the key itself is never exposed.
     RUNTIME_SETTINGS_WITH_API_KEY = {
         "llm-engine": "openai",
         "lms_url": "127.0.0.1:1234",
@@ -194,6 +212,7 @@ class RuntimeSettingsApiTests(TestCase):
         "engine_urls": {"openai": "https://openrouter.ai/api/v1"},
     }
 
+    # Treat every engine as enabled, so the API views accept any engine in the requests.
     def setUp(self):
         super().setUp()
         self._engine_enabled_patch = patch(
@@ -202,16 +221,18 @@ class RuntimeSettingsApiTests(TestCase):
         )
         self._engine_enabled_patch.start()
 
+    # Remove the engine-enabled patch.
     def tearDown(self):
         self._engine_enabled_patch.stop()
         super().tearDown()
 
-    # Run runtime settings API tests against a temporary settings file.
+    # Save the payload to a temporary settings file with every related config file redirected into the same
+    # temporary directory, then yield and invalidate the settings cache afterwards.
     @contextmanager
-    # Isolated settings payload.
     def isolated_settings_payload(self, payload):
         with tempfile.TemporaryDirectory() as temp_dir:
             settings_file = Path(temp_dir) / "settings.json"
+
             # Generated tool configs must land in the same temporary
             # directory, otherwise save_settings writes into the repository.
             with (
@@ -230,14 +251,14 @@ class RuntimeSettingsApiTests(TestCase):
                 finally:
                     project_settings._invalidate_settings_cache()
 
-    # Test get runtime settings payload.
+    # Verify that the runtime settings endpoint returns a 200 payload without the model list.
     def test_get_runtime_settings_payload(self):
         response = self.client.get(reverse("runtime_settings_api"))
 
         self.assertEqual(response.status_code, 200)
         self.assertNotIn("models", response.json())
 
-    # Test runtime settings rejects invalid JSON.
+    # Verify that posting malformed JSON to the runtime settings endpoint returns a 400 error.
     def test_runtime_settings_rejects_invalid_json(self):
         response = self.client.post(
             reverse("runtime_settings_api"),
@@ -248,9 +269,9 @@ class RuntimeSettingsApiTests(TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.json()["error"], "Invalid JSON format")
 
-    # Test post runtime settings updates engine.
+    # Verify that posting runtime settings switches the active engine, normalizes the saved URL (scheme
+    # removed), reports no saved API key and triggers an engine transition to the new engine.
     @patch("Apps.UI.views.llm_api.handle_engine_transition")
-    # Verify post runtime settings updates engine.
     def test_post_runtime_settings_updates_engine(self, mock_transition):
         with self.isolated_settings_payload(
             {
@@ -277,9 +298,9 @@ class RuntimeSettingsApiTests(TestCase):
             mock_transition.assert_called_once()
             self.assertEqual(mock_transition.call_args.args[1], "openai")
 
-    # Test disabled engine selection falls back to an enabled engine.
+    # Verify that posting a disabled engine as the active one is ignored: the active engine stays on the
+    # enabled engine, the engine options list only it, and the transition is from and to that engine.
     @patch("Apps.UI.views.llm_api.handle_engine_transition")
-    # Verify post runtime settings ignores disabled engine.
     def test_post_runtime_settings_ignores_disabled_engine(self, mock_transition):
         with self.isolated_settings_payload(
             {
@@ -302,9 +323,8 @@ class RuntimeSettingsApiTests(TestCase):
             self.assertEqual(payload["engine_options"], [{"id": "ollama-service", "label": "Ollama"}])
             mock_transition.assert_called_once_with("ollama-service", "ollama-service")
 
-    # Test models API returns engine specific models.
+    # Verify that the models endpoint returns the models loaded for the requested engine.
     @patch("Apps.API.views._load_models_for_engine", return_value=["llama3"])
-    # Verify models api returns engine specific models.
     def test_models_api_returns_engine_specific_models(self, mock_models):
         response = self.client.get(reverse("models_api"), {"engine": "lms"})
 
@@ -312,16 +332,15 @@ class RuntimeSettingsApiTests(TestCase):
         self.assertEqual(response.json(), {"engine": "lms", "models": ["llama3"]})
         mock_models.assert_called_once_with("lms")
 
-    # Test model info API requires a model query parameter.
+    # Verify that the model info endpoint returns a 400 error when the model parameter is missing.
     def test_model_info_api_requires_model_parameter(self):
         response = self.client.get(reverse("model_info_api"), {"engine": "lms"})
 
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.json()["error"], "Model parameter is required")
 
-    # Test model info API maps unsupported engines to 501.
+    # Verify that the model info endpoint maps a NotImplementedError from the payload builder to a 501 error.
     @patch("Apps.API.views._build_model_info_payload", side_effect=NotImplementedError("Not supported"))
-    # Verify model info api returns 501 for unimplemented engines.
     def test_model_info_api_returns_501_for_unimplemented_engines(self, mock_build_payload):
         response = self.client.get(reverse("model_info_api"), {"engine": "ollama-service", "model": "model"})
 
@@ -329,10 +348,11 @@ class RuntimeSettingsApiTests(TestCase):
         self.assertEqual(response.json()["error"], "Not supported")
         mock_build_payload.assert_called_once()
 
-    # Test inference info API returns a compact engine-independent payload.
+    # Verify that the inference info endpoint turns an engine specific model info payload into the compact
+    # engine independent payload: context window, output limits, capabilities, tool servers and source.
     @patch("Apps.API.views._build_model_info_payload")
-    # Verify inference info api returns unified payload.
     def test_inference_info_api_returns_unified_payload(self, mock_build_payload):
+        # Arrange: the engine specific model info that the endpoint converts.
         mock_build_payload.return_value = {
             "context_length": 131072,
             "defaults": {"num_ctx": 65536, "num_predict": 8192, "temperature": 0.7},
@@ -347,11 +367,13 @@ class RuntimeSettingsApiTests(TestCase):
             "available_tool_servers": [{"id": "time_suite", "name": "Time Suite"}],
         }
 
+        # Act
         response = self.client.get(
             reverse("inference_info_api"),
             {"engine": "ollama-service", "model": "llama3"},
         )
 
+        # Assert: the compact payload maps the context length, defaults, limits and capabilities.
         self.assertEqual(response.status_code, 200)
         payload = response.json()
         self.assertTrue(payload["ok"])
@@ -367,9 +389,9 @@ class RuntimeSettingsApiTests(TestCase):
         self.assertEqual(payload["source"]["model"], "request")
         mock_build_payload.assert_called_once_with("ollama-service", "llama3")
 
-    # Test inference info can use the latest model selected through model info.
+    # Verify that the inference info endpoint falls back to the model last selected through the model info
+    # endpoint when the request names no model.
     @patch("Apps.API.views._build_model_info_payload")
-    # Verify inference info api uses runtime selected model.
     def test_inference_info_api_uses_runtime_selected_model(self, mock_build_payload):
         mock_build_payload.return_value = {
             "context_length": 32768,
@@ -377,9 +399,11 @@ class RuntimeSettingsApiTests(TestCase):
             "supports_tool_calling": False,
         }
 
+        # Select the model through the model info endpoint.
         selected = self.client.get(reverse("model_info_api"), {"engine": "openai", "model": "gpt-test"})
         self.assertEqual(selected.status_code, 200)
 
+        # Ask for the inference info without a model.
         response = self.client.get(reverse("inference_info_api"), {"engine": "openai"})
 
         self.assertEqual(response.status_code, 200)
@@ -390,10 +414,9 @@ class RuntimeSettingsApiTests(TestCase):
         self.assertEqual(payload["max_output_tokens"], 2048)
         self.assertEqual(payload["source"]["model"], "runtime_selection")
 
-    # Test runtime settings payload does not expose API key.
+    # Verify that the runtime settings payload reports whether an API key exists but never includes the key.
     @patch("Apps.UI.views.settings.get_supported_engines", return_value=[])
     @patch("Apps.UI.views.settings.get_runtime_engine_settings", return_value=RUNTIME_SETTINGS_WITH_API_KEY)
-    # Verify runtime settings payload does not expose api key.
     def test_runtime_settings_payload_does_not_expose_api_key(
         self,
         _mock_runtime_settings,

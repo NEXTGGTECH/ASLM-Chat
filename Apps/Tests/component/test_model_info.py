@@ -11,20 +11,21 @@ from Apps.API.views import _build_model_info_payload, _clear_model_metadata_cach
 pytestmark = [pytest.mark.component]
 
 
+# Cover the model info payload cache.
 class ModelInfoCacheTests(TestCase):
-    # Clear metadata caches around each test.
+    # Clear the model metadata caches before each test.
     def setUp(self):
         super().setUp()
         _clear_model_metadata_caches()
 
-    # Restore metadata cache state after the test.
+    # Clear the model metadata caches again so no cached payload leaks into other tests.
     def tearDown(self):
         _clear_model_metadata_caches()
         super().tearDown()
 
-    # Test cached model info is returned as a defensive copy.
+    # Verify that a cached model info payload is returned as a detached copy: mutating the first result does
+    # not change the second one, and the engine settings are loaded only once.
     @patch("Apps.API.views.llm_api.get_model_settings")
-    # Verify model info payload cache returns detached copies.
     def test_model_info_payload_cache_returns_detached_copies(self, mock_get_model_settings):
         mock_get_model_settings.return_value = {
             "context_length": 32768,

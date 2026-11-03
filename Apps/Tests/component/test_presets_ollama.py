@@ -15,6 +15,7 @@ pytestmark = [pytest.mark.component]
 
 # Cover Ollama preset API endpoints and model-info integration.
 class OllamaPresetApiTests(ToolRegistryTestMixin, TestCase):
+    # Treat every engine as enabled, so the API views accept Ollama requests.
     def setUp(self):
         super().setUp()
         self._engine_enabled_patch = patch(
@@ -23,14 +24,17 @@ class OllamaPresetApiTests(ToolRegistryTestMixin, TestCase):
         )
         self._engine_enabled_patch.start()
 
+    # Remove the engine-enabled patch.
     def tearDown(self):
         self._engine_enabled_patch.stop()
         super().tearDown()
 
-    # Test model info includes active Ollama preset defaults and servers.
+    # Verify that model info returns the Ollama presets and the tool servers available to the engine, and
+    # applies the active custom preset's supported values over the model defaults.
     @patch("Apps.API.views.llm_api.get_model_settings")
-    # Verify model info includes active ollama preset defaults and servers.
     def test_model_info_includes_active_ollama_preset_defaults_and_servers(self, mock_get_model_settings):
+        # Arrange: a tool server that supports the engine, a default preset and an active custom preset
+        # with supported and unsupported options, and model settings that report tool support.
         self.write_server(
             'time_suite',
             '''
@@ -66,11 +70,14 @@ class OllamaPresetApiTests(ToolRegistryTestMixin, TestCase):
             "capabilities": ["tools"],
         }
 
+        # Act
         response = self.client.get(
             reverse("model_info_api"),
             {"engine": "ollama-service", "model": "llama3"},
         )
 
+        # Assert: the preset values win over the model parameters, the unsupported options are dropped and
+        # the tool server is listed.
         self.assertEqual(response.status_code, 200)
         payload = response.json()
         self.assertIn("ollama_presets", payload)
@@ -83,7 +90,8 @@ class OllamaPresetApiTests(ToolRegistryTestMixin, TestCase):
         self.assertNotIn("mirostat", payload["defaults"])
         self.assertNotIn("numa", payload["defaults"])
 
-    # Test sync endpoint clones default preset on first change.
+    # Verify that the first sync of a changed config keeps the default Ollama preset and saves the change
+    # as a new custom preset.
     def test_sync_endpoint_clones_default_preset_on_first_change(self):
         response = self.client.post(
             reverse("sync_ollama_preset_api"),
@@ -96,8 +104,10 @@ class OllamaPresetApiTests(ToolRegistryTestMixin, TestCase):
         self.assertEqual(len(payload["presets"]), 2)
         self.assertEqual(OllamaPreset.objects.filter(model_name="llama3").count(), 2)
 
-    # Test create rename delete endpoints manage custom preset.
+    # Verify that a custom Ollama preset can be created, renamed and deleted, and that deleting it leaves
+    # only the default preset.
     def test_create_rename_delete_endpoints_manage_custom_preset(self):
+        # Create a custom preset; it becomes the active one.
         created = self.client.post(
             reverse("create_ollama_preset_api"),
             data='{"model":"llama3","name":"Research","config":{"num_ctx":49152}}',
@@ -107,6 +117,7 @@ class OllamaPresetApiTests(ToolRegistryTestMixin, TestCase):
         created_payload = created.json()
         active_preset_id = created_payload["active_preset_id"]
 
+        # Rename it.
         renamed = self.client.post(
             reverse("rename_ollama_preset_api"),
             data=f'{{"model":"llama3","preset_id":"{active_preset_id}","name":"Research v2"}}',
@@ -114,6 +125,7 @@ class OllamaPresetApiTests(ToolRegistryTestMixin, TestCase):
         )
         self.assertEqual(renamed.status_code, 200)
 
+        # Delete it; only the default preset remains.
         deleted = self.client.post(
             reverse("delete_ollama_preset_api"),
             data=f'{{"model":"llama3","preset_id":"{active_preset_id}"}}',
@@ -122,7 +134,7 @@ class OllamaPresetApiTests(ToolRegistryTestMixin, TestCase):
         self.assertEqual(deleted.status_code, 200)
         self.assertEqual(OllamaPreset.objects.filter(model_name="llama3").count(), 1)
 
-    # Test duplicate preset name returns validation error.
+    # Verify that creating a second Ollama preset with an existing name returns a validation error.
     def test_duplicate_preset_name_returns_validation_error(self):
         self.client.post(
             reverse("create_ollama_preset_api"),
@@ -139,8 +151,9 @@ class OllamaPresetApiTests(ToolRegistryTestMixin, TestCase):
         self.assertEqual(duplicate.status_code, 400)
         self.assertIn("already exists", duplicate.json()["error"])
 
-    # Test select endpoint activates an existing custom preset.
+    # Verify that selecting a custom Ollama preset activates it and deactivates the default one.
     def test_select_endpoint_activates_custom_preset(self):
+        # Arrange: the default preset is active and a custom preset is not.
         default_preset = OllamaPreset.objects.create(
             model_name="llama3",
             name="Default",
@@ -156,12 +169,14 @@ class OllamaPresetApiTests(ToolRegistryTestMixin, TestCase):
             is_active=False,
         )
 
+        # Act
         response = self.client.post(
             reverse("select_ollama_preset_api"),
             data=f'{{"model":"llama3","preset_id":"{custom_preset.id}"}}',
             content_type="application/json",
         )
 
+        # Assert: the active flag moved from the default preset to the custom one.
         default_preset.refresh_from_db()
         custom_preset.refresh_from_db()
         self.assertEqual(response.status_code, 200)
@@ -169,7 +184,7 @@ class OllamaPresetApiTests(ToolRegistryTestMixin, TestCase):
         self.assertFalse(default_preset.is_active)
         self.assertTrue(custom_preset.is_active)
 
-    # Test default preset mutation errors are returned as validation responses.
+    # Verify that renaming or deleting the default Ollama preset returns a 400 validation error.
     def test_default_preset_mutation_errors_return_400(self):
         default_preset = OllamaPreset.objects.create(
             model_name="llama3",

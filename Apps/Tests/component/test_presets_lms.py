@@ -14,6 +14,7 @@ pytestmark = [pytest.mark.component]
 
 # Cover LM Studio preset API endpoints and model-info integration.
 class LmsPresetApiTests(TestCase):
+    # Treat every engine as enabled, so the API views accept LM Studio requests.
     def setUp(self):
         super().setUp()
         self._engine_enabled_patch = patch(
@@ -22,15 +23,18 @@ class LmsPresetApiTests(TestCase):
         )
         self._engine_enabled_patch.start()
 
+    # Remove the engine-enabled patch.
     def tearDown(self):
         self._engine_enabled_patch.stop()
         super().tearDown()
 
-    # Test model info includes active LM Studio preset defaults.
+    # Verify that model info returns the LM Studio presets and applies the active custom preset's
+    # values over the model defaults.
     @patch("Apps.API.views.llm_api.get_model_settings")
     @patch("Apps.Data.lms_presets.lms_api.get_model_settings")
-    # Verify model info includes active lms preset defaults.
     def test_model_info_includes_active_lms_preset_defaults(self, mock_preset_settings, mock_model_settings):
+        # Arrange: model settings with thinking enabled, a default preset and an active custom
+        # preset that lowers the temperature and turns thinking off.
         base_settings = {
             "context_length": 65536,
             "defaults": {"temperature": 0.7, "think": True},
@@ -63,11 +67,13 @@ class LmsPresetApiTests(TestCase):
             is_active=True,
         )
 
+        # Act
         response = self.client.get(
             reverse("model_info_api"),
             {"engine": "lms", "model": "qwen3"},
         )
 
+        # Assert: the custom preset values win and the preset list is part of the payload.
         self.assertEqual(response.status_code, 200)
         payload = response.json()
         self.assertIn("lms_presets", payload)
@@ -76,9 +82,9 @@ class LmsPresetApiTests(TestCase):
         self.assertEqual(payload["lms_presets"]["active_preset_id"], str(custom_preset.id))
         self.assertEqual(default_preset.name, "Default")
 
-    # Test sync endpoint clones default LM Studio preset on first change.
+    # Verify that the first sync of a changed config keeps the default LM Studio preset and saves
+    # the change as a new custom preset.
     @patch("Apps.Data.lms_presets.lms_api.get_model_settings")
-    # Verify sync endpoint clones default lms preset on first change.
     def test_sync_endpoint_clones_default_lms_preset_on_first_change(self, mock_get_model_settings):
         mock_get_model_settings.return_value = {
             "defaults": {"temperature": 0.7},
@@ -95,21 +101,22 @@ class LmsPresetApiTests(TestCase):
         self.assertEqual(len(payload["presets"]), 2)
         self.assertEqual(LmsPreset.objects.filter(model_name="qwen3").count(), 2)
 
-    # Test get LM Studio presets endpoint requires a model.
+    # Verify that the LM Studio presets endpoint rejects a request without a model.
     def test_get_lms_presets_requires_model(self):
         response = self.client.get(reverse("lms_presets_api"))
 
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.json()["error"], "Model parameter is required")
 
-    # Test create rename delete endpoints manage a custom LM Studio preset.
+    # Verify that a custom LM Studio preset can be created, renamed and deleted, and that deleting
+    # the active preset leaves only the default one.
     @patch("Apps.Data.lms_presets.lms_api.get_model_settings")
-    # Verify create rename delete endpoints manage custom lms preset.
     def test_create_rename_delete_endpoints_manage_custom_lms_preset(self, mock_get_model_settings):
         mock_get_model_settings.return_value = {
             "defaults": {"temperature": 0.7},
         }
 
+        # Create a custom preset; it becomes the active one.
         created = self.client.post(
             reverse("create_lms_preset_api"),
             data='{"model":"qwen3","name":"Research","config":{"operation":{"temperature":0.2}}}',
@@ -118,6 +125,7 @@ class LmsPresetApiTests(TestCase):
         self.assertEqual(created.status_code, 200)
         active_preset_id = created.json()["active_preset_id"]
 
+        # Rename it.
         renamed = self.client.post(
             reverse("rename_lms_preset_api"),
             data=f'{{"model":"qwen3","preset_id":"{active_preset_id}","name":"Research v2"}}',
@@ -126,6 +134,7 @@ class LmsPresetApiTests(TestCase):
         self.assertEqual(renamed.status_code, 200)
         self.assertEqual(LmsPreset.objects.get(id=active_preset_id).name, "Research v2")
 
+        # Delete it; only the default preset remains.
         deleted = self.client.post(
             reverse("delete_lms_preset_api"),
             data=f'{{"model":"qwen3","preset_id":"{active_preset_id}"}}',
@@ -135,9 +144,8 @@ class LmsPresetApiTests(TestCase):
         self.assertEqual(LmsPreset.objects.filter(model_name="qwen3").count(), 1)
         self.assertTrue(LmsPreset.objects.get(model_name="qwen3").is_default)
 
-    # Test duplicate LM Studio preset names return validation errors.
+    # Verify that creating a second LM Studio preset with an existing name returns a validation error.
     @patch("Apps.Data.lms_presets.lms_api.get_model_settings")
-    # Verify duplicate lms preset name returns validation error.
     def test_duplicate_lms_preset_name_returns_validation_error(self, mock_get_model_settings):
         mock_get_model_settings.return_value = {
             "defaults": {"temperature": 0.7},
@@ -157,10 +165,10 @@ class LmsPresetApiTests(TestCase):
         self.assertEqual(duplicate.status_code, 400)
         self.assertIn("already exists", duplicate.json()["error"])
 
-    # Test select endpoint activates an existing custom LM Studio preset.
+    # Verify that selecting a custom LM Studio preset activates it and deactivates the default one.
     @patch("Apps.Data.lms_presets.lms_api.get_model_settings")
-    # Verify select endpoint activates custom lms preset.
     def test_select_endpoint_activates_custom_lms_preset(self, mock_get_model_settings):
+        # Arrange: the default preset is active and a custom preset is not.
         mock_get_model_settings.return_value = {
             "defaults": {"temperature": 0.7},
         }
@@ -179,12 +187,14 @@ class LmsPresetApiTests(TestCase):
             is_active=False,
         )
 
+        # Act
         response = self.client.post(
             reverse("select_lms_preset_api"),
             data=f'{{"model":"qwen3","preset_id":"{custom_preset.id}"}}',
             content_type="application/json",
         )
 
+        # Assert: the active flag moved from the default preset to the custom one.
         default_preset.refresh_from_db()
         custom_preset.refresh_from_db()
         self.assertEqual(response.status_code, 200)
@@ -192,10 +202,10 @@ class LmsPresetApiTests(TestCase):
         self.assertFalse(default_preset.is_active)
         self.assertTrue(custom_preset.is_active)
 
-    # Test default LM Studio preset mutation errors are returned as validation responses.
+    # Verify that renaming or deleting the default LM Studio preset returns a 400 validation error.
     @patch("Apps.Data.lms_presets.lms_api.get_model_settings")
-    # Verify default lms preset mutation errors return 400.
     def test_default_lms_preset_mutation_errors_return_400(self, mock_get_model_settings):
+        # Arrange: only the default preset exists.
         mock_get_model_settings.return_value = {
             "defaults": {"temperature": 0.7},
         }
@@ -207,6 +217,7 @@ class LmsPresetApiTests(TestCase):
             is_active=True,
         )
 
+        # Act: try both forbidden mutations.
         renamed = self.client.post(
             reverse("rename_lms_preset_api"),
             data=f'{{"model":"qwen3","preset_id":"{default_preset.id}","name":"Renamed"}}',
@@ -218,6 +229,7 @@ class LmsPresetApiTests(TestCase):
             content_type="application/json",
         )
 
+        # Assert: both are rejected with an error that names the default preset.
         self.assertEqual(renamed.status_code, 400)
         self.assertEqual(deleted.status_code, 400)
         self.assertIn("default preset", renamed.json()["error"])

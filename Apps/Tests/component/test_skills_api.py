@@ -18,8 +18,11 @@ from Apps.API.views import _build_chat_history, _chat_is_first_user_turn, _compo
 pytestmark = [pytest.mark.component]
 
 
+# Cover the skills REST endpoints, front matter parsing, prompt inventory and sandbox mirroring against a
+# temporary Skills folder.
 class SkillsApiTests(TestCase):
-    # Prepare shared fixtures for each test case.
+    # Point the skills configuration at a temporary project root, so tests never touch the real Skills folder,
+    # and reset the pending refresh marker.
     def setUp(self):
         super().setUp()
         self._tmp = tempfile.TemporaryDirectory()
@@ -37,7 +40,7 @@ class SkillsApiTests(TestCase):
         self.client = Client()
         skills_config.clear_skill_config_refresh_pending()
 
-    # Clean up fixtures created for each test case.
+    # Reset the pending refresh marker, undo the path patches and remove the temporary project root.
     def tearDown(self):
         skills_config.clear_skill_config_refresh_pending()
         for patcher in reversed(self._patches):
@@ -45,12 +48,15 @@ class SkillsApiTests(TestCase):
         self._tmp.cleanup()
         super().tearDown()
 
-    # Verify skills root created and crud validates paths.
+    # Verify the skills CRUD flow: listing creates the Skills root, a skill folder can be created, a file can
+    # be saved in it, the folder can be renamed, and saving a file through a ".." path returns a 400 error.
     def test_skills_root_created_and_crud_validates_paths(self):
+        # Listing skills creates the missing Skills root.
         response = self.client.get(reverse("skills_api"))
         self.assertEqual(response.status_code, 200)
         self.assertTrue(self.skills_dir.is_dir())
 
+        # Create a skill folder; it gets a default SKILL.md.
         created = self.client.post(
             reverse("skills_api"),
             data=json.dumps({"name": "skill-creator"}),
@@ -59,6 +65,7 @@ class SkillsApiTests(TestCase):
         self.assertEqual(created.status_code, 200)
         self.assertTrue((self.skills_dir / "skill-creator" / "SKILL.md").is_file())
 
+        # Save a file in a new subdirectory of the skill.
         saved = self.client.put(
             reverse("skills_file_api"),
             data=json.dumps({
@@ -71,6 +78,7 @@ class SkillsApiTests(TestCase):
         self.assertEqual(saved.status_code, 200)
         self.assertTrue((self.skills_dir / "skill-creator" / "agents" / "grader.md").is_file())
 
+        # Rename the skill folder; the listing reports the new title.
         renamed = self.client.patch(
             reverse("skills_folder_api"),
             data=json.dumps({"old_name": "skill-creator", "new_name": "renamed-skill"}),
@@ -80,6 +88,7 @@ class SkillsApiTests(TestCase):
         self.assertTrue((self.skills_dir / "renamed-skill" / "SKILL.md").is_file())
         self.assertEqual(renamed.json()["folders"][0]["title"], "renamed-skill")
 
+        # Saving a file outside the skill folder through ".." is rejected.
         rejected = self.client.put(
             reverse("skills_file_api"),
             data=json.dumps({"folder": "renamed-skill", "file": "../bad.md", "content": "x"}),
@@ -87,8 +96,10 @@ class SkillsApiTests(TestCase):
         )
         self.assertEqual(rejected.status_code, 400)
 
-    # Verify front matter summary and prompt inventory.
+    # Verify that the skills listing summarizes a skill from its front matter, that the first-turn system
+    # prompt lists the enabled skill with its files, and that later prompts and disabled skills omit it.
     def test_front_matter_summary_and_prompt_inventory(self):
+        # Arrange: an enabled skill with front matter and one extra markdown file.
         skill_root = self.skills_dir / "skill-creator"
         skill_root.mkdir(parents=True)
         (skill_root / "SKILL.md").write_text(
@@ -105,6 +116,8 @@ class SkillsApiTests(TestCase):
         agents_dir.mkdir()
         (agents_dir / "grader.md").write_text("# Grader\n", encoding="utf-8")
 
+        # The listing reports the front matter title and description, and a skill added by someone else is
+        # marked as downloaded.
         payload = self.client.get(reverse("skills_api")).json()
         folder = payload["folders"][0]
         self.assertEqual(folder["title"], "skill-creator")
@@ -113,6 +126,7 @@ class SkillsApiTests(TestCase):
         self.assertIsInstance(folder["created_at"], float)
         self.assertGreater(folder["created_at"], 0)
 
+        # The first-turn prompt lists the skill, its sandbox path and its files; a follow-up prompt does not.
         prompt = _compose_system_prompt("", include_skills_baseline=True)
         self.assertIn("Your skills:", prompt)
         self.assertIn("/workspace/_sandbox/Skills/skill-creator", prompt)
@@ -121,6 +135,7 @@ class SkillsApiTests(TestCase):
         follow_up_prompt = _compose_system_prompt("")
         self.assertNotIn("Your skills:", follow_up_prompt)
 
+        # A skill disabled in its front matter never appears in the prompt.
         disabled_root = self.skills_dir / "disabled-skill"
         disabled_root.mkdir()
         (disabled_root / "SKILL.md").write_text(
@@ -130,8 +145,10 @@ class SkillsApiTests(TestCase):
         prompt_with_disabled = _compose_system_prompt("")
         self.assertNotIn("disabled-skill", prompt_with_disabled)
 
-    # Verify disable skill queues refreshed inventory for next prompt.
+    # Verify that disabling the only enabled skill queues a one-shot configuration update that the next
+    # prompt carries (saying no skills are enabled) and that the prompt after it no longer repeats.
     def test_disable_skill_queues_refreshed_inventory_for_next_prompt(self):
+        # Arrange: one enabled skill, and a first-turn prompt that lists it without any update notice.
         skill_root = self.skills_dir / "pdf"
         skill_root.mkdir(parents=True)
         (skill_root / "SKILL.md").write_text(
@@ -143,6 +160,7 @@ class SkillsApiTests(TestCase):
         self.assertIn("Your skills:", baseline_prompt)
         self.assertNotIn("Skill configuration update:", baseline_prompt)
 
+        # Act: disable the skill through the API.
         response = self.client.patch(
             reverse("skills_enabled_api"),
             data=json.dumps({"folder": "pdf", "enabled": False}),
@@ -150,6 +168,7 @@ class SkillsApiTests(TestCase):
         )
         self.assertEqual(response.status_code, 200)
 
+        # Assert: the next prompt carries the update once, and the one after it carries nothing.
         prompt_after_disable = _compose_system_prompt("")
         self.assertIn("Skill configuration update:", prompt_after_disable)
         self.assertIn("no enabled project skills", prompt_after_disable)
@@ -159,7 +178,8 @@ class SkillsApiTests(TestCase):
         self.assertNotIn("Skill configuration update:", prompt_after_consume)
         self.assertNotIn("Your skills:", prompt_after_consume)
 
-    # Verify sync mirrors skills and overrides sandbox.
+    # Verify that syncing copies a skill into the sandbox, overwrites a stale copy there and removes files
+    # in the sandbox that have no counterpart in the project Skills folder.
     def test_sync_mirrors_skills_and_overrides_sandbox(self):
         skill_root = self.skills_dir / "writer"
         skill_root.mkdir(parents=True)
@@ -175,7 +195,8 @@ class SkillsApiTests(TestCase):
         self.assertEqual((self.sandbox_skills_dir / "writer" / "SKILL.md").read_text(encoding="utf-8"), "# Writer\n")
         self.assertFalse((self.sandbox_skills_dir / "extra.txt").exists())
 
-    # Verify sync excludes disabled skills from sandbox.
+    # Verify that syncing copies an enabled skill into the sandbox and removes the stale sandbox copy of a
+    # disabled skill.
     def test_sync_excludes_disabled_skills_from_sandbox(self):
         enabled_root = self.skills_dir / "writer"
         enabled_root.mkdir(parents=True)
@@ -197,7 +218,7 @@ class SkillsApiTests(TestCase):
         self.assertTrue((self.sandbox_skills_dir / "writer" / "SKILL.md").is_file())
         self.assertFalse(stale_disabled.exists())
 
-    # Verify disable skill removes folder from sandbox.
+    # Verify that disabling a skill through the API removes its folder from the sandbox mirror.
     def test_disable_skill_removes_folder_from_sandbox(self):
         skill_root = self.skills_dir / "toggle-skill"
         skill_root.mkdir(parents=True)
@@ -217,7 +238,7 @@ class SkillsApiTests(TestCase):
         self.assertFalse(response.json()["folders"][0]["enabled"])
         self.assertFalse((self.sandbox_skills_dir / "toggle-skill").exists())
 
-    # Verify create skill subdirectory.
+    # Verify that a subdirectory, including a nested one, can be created inside a skill folder.
     def test_create_skill_subdirectory(self):
         skill_root = self.skills_dir / "my-skill"
         skill_root.mkdir(parents=True)
@@ -239,7 +260,7 @@ class SkillsApiTests(TestCase):
         self.assertEqual(nested_response.status_code, 200)
         self.assertTrue((skill_root / "agents" / "tools").is_dir())
 
-    # Verify create skill subdirectory rejects duplicate.
+    # Verify that creating a subdirectory that already exists returns a 400 error.
     def test_create_skill_subdirectory_rejects_duplicate(self):
         skill_root = self.skills_dir / "my-skill"
         skill_root.mkdir(parents=True)
@@ -252,7 +273,7 @@ class SkillsApiTests(TestCase):
         )
         self.assertEqual(response.status_code, 400)
 
-    # Verify create skill subdirectory rejects traversal.
+    # Verify that creating a subdirectory with a ".." path that escapes the skill folder returns a 400 error.
     def test_create_skill_subdirectory_rejects_traversal(self):
         skill_root = self.skills_dir / "my-skill"
         skill_root.mkdir(parents=True)
@@ -264,7 +285,7 @@ class SkillsApiTests(TestCase):
         )
         self.assertEqual(response.status_code, 400)
 
-    # Verify create skill subdirectory rejects file extension.
+    # Verify that creating a subdirectory whose name looks like a file (with an extension) returns a 400 error.
     def test_create_skill_subdirectory_rejects_file_extension(self):
         skill_root = self.skills_dir / "my-skill"
         skill_root.mkdir(parents=True)
@@ -276,13 +297,15 @@ class SkillsApiTests(TestCase):
         )
         self.assertEqual(response.status_code, 400)
 
-    # Verify rename and delete skill subdirectory.
+    # Verify that a skill subdirectory can be renamed with its files and then deleted.
     def test_rename_and_delete_skill_subdirectory(self):
+        # Arrange: a skill with an agents subdirectory that holds one file.
         skill_root = self.skills_dir / "my-skill"
         skill_root.mkdir(parents=True)
         (skill_root / "agents").mkdir()
         (skill_root / "agents" / "grader.md").write_text("# Grader\n", encoding="utf-8")
 
+        # Rename the subdirectory; its file moves with it.
         renamed = self.client.patch(
             reverse("skills_path_api"),
             data=json.dumps({
@@ -297,6 +320,7 @@ class SkillsApiTests(TestCase):
         self.assertTrue((skill_root / "reviewers" / "grader.md").is_file())
         self.assertFalse((skill_root / "agents").exists())
 
+        # Delete the renamed subdirectory.
         deleted = self.client.delete(
             reverse("skills_directory_api"),
             data=json.dumps({"folder": "my-skill", "path": "reviewers"}),
@@ -305,7 +329,7 @@ class SkillsApiTests(TestCase):
         self.assertEqual(deleted.status_code, 200)
         self.assertFalse((skill_root / "reviewers").exists())
 
-    # Verify rename skill file.
+    # Verify that a file inside a skill folder can be renamed.
     def test_rename_skill_file(self):
         skill_root = self.skills_dir / "my-skill"
         skill_root.mkdir(parents=True)
@@ -325,13 +349,15 @@ class SkillsApiTests(TestCase):
         self.assertTrue((skill_root / "journal.md").is_file())
         self.assertFalse((skill_root / "notes.md").exists())
 
-    # Verify import skill creates folder and files.
+    # Verify that importing creates the skill folder with its valid files, silently skips files with a ".."
+    # path or a NUL character in the path, and lists the new skill with its front matter description.
     def test_import_skill_creates_folder_and_files(self):
+        # The last two entries are invalid and must be skipped without failing the import.
         files = [
             {"path": "SKILL.md", "content": "---\nname: imported\ndescription: Test import\nenabled: true\n---\n\n# Imported\n"},
             {"path": "agents/grader.md", "content": "# Grader\n"},
-            {"path": "../escape.md", "content": "bad"},   # should be silently skipped
-            {"path": "binary\x00.md", "content": "bad"},  # should be skipped
+            {"path": "../escape.md", "content": "bad"},
+            {"path": "binary\x00.md", "content": "bad"},
         ]
         response = self.client.post(
             reverse("skills_import_api"),
@@ -349,7 +375,7 @@ class SkillsApiTests(TestCase):
         imported = next(f for f in payload["folders"] if f["name"] == "imported-skill")
         self.assertEqual(imported["description"], "Test import")
 
-    # Verify import skill merges into existing folder.
+    # Verify that importing into an existing skill folder adds the new files to it and keeps it listed.
     def test_import_skill_merges_into_existing_folder(self):
         skill_root = self.skills_dir / "duplicate-skill"
         skill_root.mkdir(parents=True)
@@ -369,9 +395,11 @@ class SkillsApiTests(TestCase):
         folder_names = [f["name"] for f in payload["folders"]]
         self.assertIn("duplicate-skill", folder_names)
 
-# Verify what the model receives in system context under skills toggles.
+
+# Cover what the model receives in its system context when skills are enabled, disabled and toggled.
 class SkillsModelContextTests(TestCase):
-    # Prepare shared fixtures for each test case.
+    # Point the skills configuration at a temporary project root, so tests never touch the real Skills folder,
+    # and reset the pending refresh marker.
     def setUp(self):
         super().setUp()
         self._tmp = tempfile.TemporaryDirectory()
@@ -389,7 +417,7 @@ class SkillsModelContextTests(TestCase):
         self.client = Client()
         skills_config.clear_skill_config_refresh_pending()
 
-    # Clean up fixtures created for each test case.
+    # Reset the pending refresh marker, undo the path patches and remove the temporary project root.
     def tearDown(self):
         skills_config.clear_skill_config_refresh_pending()
         for patcher in reversed(self._patches):
@@ -397,24 +425,25 @@ class SkillsModelContextTests(TestCase):
         self._tmp.cleanup()
         super().tearDown()
 
-    # Assert has skills inventory.
+    # Assert that the text lists the skills inventory with a sandbox path for each given skill folder.
     def _assert_has_skills_inventory(self, text: str, *folders: str) -> None:
         self.assertIn("Your skills:", text)
         for folder in folders:
             self.assertIn(f"/workspace/_sandbox/Skills/{folder}", text)
 
-    # Assert no skill context.
+    # Assert that the text has no skills inventory, no configuration update notice and no skill sandbox path.
     def _assert_no_skill_context(self, text: str) -> None:
         self.assertNotIn("Your skills:", text)
         self.assertNotIn("Skill configuration update:", text)
         self.assertNotIn("/workspace/_sandbox/Skills/", text)
 
-    # Assert config update header.
+    # Assert that the text starts the skills configuration update notice that follows an enable toggle.
     def _assert_config_update_header(self, text: str) -> None:
         self.assertIn("Skill configuration update:", text)
         self.assertIn("changed which project skills are enabled", text)
 
-    # Write skill.
+    # Create a skill folder whose SKILL.md front matter uses the given title (default: the folder name) and
+    # enabled flag.
     def _write_skill(self, folder: str, *, enabled: bool = True, title: str | None = None) -> None:
         skill_root = self.skills_dir / folder
         skill_root.mkdir(parents=True, exist_ok=True)
@@ -424,7 +453,7 @@ class SkillsModelContextTests(TestCase):
             encoding="utf-8",
         )
 
-    # Compose.
+    # Compose the system prompt with the given skill notification and baseline options.
     def _compose(self, *, consume: bool = True, include_baseline: bool = False, user_prompt: str = "") -> str:
         return _compose_system_prompt(
             user_prompt,
@@ -432,7 +461,8 @@ class SkillsModelContextTests(TestCase):
             include_skills_baseline=include_baseline,
         )
 
-    # System message for chat.
+    # Build the chat history for a new chat from the given system prompt and return the content of its
+    # single system message.
     def _system_message_for_chat(self, system_prompt: str, user_text: str = "hello") -> str:
         chat = Chat.objects.create(title="Skills model context")
         user_record = Message.objects.create(chat=chat, role="user", content=user_text)
@@ -448,7 +478,7 @@ class SkillsModelContextTests(TestCase):
         self.assertEqual(len(system_entries), 1)
         return str(system_entries[0].get("content") or "")
 
-    # Disable via api.
+    # Disable the given skill through the enabled endpoint and check for a 200 response.
     def _disable_via_api(self, folder: str) -> None:
         response = self.client.patch(
             reverse("skills_enabled_api"),
@@ -457,7 +487,8 @@ class SkillsModelContextTests(TestCase):
         )
         self.assertEqual(response.status_code, 200)
 
-    # Verify enabled skills appear only on first chat turn.
+    # Verify that enabled skills are listed in the first-turn prompt and in the system message built from
+    # it, and that a follow-up prompt without the baseline lists none.
     def test_enabled_skills_appear_only_on_first_chat_turn(self):
         self._write_skill("writer", enabled=True)
         self._write_skill("pdf", enabled=True, title="PDF helper")
@@ -472,7 +503,8 @@ class SkillsModelContextTests(TestCase):
         follow_up = self._compose(include_baseline=False)
         self._assert_no_skill_context(follow_up)
 
-    # Verify chat api first turn includes skills baseline.
+    # Verify that the baseline flag derived from the chat (first user turn) adds the skills inventory to
+    # the prompt, and that it is dropped once the chat has a user message.
     def test_chat_api_first_turn_includes_skills_baseline(self):
         self._write_skill("writer", enabled=True)
         chat = Chat.objects.create(title="Skills baseline chat")
@@ -483,7 +515,7 @@ class SkillsModelContextTests(TestCase):
         prompt_after_history = _compose_system_prompt("", include_skills_baseline=_chat_is_first_user_turn(chat))
         self._assert_no_skill_context(prompt_after_history)
 
-    # Verify static disabled skill is omitted from inventory.
+    # Verify that a skill disabled in its front matter is left out of the skills inventory.
     def test_static_disabled_skill_is_omitted_from_inventory(self):
         self._write_skill("writer", enabled=True)
         self._write_skill("legacy-off", enabled=False, title="Legacy")
@@ -492,7 +524,8 @@ class SkillsModelContextTests(TestCase):
         self._assert_has_skills_inventory(composed, "writer")
         self.assertNotIn("legacy-off", composed)
 
-    # Verify disable sends updated inventory once.
+    # Verify that disabling a skill makes the next consuming prompt carry the update notice with the
+    # remaining skills, and that the prompt after it carries no skill context.
     def test_disable_sends_updated_inventory_once(self):
         self._write_skill("writer", enabled=True)
         self._write_skill("pdf", enabled=True, title="PDF skill")
@@ -507,7 +540,8 @@ class SkillsModelContextTests(TestCase):
         self.assertNotIn("Skill configuration update:", second_compose)
         self._assert_no_skill_context(second_compose)
 
-    # Verify context usage style compose does not consume pending refresh.
+    # Verify that composing a prompt without consuming (as the context usage view does) shows the pending
+    # update but keeps it pending, and that a consuming compose clears it.
     def test_context_usage_style_compose_does_not_consume_pending_refresh(self):
         self._write_skill("writer", enabled=True)
         self._write_skill("docx", enabled=True, title="DOCX skill")
@@ -526,7 +560,8 @@ class SkillsModelContextTests(TestCase):
         self.assertNotIn("Skill configuration update:", follow_up)
         self._assert_no_skill_context(follow_up)
 
-    # Verify enable queues refreshed inventory with enabled skill.
+    # Verify that re-enabling a disabled skill queues an update notice that lists it, and that the notice
+    # is sent only once.
     def test_enable_queues_refreshed_inventory_with_enabled_skill(self):
         self._write_skill("pdf", enabled=True, title="PDF")
         self._disable_via_api("pdf")
@@ -547,7 +582,7 @@ class SkillsModelContextTests(TestCase):
         self.assertNotIn("Skill configuration update:", follow_up)
         self._assert_no_skill_context(follow_up)
 
-    # Verify re toggle without change does not queue refresh.
+    # Verify that setting a skill to the state it already has queues no update notice.
     def test_re_toggle_without_change_does_not_queue_refresh(self):
         self._write_skill("pdf", enabled=False, title="PDF")
 
@@ -562,8 +597,9 @@ class SkillsModelContextTests(TestCase):
         self._assert_no_skill_context(composed)
         self.assertFalse(skills_config._peek_config_refresh_pending())
 
+    # Verify that disabling a skill still returns 200 and queues the update notice when the sandbox sync
+    # raises an error.
     @patch.object(skills_config, "sync_skills_to_sandbox", side_effect=RuntimeError("sandbox unavailable"))
-    # Verify toggle still queues inventory when sandbox sync fails.
     def test_toggle_still_queues_inventory_when_sandbox_sync_fails(self, _sync_mock):
         self._write_skill("writer", enabled=True)
         self._write_skill("pdf", enabled=True, title="PDF skill")
@@ -578,9 +614,11 @@ class SkillsModelContextTests(TestCase):
         self._assert_config_update_header(prompt)
         self._assert_has_skills_inventory(prompt, "writer")
 
-# Ensure sandbox dispatch refreshes Skills before executing a tool.
+
+# Cover the skills refresh that sandbox tool dispatch performs before executing a tool.
 class SkillsSandboxDispatchTests(SimpleTestCase):
-    # Verify sandbox tool dispatch syncs skills first.
+    # Verify that calling a sandbox tool syncs the skills into the sandbox once and still returns the tool
+    # result.
     def test_sandbox_tool_dispatch_syncs_skills_first(self):
         server = {
             "id": "sandbox",

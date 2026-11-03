@@ -13,15 +13,15 @@ from Apps.Tests.support import ToolRegistryTestMixin
 pytestmark = [pytest.mark.component]
 
 
-# Verify per-process static cache busting for templates and ES modules.
+# Cover the per-process static cache busting of templates and ES modules.
 class StaticCacheVersionTests(SimpleTestCase):
-    # Verify static cache version format.
+    # Verify that the static cache version is a 14-digit timestamp string.
     def test_static_cache_version_format(self):
         from Apps.UI import STATIC_CACHE_VERSION
 
         self.assertRegex(STATIC_CACHE_VERSION, r"^\d{14}$")
 
-    # Verify static template tag appends the cache-bust query.
+    # Verify that the static template tag appends the cache version as a query parameter to the static URL.
     def test_static_template_tag_appends_cache_bust_query(self):
         from Apps.UI import STATIC_CACHE_VERSION
         from django.template import Context, Template
@@ -31,7 +31,8 @@ class StaticCacheVersionTests(SimpleTestCase):
         ).render(Context({}))
         self.assertEqual(rendered, f"/static/css/main/main.css?v={STATIC_CACHE_VERSION}")
 
-    # Verify every local ES module is mapped to the same backend-generated key.
+    # Verify that the static import map covers the local ES modules and maps every one of them to its URL
+    # with the same cache version.
     def test_static_import_map_versions_the_complete_module_graph(self):
         import json
 
@@ -56,12 +57,14 @@ class StaticCacheVersionTests(SimpleTestCase):
             all(target == f"{source}?v={STATIC_CACHE_VERSION}" for source, target in imports.items())
         )
 
-# Verify that the main page uses the configured engine and local server helpers.
+
+# Cover the main page: the configured engine, the local tool servers and the versioned static assets.
 class MainViewTests(ToolRegistryTestMixin, TestCase):
-    # Test main view includes runtime settings and local servers.
+    # Verify that the main page context carries the engine, the runtime settings and the local tool servers,
+    # and that the page links only versioned local static assets.
     @patch("Apps.API.views._resolve_request_engine", return_value="ollama-service")
-    # Verify main view includes runtime settings and local servers.
     def test_main_view_includes_runtime_settings_and_local_servers(self, _mock_engine):
+        # Arrange: one local tool server.
         self.write_server(
             'time_suite',
             '''
@@ -72,8 +75,10 @@ class MainViewTests(ToolRegistryTestMixin, TestCase):
             ''',
         )
 
+        # Act
         response = self.client.get(reverse("main"))
 
+        # Assert: the context holds the engine and the tool server.
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.context["models"], [])
         self.assertEqual(response.context["llm_engine"], "ollama-service")
@@ -88,6 +93,9 @@ class MainViewTests(ToolRegistryTestMixin, TestCase):
                 "tools": [{"id": "time_now", "name": "Current Time", "description": ""}],
             }],
         )
+
+        # Assert: the markup has the import map, versioned static URLs without a doubled version, and no CDN
+        # or account links.
         self.assertContains(response, 'id="group-load"')
         self.assertContains(response, 'type="importmap"')
         self.assertRegex(
