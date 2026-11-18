@@ -8,7 +8,6 @@ import json
 import os
 import subprocess
 import sys
-import threading
 from pathlib import Path
 
 
@@ -132,85 +131,7 @@ def run_django_command(*args: str, log: bool = False) -> None:
     execute_from_command_line(argv)
 
 
-# WSGI application that lets the UI port start listening before Django is imported: Django loads
-# in a background thread, and until it is ready every request gets a self-reloading "starting"
-# page (or a 500 page when loading failed).
-class LazyDjangoApplication:
-    # Create the holder for the Django application, the load error and the load guard.
-    def __init__(self) -> None:
-        # The loaded Django WSGI application and the exception of a failed load; at most one is set.
-        self._application = None
-        self._error: BaseException | None = None
-
-        # Event set when loading has ended (successfully or not) and the lock that allows one load only.
-        self._ready = threading.Event()
-        self._lock = threading.Lock()
-
-    # Start loading Django in a daemon thread without blocking the listening socket.
-    def load_in_background(self) -> None:
-        thread = threading.Thread(target=self._load, name="aslm-chat-django-loader", daemon=True)
-        thread.start()
-
-    # Import the Django WSGI application once; any failure is stored and shown to the browser.
-    def _load(self) -> None:
-        with self._lock:
-            if self._application is not None or self._error is not None:
-                return
-            try:
-                from ASLM.wsgi import application
-
-                self._application = application
-            except BaseException as exc:
-                self._error = exc
-            finally:
-                self._ready.set()
-
-    # Handle one WSGI request: delegate to Django once loaded, answer 500 when loading failed,
-    # otherwise answer 503 with a page that polls until Django is ready and then reloads itself.
-    def __call__(self, environ, start_response):
-        if self._application is not None:
-            return self._application(environ, start_response)
-
-        # Loading failed: show the error as plain text.
-        if self._error is not None:
-            body = f"ASLM-Chat failed to start: {self._error}".encode("utf-8", errors="replace")
-            start_response(
-                "500 Internal Server Error",
-                [("Content-Type", "text/plain; charset=utf-8"), ("Content-Length", str(len(body)))],
-            )
-            return [body]
-
-        # Still loading: the page re-requests its own URL every 200 ms and reloads once the response
-        # no longer carries the X-ASLM-Starting header.
-        body = (
-            "<!doctype html><html><head><meta charset=\"utf-8\">"
-            "<title>ASLM-Chat starting</title></head>"
-            "<body style=\"font-family:Segoe UI,sans-serif;background:#111;color:#eee;\">"
-            "ASLM-Chat is starting..."
-            "<script>"
-            "(function pollUntilReady(){setTimeout(async function(){try{"
-            "const response=await fetch(window.location.href,{cache:'no-store'});"
-            "if(response.headers.get('X-ASLM-Starting')!=='1'){"
-            "window.location.replace(window.location.href);return;}"
-            "}catch(_error){}pollUntilReady();},200);})();"
-            "</script>"
-            "</body></html>"
-        ).encode("utf-8")
-        start_response(
-            "503 Service Unavailable",
-            [
-                ("Content-Type", "text/html; charset=utf-8"),
-                ("Content-Length", str(len(body))),
-                ("Cache-Control", "no-store"),
-                ("Retry-After", "1"),
-                ("X-ASLM-Starting", "1"),
-            ],
-        )
-        return [body]
-
-
-# Serve the UI on the requested loopback port with a threaded WSGI server. The port is bound first
-# and Django loads in the background, so the browser gets the "starting" page instead of a refusal.
+# Prepare Django, then serve the UI on the requested loopback port with a threaded WSGI server.
 def cmd_runserver(port: int, log: bool) -> None:
     if log:
         print(f"[ASLM-Chat] Starting server on port {port}...")
@@ -244,8 +165,10 @@ def cmd_runserver(port: int, log: bool) -> None:
         def log_message(self, format: str, *args) -> None:
             return
 
-    # Bind the port, start loading Django, then serve until the process is stopped.
-    app = LazyDjangoApplication()
+    # Import Django before opening its listening socket.
+    from ASLM.wsgi import application
+
+    app = application
     with make_server(
         "127.0.0.1",
         port,
@@ -253,7 +176,6 @@ def cmd_runserver(port: int, log: bool) -> None:
         server_class=ThreadedWSGIServer,
         handler_class=QuietWSGIRequestHandler,
     ) as httpd:
-        app.load_in_background()
         _probe_docker_status_async(log=log)
         if log:
             print(f"[ASLM-Chat] UI server listening at http://127.0.0.1:{port}/", flush=True)
