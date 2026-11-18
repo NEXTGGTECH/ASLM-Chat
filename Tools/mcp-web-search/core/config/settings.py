@@ -64,6 +64,18 @@ class ExtractionSection:
     enable_read_page_compress: bool = True
     read_page_compress_threshold_chars: int = 25_000
     read_page_compress_target_chars: int = 10_000
+    # Size-adaptive compression for the standalone read_page tool (no focus query):
+    # pages under the soft limit pass untouched; above it the removed share grows on a
+    # saturating curve (ratio_at_double at 2x the limit, approaching max_ratio), capped by
+    # the hard ceiling. See core/extract/adaptive_compression.py.
+    read_page_soft_limit_chars: int = 60_000
+    read_page_ratio_at_double: float = 0.30
+    read_page_max_ratio: float = 0.85
+    read_page_max_output_chars: int = 150_000
+    # read_page `find`: how much of the full page is scanned and how much is returned.
+    read_page_find_scan_chars: int = 2_000_000
+    read_page_find_max_hits: int = 20
+    read_page_find_max_chars: int = 20_000
 
 
 # Cache and de-duplication windows, all in seconds. search_ttl_seconds (6 h) is the flat TTL of the
@@ -214,6 +226,11 @@ class RichCardsSection:
     timeout_seconds: float = 2.0
     ttl_seconds: float = 86400.0
     negative_ttl_seconds: float = 900.0
+    # Product card (ASLM-Search shopping preview): when the query reads as a product
+    # search, live offers run alongside the web search and come back as JSON.
+    products: bool = True
+    products_limit: int = 6
+    products_timeout_seconds: float = 5.0
 
 
 # Kill switches for the image vertical (engines/images.py). Defaults follow the 2026-10-28 live
@@ -456,6 +473,13 @@ def load_search_config(path: Path | None = None) -> SearchConfig:
                 e.get("read_page_compress_threshold_chars", 10_000)
             ),
             read_page_compress_target_chars=int(e.get("read_page_compress_target_chars", 10_000)),
+            read_page_soft_limit_chars=int(e.get("read_page_soft_limit_chars", 60_000)),
+            read_page_ratio_at_double=float(e.get("read_page_ratio_at_double", 0.30)),
+            read_page_max_ratio=float(e.get("read_page_max_ratio", 0.85)),
+            read_page_max_output_chars=int(e.get("read_page_max_output_chars", 150_000)),
+            read_page_find_scan_chars=int(e.get("read_page_find_scan_chars", 2_000_000)),
+            read_page_find_max_hits=int(e.get("read_page_find_max_hits", 20)),
+            read_page_find_max_chars=int(e.get("read_page_find_max_chars", 20_000)),
         ),
         cache=CacheSection(
             search_ttl_seconds=int(c.get("search_ttl_seconds", 21_600)),
@@ -539,6 +563,9 @@ def load_search_config(path: Path | None = None) -> SearchConfig:
             timeout_seconds=float(rc.get("timeout_seconds", 2.0)),
             ttl_seconds=float(rc.get("ttl_seconds", 86400.0)),
             negative_ttl_seconds=float(rc.get("negative_ttl_seconds", 900.0)),
+            products=bool(rc.get("products", True)),
+            products_limit=int(rc.get("products_limit", 6)),
+            products_timeout_seconds=float(rc.get("products_timeout_seconds", 5.0)),
         ),
         localization=LocalizationSection(
             enabled=bool(l.get("enabled", True)),

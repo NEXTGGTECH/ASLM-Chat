@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import asdict
 import time
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 
@@ -141,10 +141,16 @@ class ShoppingSearchEngine:
         # Start both lanes concurrently; finished lanes are stored in the buffer.
         timeout_ms = hard_timeout_ms if hard_timeout_ms is not None else self._hard_timeout_for_effort(effort, language)
         grace_ms = EFFORT_BUFFER_GRACE_MS[effort]
-        buffer = _SearchBuffer()
+        buffer = _SearchBuffer(started)
+        # Lanes stream every provider's products into the buffer as they arrive, so a lane
+        # cut off by the hard timeout still contributes what it already found.
         tasks = {
-            asyncio.create_task(self._timed_lane(query, "primary", limit, language=language)): "primary",
-            asyncio.create_task(self._timed_secondary_lane(query, limit, language=language)): "secondary",
+            asyncio.create_task(
+                self._timed_lane(query, "primary", limit, language=language, sink=buffer.sink("primary"))
+            ): "primary",
+            asyncio.create_task(
+                self._timed_secondary_lane(query, limit, language=language, sink=buffer.sink("secondary"))
+            ): "secondary",
         }
         partial = False
         partial_reason = ""
@@ -281,9 +287,10 @@ class ShoppingSearchEngine:
         limit: int,
         *,
         language: str = "en",
+        sink: "_LaneSink | None" = None,
     ) -> tuple[list[ShoppingProduct], list[ShoppingProviderAttempt], int]:
         started = time.perf_counter()
-        products, attempts = await self._lane(query, lane, limit, language=language)
+        products, attempts = await self._lane(query, lane, limit, language=language, sink=sink)
         return products, attempts, int((time.perf_counter() - started) * 1000)
 
     # Run the secondary lane and return its products and attempts together with its elapsed
@@ -294,9 +301,10 @@ class ShoppingSearchEngine:
         limit: int,
         *,
         language: str = "en",
+        sink: "_LaneSink | None" = None,
     ) -> tuple[list[ShoppingProduct], list[ShoppingProviderAttempt], int]:
         started = time.perf_counter()
-        products, attempts = await self._secondary_lane(query, limit, language=language)
+        products, attempts = await self._secondary_lane(query, limit, language=language, sink=sink)
         return products, attempts, int((time.perf_counter() - started) * 1000)
 
     # Return True when the products buffered so far already merge into the full result limit.
@@ -337,6 +345,7 @@ class ShoppingSearchEngine:
         limit: int,
         *,
         language: str = "en",
+        sink: "_LaneSink | None" = None,
     ) -> tuple[list[ShoppingProduct], list[ShoppingProviderAttempt]]:
         if limit <= 0:
             return [], []
@@ -348,8 +357,10 @@ class ShoppingSearchEngine:
             attempts.extend(provider_attempts)
             if provider_products:
                 products.extend(provider_products)
-                if len(products) >= limit:
-                    break
+            if sink is not None:
+                sink(products[:limit], attempts)
+            if len(products) >= limit:
+                break
         return products[:limit], attempts
 
     # Query the secondary lane: the best provider and the first backup run concurrently as a first
@@ -360,6 +371,7 @@ class ShoppingSearchEngine:
         limit: int,
         *,
         language: str = "en",
+        sink: "_LaneSink | None" = None,
     ) -> tuple[list[ShoppingProduct], list[ShoppingProviderAttempt]]:
         if limit <= 0:
             return [], []
@@ -371,18 +383,29 @@ class ShoppingSearchEngine:
         attempts: list[ShoppingProviderAttempt] = []
         products: list[ShoppingProduct] = []
 
-        # First wave: the best provider and the first backup run concurrently.
+        # Record a provider's result and report the lane's progress so far to the buffer.
+        def collect(provider_products, provider_attempts) -> None:
+            attempts.extend(provider_attempts)
+            products.extend(provider_products)
+            if sink is not None:
+                sink(self._dedupe_products(products)[:limit], attempts)
+
+        # First wave: the best provider and the first backup run concurrently, and each one's
+        # products are taken as soon as it answers instead of waiting for the slower of the two.
         first_wave = [asyncio.create_task(self._provider(query, main))]
         if backups:
             first_wave.append(asyncio.create_task(self._provider(query, backups[0])))
-        results = await asyncio.gather(*first_wave, return_exceptions=True)
-        for result in results:
-            if isinstance(result, Exception):
-                # A crashed provider task is ignored; the other providers still count.
-                continue
-            provider_products, provider_attempts = result
-            attempts.extend(provider_attempts)
-            products.extend(provider_products)
+        try:
+            for next_done in asyncio.as_completed(first_wave):
+                try:
+                    provider_products, provider_attempts = await next_done
+                except Exception:  # noqa: BLE001 - a crashed provider task must not drop the other
+                    continue
+                collect(provider_products, provider_attempts)
+        finally:
+            for task in first_wave:
+                if not task.done():
+                    task.cancel()
 
         # Second wave: sequential backups that were not already tried.
         if len(products) < limit and backups:
@@ -390,9 +413,7 @@ class ShoppingSearchEngine:
             for provider in backups[1:]:
                 if provider.name in attempted:
                     continue
-                provider_products, provider_attempts = await self._provider(query, provider)
-                attempts.extend(provider_attempts)
-                products.extend(provider_products)
+                collect(*await self._provider(query, provider))
                 if len(products) >= limit:
                     break
         return self._dedupe_products(products)[:limit], attempts
@@ -620,14 +641,27 @@ def result_to_jsonable(result: ShoppingSearchResult) -> dict[str, Any]:
     }
 
 
+# Callback a running lane uses to hand its products and attempts so far to the search buffer.
+_LaneSink = Callable[[list[ShoppingProduct], list[ShoppingProviderAttempt]], None]
+
+
 # Per-lane results (products, attempts, elapsed ms) collected while a search is running, so a
-# search cut short by the deadline can still use the lanes that finished.
+# search cut short by the deadline can still use what the lanes found, even unfinished lanes.
 class _SearchBuffer:
-    # Create empty per-lane storage for the primary and secondary lanes.
-    def __init__(self) -> None:
+    # Create empty per-lane storage for the primary and secondary lanes; `started` is the search start.
+    def __init__(self, started: float | None = None) -> None:
+        self.started = started if started is not None else time.perf_counter()
         self.products: dict[str, list[ShoppingProduct]] = {"primary": [], "secondary": []}
         self.attempts: dict[str, list[ShoppingProviderAttempt]] = {"primary": [], "secondary": []}
         self.elapsed_ms: dict[str, int] = {"primary": 0, "secondary": 0}
+
+    # Build the sink of a lane: it stores the lane's partial results until the final return replaces them.
+    def sink(self, lane: str) -> _LaneSink:
+        # Store a snapshot of the partial results with the time elapsed since the search started.
+        def push(products: list[ShoppingProduct], attempts: list[ShoppingProviderAttempt]) -> None:
+            self.update(lane, list(products), list(attempts), int((time.perf_counter() - self.started) * 1000))
+
+        return push
 
     # Store the finished results of a lane.
     def update(

@@ -46,7 +46,9 @@ logger = logging.getLogger("services.read_page")
 trace_logger = logging.getLogger("trace.read_page")
 
 # Tag mixed into every read cache key; changing it invalidates all cached reads of the old strategy.
-_READ_PAGE_STRATEGY_VERSION = "2026-06-core-v1"
+# Bumped 2026-11 when the normalizer stopped cutting pages at 50k chars: older cache entries hold
+# truncated text that `find` and the adaptive curve must not reuse.
+_READ_PAGE_STRATEGY_VERSION = "2026-11-core-v2"
 
 # Minimum global read deadlines in seconds for Reddit (curl plus browser render) and .onion pages (slow Tor).
 _REDDIT_READ_TIMEOUT_SEC = 60.0
@@ -458,6 +460,11 @@ class ReadPageOptions:
     # the browser stays exclusive to the read_page tool: a wide search must be cheap/
     # HTTP-only and skip browser-only sources rather than pay seconds a page.
     allow_browser: bool = True
+    # Size-adaptive compression (the read_page tool). False keeps the fixed char budget
+    # with focus-query chunk selection that web_search previews rely on.
+    adaptive: bool = False
+    # grep-style lookup: when set, return only the matching passages of the full page.
+    find: str = ""
 
 
 # Return the global asyncio deadline in seconds for one read: at least 30 seconds, raised to the Reddit floor
@@ -492,9 +499,37 @@ class ReadPageService:
     async def _browser_ok(self) -> bool:
         return self._opts.allow_browser and await browser_available()
 
-    # Apply the read_page BM25 compression budget from config.
+    # Apply the read_page compression from config: the size-adaptive curve for the
+    # read_page tool, or the fixed BM25 budget for web_search previews.
     def _apply_budget(self, markdown: str, url: str) -> str:
         ext = self._cfg.extraction
+        if self._opts.adaptive:
+            if not ext.enable_read_page_compress:
+                return markdown
+            from core.extract.adaptive_compression import (
+                CompressionCurve,
+                compress_adaptive,
+                compression_note,
+                insert_note,
+            )
+
+            curve = CompressionCurve(
+                soft_limit=ext.read_page_soft_limit_chars,
+                ratio_at_double=ext.read_page_ratio_at_double,
+                max_ratio=ext.read_page_max_ratio,
+                hard_cap=ext.read_page_max_output_chars,
+            )
+            compressed, report = compress_adaptive(markdown, curve, url=url, focus=self._focus)
+            if report.compressed:
+                logger.info(
+                    "read_page.adaptive url=%r original=%d target=%d output=%d dropped=%d "
+                    "trimmed=%d protected=%d kinds=%s hard_capped=%s",
+                    url, report.original_chars, report.target_chars, report.output_chars,
+                    report.dropped_blocks, report.trimmed_blocks, report.protected_chars,
+                    report.kinds, report.hard_capped,
+                )
+                compressed = insert_note(compressed, compression_note(report))
+            return compressed
         return compress_read_page_markdown(
             markdown,
             url=url,
@@ -892,10 +927,27 @@ class ReadPageService:
         result = await self._generic_read(GenericRequest(url=url))
         return self._finalize(url, result)
 
-    # Apply the compression budget when the result asks for it, then return markdown.
+    # Apply `find` or the compression budget when the result asks for it, then return markdown.
     def _finalize(self, url: str, result: PageResult) -> str:
         markdown = result.markdown or ""
-        if result.apply_budget and markdown and not markdown.lstrip().lower().startswith(("error:", "warning:")):
+        lowered = markdown.lstrip().lower()
+        if self._opts.find.strip() and markdown and not lowered.startswith("error:"):
+            # find always runs on the full extracted text, never on compressed output.
+            from core.extract.page_find import find_in_page
+
+            ext = self._cfg.extraction
+            return find_in_page(
+                markdown,
+                self._opts.find,
+                url=url,
+                max_hits=ext.read_page_find_max_hits,
+                max_chars=ext.read_page_find_max_chars,
+            )
+        # Handlers and PDFs that skip the fixed budget used to self-truncate at a small
+        # max_chars; in adaptive mode they get the hard ceiling instead, so the curve covers
+        # every result (it is a no-op under the soft limit).
+        wants_budget = result.apply_budget or self._opts.adaptive
+        if wants_budget and markdown and not lowered.startswith(("error:", "warning:")):
             markdown = self._apply_budget(markdown, url)
         return markdown
 
@@ -911,20 +963,29 @@ class ReadPageService:
 
 
 # Convenience entry point for the central API and debug CLI: read one URL with the given limits. Reddit
-# reads get at least the Reddit timeout floor.
+# reads get at least the Reddit timeout floor. With max_chars given (web_search previews) the budget is
+# fixed and `focus` selects chunks; with max_chars omitted (the read_page tool) the size-adaptive curve
+# applies, with the hard ceiling from config as the extraction limit, and `find` greps the full page.
 async def run_read_page(
     url: str,
     timeout: float = 20.0,
-    max_chars: int = 20_000,
+    max_chars: int | None = None,
     focus: str = "",
     allow_browser: bool = True,
+    find: str = "",
 ) -> str:
     host = urlparse(url.strip()).netloc.lower().removeprefix("www.").removeprefix("m.")
     effective_timeout = max(timeout, _REDDIT_READ_TIMEOUT_SEC) if host == "reddit.com" else timeout
+    adaptive = max_chars is None
+    if max_chars is None:
+        ext = load_search_config().extraction
+        # Handlers and the PDF extractor cut at max_chars before compression or find see
+        # the text: give find the whole page, and the adaptive curve its hard ceiling.
+        max_chars = ext.read_page_find_scan_chars if find.strip() else ext.read_page_max_output_chars
     service = ReadPageService(
         options=ReadPageOptions(
             timeout=effective_timeout, max_chars=max_chars, focus=focus,
-            allow_browser=allow_browser,
+            allow_browser=allow_browser, adaptive=adaptive, find=find,
         )
     )
     return await service.read(url)
